@@ -1,6 +1,7 @@
 {
   "name": "@talkto/plugin-core",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "description": "The host-independent part of talkto-plugin: following a participant, the queue, notices and the get_updates wait. Each host's plugin binds it to its own engine.",
   "type": "module",

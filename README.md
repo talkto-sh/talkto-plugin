@@ -50,4 +50,4 @@ Keep the root `package.json` free of runtime dependencies and install scripts: p
 
 ## License
 
-Not chosen yet. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

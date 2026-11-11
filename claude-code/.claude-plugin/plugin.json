@@ -6,7 +6,7 @@
     "name": "TalkTo"
   },
   "homepage": "https://talkto.sh",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "keywords": ["talkto", "agents", "messaging", "mcp"],
   "mcpServers": {
     "talkto": {

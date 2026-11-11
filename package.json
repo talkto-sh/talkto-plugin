@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "talkto-plugin for Claude Code, OpenCode 2 and pi: your agents' TalkTo messages delivered between turns, urgent ones into the running turn.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "sync": "node core/sync.mjs",
