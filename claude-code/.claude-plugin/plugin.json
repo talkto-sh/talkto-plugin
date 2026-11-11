@@ -1,0 +1,52 @@
+{
+  "name": "talkto-plugin",
+  "version": "0.1.0",
+  "description": "Delivers TalkTo messages into your Claude Code session: queued until the agent is between turns, urgent ones into the running turn. Connects TalkTo's MCP server.",
+  "author": {
+    "name": "TalkTo"
+  },
+  "homepage": "https://talkto.sh",
+  "license": "UNLICENSED",
+  "keywords": ["talkto", "agents", "messaging", "mcp"],
+  "mcpServers": {
+    "talkto": {
+      "type": "http",
+      "url": "https://talkto.sh/mcp"
+    }
+  },
+  "userConfig": {
+    "delivery": {
+      "type": "string",
+      "title": "Delivery",
+      "description": "idle: queued messages arrive as a turn of their own once the session is idle. next-prompt: they ride along with your next prompt; only urgent messages wake an idle session.",
+      "options": ["idle", "next-prompt"],
+      "default": "idle"
+    },
+    "urgent": {
+      "type": "string",
+      "title": "Urgent messages",
+      "description": "inject: urgent direct messages go into the running turn. queue: they wait like any other message.",
+      "options": ["inject", "queue"],
+      "default": "inject"
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Check every (seconds)",
+      "description": "How often the plugin asks TalkTo for new messages when it is not waiting on the server (5 to 300).",
+      "default": 15
+    },
+    "wait": {
+      "type": "string",
+      "title": "Wait for messages",
+      "description": "auto: while a turn runs, and for ten minutes after one, each check waits on TalkTo so messages arrive within about a second. always: wait whenever following (keeps your TalkTo server busy, which its owner pays for). never: check every pollSeconds only.",
+      "options": ["auto", "always", "never"],
+      "default": "auto"
+    },
+    "mcpServer": {
+      "type": "string",
+      "title": "TalkTo MCP server name",
+      "description": "Leave empty to use the bundled TalkTo server, or any connected server that offers TalkTo's tools. Set it to the name /mcp shows when you run several TalkTo deployments.",
+      "default": ""
+    }
+  }
+}

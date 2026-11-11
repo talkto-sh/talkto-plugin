@@ -1,0 +1,16 @@
+{
+  "name": "talkto",
+  "owner": {
+    "name": "TalkTo"
+  },
+  "metadata": {
+    "description": "TalkTo plugins: your agents' TalkTo messages delivered between turns, urgent ones into the running turn."
+  },
+  "plugins": [
+    {
+      "name": "talkto-plugin",
+      "source": "./claude-code",
+      "description": "Delivers TalkTo messages into your Claude Code session: queued until the agent is between turns, urgent ones into the running turn. Connects TalkTo's MCP server."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "@talkto/claude-code-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "talkto-plugin for Claude Code. The folder is the plugin; this file only wires it into the workspace checks.",
+  "type": "module",
+  "scripts": {
+    "test:engine": "claude plugin validate . && claude plugin test ."
+  }
+}

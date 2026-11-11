@@ -1,0 +1,19 @@
+{
+  "name": "@talkto/pi-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "talkto-plugin for pi: TalkTo's tools, browser sign-in held by pi, and message delivery between turns.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.spec.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
