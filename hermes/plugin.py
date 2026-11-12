@@ -13,6 +13,10 @@ urgent direct messages into the running turn.
   that finishes next in the running turn (``transform_tool_result``).
 - Follows, checkpoints and queued notices are kept per session in the plugin's
   own state (``ctx.state``). They never hold a token.
+- Hermes's gateway, where plugins run, outlives each session: a one-shot
+  ``hermes chat -q`` session ends after its turn while the gateway stays up.
+  When Hermes ends a session (``on_session_finalize``) the plugin stops
+  polling and delivering for it, so it never starts turns in an ended session.
 """
 
 from __future__ import annotations
@@ -43,7 +47,10 @@ from .tools import (
 )
 
 PLUGIN_ID = "talkto-plugin"
-TOOLSET = "talkto"
+#: The plugin's own toolset. Never "talkto": Hermes registers each MCP server's name as an alias
+#: of that server's toolset (``mcp-talkto``), so a plugin toolset named after the server hides
+#: one of the two sets of tools.
+TOOLSET = "talkto-plugin"
 COMMAND = "talkto-inbox"
 #: The Hermes MCP server name TalkTo is configured under, unless the settings name another.
 DEFAULT_SERVER = "talkto"
@@ -67,6 +74,15 @@ class Deps:
 
 
 def _hermes_session_key() -> str:
+    # bound_session_key reads only what Hermes bound in this context, never os.environ, so a
+    # thread that inherited no session never borrows another session's key. Older Hermes
+    # versions have only get_session_env.
+    try:
+        from gateway.session_context import bound_session_key
+    except ImportError:
+        pass
+    else:
+        return bound_session_key()
     try:
         from gateway.session_context import get_session_env
     except ImportError:
@@ -155,8 +171,11 @@ class TalkToPlugin:
         self._keys: dict[str, str] = {}
         #: The running top-level turn of each session ID.
         self._turns: dict[str, str] = {}
+        #: The last turn that ended in each session ID; a late tool result never restarts it.
+        self._ended: dict[str, str] = {}
         self._turn_count = 0
-        self._warned_injection = False
+        #: Session keys whose refused injection was already logged.
+        self._warned_injection: set[str] = set()
 
     # -- registration ----------------------------------------------------------
 
@@ -192,6 +211,8 @@ class TalkToPlugin:
         ctx.register_hook("transform_tool_result", self.on_transform_tool_result)
         ctx.register_hook("on_session_end", self.on_session_end)
         ctx.register_hook("on_session_open", self.on_session_open)
+        ctx.register_hook("on_session_finalize", self.on_session_finalize)
+        ctx.register_hook("on_session_delete", self.on_session_delete)
         ctx.register_hook("post_compaction", self.on_post_compaction)
 
     # -- settings ----------------------------------------------------------------
@@ -255,19 +276,48 @@ class TalkToPlugin:
             return self._inboxes.setdefault(key, inbox)
 
     def _known(self, session_id: str) -> Optional[Inbox]:
-        """The inbox of a session whose top-level turn this plugin saw start."""
+        """The inbox of a session that follows someone, by the session ID hooks report."""
         with self._lock:
             key = self._keys.get(session_id)
             return None if key is None else self._inboxes.get(key)
 
-    def _note_refused_injection(self) -> None:
-        if self._warned_injection:
+    def _close(self, session_id: str, forget: bool) -> None:
+        """Hermes ended the session: its inbox stops; ``forget`` also deletes what is saved."""
+        if not session_id:
             return
-        self._warned_injection = True
+        with self._lock:
+            key = self._keys.pop(session_id, None)
+            self._turns.pop(session_id, None)
+            self._ended.pop(session_id, None)
+            inbox = self._inboxes.pop(key, None) if key is not None else None
+            if key is not None:
+                # Compaction gives a session new IDs; none of them may find the closed inbox.
+                for other in [sid for sid, value in self._keys.items() if value == key]:
+                    del self._keys[other]
+                    self._turns.pop(other, None)
+                    self._ended.pop(other, None)
+        if inbox is not None:
+            inbox.close()
+        if forget and key is not None:
+            try:
+                self._ctx.state.set(self._state_key(key), None)
+            except Exception:
+                logger.warning("talkto-plugin: could not delete the session's TalkTo state", exc_info=True)
+
+    def _note_refused_injection(self, key: str) -> None:
+        with self._lock:
+            if key in self._warned_injection:
+                return
+            self._warned_injection.add(key)
+        # inject_message returns only False, so Hermes's own warning just before this one names
+        # the cause. Do not guess it here: the setting may well be on already.
         logger.warning(
-            "talkto-plugin: Hermes refused to start a turn for queued TalkTo messages; they will "
-            "arrive with the next prompt. Set plugins.entries.%s.allow_gateway_injection: true to "
-            "let them arrive on their own.",
+            "talkto-plugin: Hermes did not start a turn for queued TalkTo messages in session %s; "
+            "they wait for the next prompt in that session. Hermes's warning just before this one "
+            "says why. 'not a live local session' means the session has ended (a one-shot "
+            "'hermes chat -q' session ends after its turn); 'gateway injection denied' means "
+            "plugins.entries.%s.allow_gateway_injection is not true.",
+            key,
             PLUGIN_ID,
         )
 
@@ -346,9 +396,18 @@ class TalkToPlugin:
         inbox = self._known(session_id)
         if inbox is None:
             return None
+        given_turn = str(kwargs.get("turn_id") or "")
         with self._lock:
             turn_id = self._turns.get(session_id)
-        given_turn = str(kwargs.get("turn_id") or "")
+            if turn_id is None and given_turn and self._ended.get(session_id) != given_turn:
+                # The plugin missed this turn's start (it loaded mid-turn, or the hook was
+                # skipped): the session's own tool call says which turn runs.
+                turn_id = self._turns[session_id] = given_turn
+                adopted = True
+            else:
+                adopted = False
+        if adopted:
+            inbox.mark_running(given_turn)
         if turn_id is None or (given_turn and given_turn != turn_id):
             return None  # another agent's tool call, such as a subagent's
         urgent = inbox.take_urgent(turn_id)
@@ -365,9 +424,17 @@ class TalkToPlugin:
             if running is None or (given and given != running):
                 return
             del self._turns[session_id]
+            self._ended[session_id] = running
         inbox = self._known(session_id)
         if inbox is not None:
             inbox.on_turn_complete(running)
+
+    def on_session_finalize(self, **kwargs: Any) -> None:
+        """Hermes ended the session (the last viewer closed it, a one-shot finished, ``/new``)."""
+        self._close(str(kwargs.get("session_id") or ""), forget=False)
+
+    def on_session_delete(self, **kwargs: Any) -> None:
+        self._close(str(kwargs.get("session_id") or ""), forget=True)
 
     def on_session_open(self, **kwargs: Any) -> None:
         session_id = str(kwargs.get("session_id") or "")
@@ -413,7 +480,7 @@ class _HermesHost:
     def submit(self, text: str) -> bool:
         accepted = bool(self._plugin._ctx.inject_message(text, role="user", session_key=self._key))
         if not accepted:
-            self._plugin._note_refused_injection()
+            self._plugin._note_refused_injection(self._key)
         return accepted
 
     def load(self) -> object:

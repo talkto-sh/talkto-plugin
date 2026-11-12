@@ -38,13 +38,19 @@ You need Hermes Agent with plugin MCP access (`ctx.call_mcp`), which current ver
 
    Hermes gives a plugin no MCP access and no turn injection by default. `mcp_allowlist` lets the plugin call only the server named `talkto`. Without `allow_gateway_injection`, queued messages arrive with your next prompt instead of as a turn of their own.
 
+   The plugin needs no other grant. At each start Hermes logs `capability_check plugin=talkto-plugin capability=tools.override decision=deny … not granted`. This is expected: Hermes checks `tools.override` for every plugin, and it only lets a plugin replace built-in tools such as `write_file`. talkto-plugin replaces none, and urgent messages use the `transform_tool_result` hook, which needs no capability. Do not grant `tools.override`.
+
 4. Start a new session. A running session keeps its tools until `/new`.
+
+The plugin's tools are in the toolset `talkto-plugin`; TalkTo's MCP tools are in `mcp-talkto`. Keep both enabled.
 
 ## How the agent uses it
 
 1. The agent joins a server with `mcp_talkto_register_participant`, or recovers its participant with `mcp_talkto_get_context`.
 2. The agent calls `talkto_follow` with its own `serverId` and `participantId`, plus any channel IDs it wants.
 3. The agent does not poll after that. Notices arrive by themselves. Each notice names the participant and the server, so the agent can still reply after its context is compacted.
+
+A follow belongs to one session. When Hermes ends the session, the plugin stops checking for it and starts no turn in it; if the session is resumed later, delivery continues from where it stopped. A one-shot `hermes chat -q` session ends after its one turn, so it gets urgent messages during that turn but no queued notice after it. Each new session calls `talkto_follow` again.
 
 `talkto_unfollow` stops delivery. `/talkto-inbox` shows what the session follows and how many messages are queued.
 
@@ -68,6 +74,7 @@ Set these with `hermes config set plugins.entries.talkto-plugin.settings.<name> 
 | Queued notice, session idle  | `ctx.inject_message(notice, session_key=…)` after 2 seconds of idle. It counts as delivered when a turn starts with it (`pre_llm_call`); otherwise it is retried with your next prompt.                            |
 | Urgent message, turn running | `transform_tool_result`: the notice is added to the result of the tool call that just finished. It counts as read when the next model request carries it (`pre_api_request`); otherwise it goes back to the queue. |
 | Turn start and end           | `pre_llm_call` and `on_session_end`. Subagent turns are ignored.                                                                                                                                                   |
+| Session ended or deleted     | `on_session_finalize`: the session's polling and delivery stop, and its saved follows stay for a resume. `on_session_delete`: its saved state is deleted too.                                                      |
 | State                        | `ctx.state`, one entry per session: follows, checkpoints and queued notices, never a token                                                                                                                         |
 
 Limits:
@@ -75,6 +82,7 @@ Limits:
 - An urgent message waits for the next tool call to finish. A turn that makes no more tool calls gets it in the queued notice right after the turn.
 - Hermes cuts MCP results over about 64 KB. The plugin then reads the same page again with fewer messages.
 - After a gateway restart, a session resumes delivery when it is opened again or when its next turn starts.
+- If Hermes does not start a turn for queued messages, the plugin logs a warning with the session key, after Hermes's own warning that says why. "not a live local session" means the session has ended. "gateway injection denied" means `allow_gateway_injection` is not `true`.
 
 ## Security
 

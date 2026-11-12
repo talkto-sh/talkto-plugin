@@ -13,8 +13,12 @@ the TypeScript core cannot run here. Differences, all caused by Hermes's API:
   notice when a turn starts with it as its prompt (``on_turn_start``), an urgent
   one when a model request carries it (``confirm_read``). An urgent notice that
   no request carried goes back to the queue, so it is never lost.
-- When Hermes refuses a submitted turn (gateway injection is not granted), the
-  queue goes with the person's next prompt instead (``take_for_prompt``).
+- When Hermes refuses a submitted turn (gateway injection is not granted, or the
+  session is no longer live), the queue goes with the person's next prompt
+  instead (``take_for_prompt``).
+- Hermes's gateway outlives each session, so the plugin closes a session's inbox
+  when Hermes ends the session (``close``); it stops polling and delivering, and
+  a resumed session reads on from the saved checkpoint.
 - Hermes truncates an MCP result over about 64 KB, so a truncated page is read
   again with fewer messages.
 - Methods are synchronous and thread-safe. Network calls run without the lock.
@@ -281,6 +285,8 @@ class Inbox:
         self._failures = 0
         self._resume_at = 0.0
         self._injected: list[_Injected] = []
+        #: True once Hermes ended the session: nothing polls or delivers any more.
+        self._closed = False
 
     # -- what the plugin and the agent use --------------------------------
 
@@ -293,6 +299,22 @@ class Inbox:
             self._follows, self._notes = decoded
         if self._follows:
             self._host.after(0, self.tick)
+
+    def close(self) -> None:
+        """Hermes ended the session: stop polling and delivering, and keep what is saved.
+
+        A session that is resumed later restores its follows and checkpoints and reads on from
+        there, so nothing sent meanwhile is lost."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            unread = list(self._injected)
+            self._injected = []
+            for entry in unread:
+                self._requeue(entry)
+            if unread:
+                self._persist()
 
     def follows(self) -> int:
         with self._lock:
@@ -481,7 +503,7 @@ class Inbox:
     def tick(self) -> None:
         """One tick: poll every follow at once, then deliver what is due."""
         with self._lock:
-            if self._polling or not self._follows:
+            if self._closed or self._polling or not self._follows:
                 return
             now = self._host.now()
             if now < self._resume_at:
@@ -504,7 +526,10 @@ class Inbox:
                 )
                 if self._queued() > before:
                     self._active_at = self._host.now()
-                self._persist()
+                # A poll that ends after the session closed saves nothing: the saved checkpoint
+                # stays before these messages, so a resumed session reads them again.
+                if not self._closed:
+                    self._persist()
         finally:
             with self._lock:
                 self._polling = False
@@ -521,7 +546,7 @@ class Inbox:
     def _chain(self, started: float) -> None:
         with self._lock:
             now = self._host.now()
-            if self._chained or not self._follows or self._wait_for(now) == 0:
+            if self._closed or self._chained or not self._follows or self._wait_for(now) == 0:
                 return
             self._chained = True
 
@@ -636,7 +661,7 @@ class Inbox:
     def deliver(self) -> None:
         """Submits everything queued as one turn of its own, once the session is idle."""
         with self._lock:
-            if self._busy or self._submitting or self._held_for_input:
+            if self._closed or self._busy or self._submitting or self._held_for_input:
                 return
             now = self._host.now()
             if self._submitted is not None:

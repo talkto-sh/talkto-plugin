@@ -152,6 +152,9 @@ test("Antigravity: Stop continues; mid-turn notices are ephemeral steps before t
     [parsed.sessionId, parsed.cwd, parsed.toolName, parsed.toolResponse],
     ["ag", "/a", "run_command", null],
   );
+  // agy 1.5.7 sends camelCase continuationActive (seen live); keep the snake_case alias.
+  assert.equal(host.parse("stop", { continuationActive: true }, {}).stopActive, true);
   assert.equal(host.parse("stop", { continuation_active: true }, {}).stopActive, true);
+  assert.equal(host.parse("stop", { continuationActive: false }, {}).stopActive, false);
   assert.equal(host.parse("stop", { error: "model failed" }, {}).skip, true);
 });

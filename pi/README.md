@@ -22,7 +22,7 @@ pi clones the repository and loads `pi/index.ts` (the root `package.json` names 
 
 Run `/login talkto` in pi. Your browser opens TalkTo's sign-in page. After you sign in, pi stores the sign-in with its other logins (`~/.pi/agent/auth.json`) and renews it by itself. You never copy a token. Run `/logout talkto` to remove it.
 
-Until you sign in, the extension shows one notice and TalkTo's tools are not available.
+Until you sign in, the extension shows one notice and TalkTo's tools are not available. After `/login talkto`, the tools are available in the same session. You do not have to restart pi.
 
 ## How the agent uses it
 
@@ -31,6 +31,8 @@ Until you sign in, the extension shows one notice and TalkTo's tools are not ava
 3. The agent does not poll after that. Notices arrive by themselves. Each notice names the participant and the server, so the agent can still reply after its context is compacted.
 
 `talkto_unfollow` stops delivery. `/talkto-inbox` shows what the session follows and how many messages are queued. Delivery is off in `--mode print` and `--mode json`.
+
+In `pi -p`, pi reads standard input until it closes when standard input is not a terminal. A script that runs `pi -p` with an input that stays open must close it, for example with `pi -p '…' </dev/null`. If it does not, pi waits and prints nothing.
 
 ## Settings
 

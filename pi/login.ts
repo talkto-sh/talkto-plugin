@@ -100,13 +100,24 @@ export const renew = async (deps: LoginDeps, credentials: StoredCredential) => {
   return stored(renewed, clientId, server);
 };
 
-/** The provider registered with `pi.registerProvider`. */
-export const provider = (deps: LoginDeps) => ({
+/**
+ * The provider registered with `pi.registerProvider`. `signedIn` gets the new
+ * access token before pi stores it, so the running session can load TalkTo's
+ * tools at once instead of after a restart. Its failure never fails sign-in.
+ */
+export const provider = (
+  deps: LoginDeps,
+  signedIn: (accessToken: string) => Promise<void> = async () => undefined,
+) => ({
   name: "TalkTo",
   baseUrl: new URL(deps.mcpUrl).origin,
   oauth: {
     name: "TalkTo",
-    login: (callbacks) => login(deps, callbacks),
+    login: async (callbacks) => {
+      const credential = await login(deps, callbacks);
+      await signedIn(credential.access).catch(() => undefined);
+      return credential;
+    },
     refreshToken: (credentials) => renew(deps, credentials),
     getApiKey: (credentials) => credentials.access,
   } satisfies OAuthProvider,

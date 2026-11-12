@@ -168,11 +168,13 @@ test("TalkTo's own tools are registered from its tool list and carry pi's stored
   await pi.emit("session_start", { reason: "startup" });
   assert.deepEqual(pi.notices, ["TalkTo: run /login talkto to connect TalkTo's tools."]);
   assert.equal(talkto.calls.length, 0, "nothing is sent without a sign-in");
-  await pi.emit("agent_start");
+  await pi.emit("before_agent_start");
   assert.equal(pi.notices.length, 1, "the person is told once");
 
   pi.signedIn = true;
   await pi.emit("agent_start");
+  assert.ok(!pi.tools.has("talkto_get_context"), "too late: the turn already has its tools");
+  await pi.emit("before_agent_start");
   assert.ok(pi.tools.has("talkto_get_context"));
   assert.ok(pi.tools.has("talkto_send_message"));
   const sentReply = await pi.tools
@@ -260,8 +262,37 @@ test("print mode has nobody to deliver to: the tools work, the follow does not s
   await assert.rejects(follow(pi), /only in an interactive pi session/);
 });
 
-test("browser sign-in: discovery, a loopback answer, and renewal with what pi stored", async () => {
-  const issuer = "https://auth.talkto.test";
+test("print and JSON runs start no poll or timer that could keep pi from exiting", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "talkto-pi-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const talkto = fakeTalkTo();
+  const setTimer = t.mock.method(globalThis, "setTimeout");
+  const setPoll = t.mock.method(globalThis, "setInterval");
+  for (const mode of ["print", "json"]) {
+    const pi = fakePi();
+    pi.mode = mode;
+    extension({ mcpUrl, fetch: talkto.fetch, now: () => Date.now(), stateDir, settings })(pi);
+    await pi.emit("session_start", { reason: "startup" });
+    await pi.emit("before_agent_start");
+    await pi.emit("agent_start");
+    await pi.tools.get("talkto_get_context").execute("call-1", {});
+    await pi.emit("agent_settled");
+    assert.equal(setPoll.mock.callCount(), 0, `${mode}: no poll`);
+    assert.equal(setTimer.mock.callCount(), 0, `${mode}: no timer`);
+  }
+
+  const interactive = fakePi();
+  extension({ mcpUrl, fetch: talkto.fetch, now: () => Date.now(), stateDir, settings })(
+    interactive,
+  );
+  await interactive.emit("session_start", { reason: "startup" });
+  assert.equal(setPoll.mock.callCount(), 1, "the check above can see a poll");
+  await interactive.emit("session_shutdown", { reason: "quit" });
+});
+
+const issuer = "https://auth.talkto.test";
+/** TalkTo's authorization server; the code exchange answers `access`, a refresh answers a2. */
+const fakeAuthServer = (access = "a1") => {
   const forms = [];
   const routes = {
     "https://talkto.test/.well-known/oauth-protected-resource/mcp": () =>
@@ -278,28 +309,31 @@ test("browser sign-in: discovery, a loopback answer, and renewal with what pi st
       const form = new URLSearchParams(init.body);
       forms.push(form);
       return form.get("grant_type") === "authorization_code"
-        ? json(200, { access_token: "a1", refresh_token: "r1", expires_in: 600 })
+        ? json(200, { access_token: access, refresh_token: "r1", expires_in: 600 })
         : json(200, { access_token: "a2", refresh_token: "r2", expires_in: 600 });
     },
   };
-  const deps = {
-    mcpUrl,
-    fetch: async (url, init) => routes[url](init),
-    now: () => 5000,
-  };
-  let opened = null;
-  const credential = await login(deps, {
-    onAuth: ({ url }) => {
-      opened = new URL(url);
-      // The browser: TalkTo's authorization server redirects to the loopback address.
-      const back = new URL(opened.searchParams.get("redirect_uri"));
-      back.searchParams.set("code", "code-1");
-      back.searchParams.set("state", opened.searchParams.get("state"));
-      fetch(back).catch(() => undefined);
-    },
-  });
-  assert.equal(opened.searchParams.get("resource"), mcpUrl);
-  assert.match(opened.searchParams.get("redirect_uri"), /^http:\/\/127\.0\.0\.1:\d+\/callback$/);
+  return { forms, fetch: async (url, init) => routes[url](init) };
+};
+/** The browser: TalkTo's authorization server redirects to the loopback address. */
+const browser = (opened = []) => ({
+  onAuth: ({ url }) => {
+    const authorize = new URL(url);
+    opened.push(authorize);
+    const back = new URL(authorize.searchParams.get("redirect_uri"));
+    back.searchParams.set("code", "code-1");
+    back.searchParams.set("state", authorize.searchParams.get("state"));
+    fetch(back).catch(() => undefined);
+  },
+});
+
+test("browser sign-in: discovery, a loopback answer, and renewal with what pi stored", async () => {
+  const auth = fakeAuthServer();
+  const deps = { mcpUrl, fetch: auth.fetch, now: () => 5000 };
+  const opened = [];
+  const credential = await login(deps, browser(opened));
+  assert.equal(opened[0].searchParams.get("resource"), mcpUrl);
+  assert.match(opened[0].searchParams.get("redirect_uri"), /^http:\/\/127\.0\.0\.1:\d+\/callback$/);
   assert.deepEqual(credential, {
     access: "a1",
     refresh: "r1",
@@ -308,14 +342,62 @@ test("browser sign-in: discovery, a loopback answer, and renewal with what pi st
     tokenEndpoint: `${issuer}/token`,
     resource: mcpUrl,
   });
-  assert.equal(forms[0].get("code"), "code-1");
+  assert.equal(auth.forms[0].get("code"), "code-1");
 
   const renewed = await renew(deps, credential);
   assert.equal(renewed.access, "a2");
   assert.equal(renewed.refresh, "r2");
-  assert.equal(forms[1].get("refresh_token"), "r1");
+  assert.equal(auth.forms[1].get("refresh_token"), "r1");
   await assert.rejects(
     renew(deps, { access: "x", refresh: "y", expires: 0 }),
     /run \/login talkto again/,
   );
+});
+
+/** An extension whose sign-in and TalkTo both answer; pi has stored no sign-in yet. */
+const signedOut = async (t, mcpFetch) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "talkto-pi-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const auth = fakeAuthServer("live-token");
+  const both = (url, init) => (url === mcpUrl ? mcpFetch(url, init) : auth.fetch(url, init));
+  const pi = fakePi();
+  pi.signedIn = false;
+  extension({ mcpUrl, fetch: both, now: () => Date.now(), stateDir, settings })(pi);
+  await pi.emit("session_start", { reason: "startup" });
+  t.after(() => pi.emit("session_shutdown", { reason: "quit" }));
+  return pi;
+};
+
+test("/login talkto loads TalkTo's tools into the running session at once", async (t) => {
+  const talkto = fakeTalkTo();
+  const pi = await signedOut(t, talkto.fetch);
+  assert.deepEqual([...pi.tools.keys()], ["talkto_follow", "talkto_unfollow"]);
+
+  const credential = await pi.providers.get("talkto").oauth.login(browser());
+  assert.equal(credential.access, "live-token");
+  assert.ok(pi.tools.has("talkto_get_context"), "no restart and no extra turn needed");
+  assert.ok(pi.tools.has("talkto_send_message"));
+  assert.equal(
+    talkto.calls.at(-1).token,
+    "Bearer live-token",
+    "the new token, before pi stores it",
+  );
+});
+
+test("a sign-in whose tool list fails still succeeds, says so, and loads them before the next turn", async (t) => {
+  const talkto = fakeTalkTo();
+  let down = true;
+  const pi = await signedOut(t, (url, init) =>
+    down ? Promise.reject(new Error("offline")) : talkto.fetch(url, init),
+  );
+
+  const credential = await pi.providers.get("talkto").oauth.login(browser());
+  assert.equal(credential.access, "live-token");
+  assert.ok(!pi.tools.has("talkto_get_context"));
+  assert.match(pi.notices.at(-1), /tries again before your next prompt/);
+
+  down = false;
+  pi.signedIn = true;
+  await pi.emit("before_agent_start");
+  assert.ok(pi.tools.has("talkto_get_context"));
 });

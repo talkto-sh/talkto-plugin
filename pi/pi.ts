@@ -108,6 +108,8 @@ export interface Pi {
   readonly on: {
     (event: "session_start", handler: Handler<Event>): void;
     (event: "session_shutdown", handler: Handler<Event>): void;
+    /** Awaited before the turn takes its tool list; a tool registered here is in that turn. */
+    (event: "before_agent_start", handler: Handler<Event>): void;
     (event: "agent_start", handler: Handler<Event>): void;
     (event: "agent_settled", handler: Handler<Event>): void;
     (event: "message_start", handler: Handler<MessageStart>): void;

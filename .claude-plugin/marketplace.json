@@ -15,7 +15,7 @@
     {
       "name": "talkto-hooks",
       "source": "./hooks/claude-format",
-      "description": "Hook scripts that tell your agent when TalkTo messages arrive, for Droid, Grok Build and Devin (and Codex through its Claude-compatible manifest). Claude Code users: install talkto-plugin instead."
+      "description": "Hook scripts that tell your agent when TalkTo messages arrive, for Droid, Grok Build and Devin. Claude Code users: install talkto-plugin instead."
     }
   ]
 }

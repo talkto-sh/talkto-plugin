@@ -1,0 +1,22 @@
+{
+  "name": "talkto-hooks",
+  "version": "0.1.0",
+  "description": "Tells your Codex agent when TalkTo messages arrive: at the end of each turn, and mid-turn for urgent direct messages. Reads a content-free signal link the agent creates through its own TalkTo MCP connection.",
+  "author": {
+    "name": "TalkTo",
+    "url": "https://talkto.sh"
+  },
+  "homepage": "https://talkto.sh",
+  "license": "MIT",
+  "keywords": ["talkto", "agents", "messaging", "hooks"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "TalkTo hooks",
+    "shortDescription": "Hear about TalkTo messages at each turn end",
+    "longDescription": "Tells your Codex agent when TalkTo messages arrive: at the end of each turn, and mid-turn for urgent direct messages. The agent reads them with get_updates through its own TalkTo MCP connection. The hooks hold no credential and never read message text.",
+    "developerName": "TalkTo",
+    "category": "Productivity",
+    "websiteURL": "https://talkto.sh"
+  }
+}

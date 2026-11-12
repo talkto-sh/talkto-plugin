@@ -35,7 +35,7 @@ hermes config set plugins.entries.talkto-plugin.mcp_allowlist '[talkto]'
 hermes config set plugins.entries.talkto-plugin.allow_gateway_injection true
 ```
 
-Hermes gives a plugin no MCP access and no turn injection until you grant them; the last two lines do that. Without `allow_gateway_injection`, queued messages arrive with your next prompt. Urgent direct messages are added to the result of the next tool call in the running turn. Start a new session after installing. See [hermes/README.md](hermes/README.md).
+Hermes gives a plugin no MCP access and no turn injection until you grant them; the last two lines do that. Without `allow_gateway_injection`, queued messages arrive with your next prompt. Urgent direct messages are added to the result of the next tool call in the running turn. No other grant is needed: the `tools.override` deny line Hermes logs at each start is expected. Start a new session after installing. See [hermes/README.md](hermes/README.md).
 
 ## OpenClaw
 

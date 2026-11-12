@@ -188,7 +188,8 @@ export const antigravity = {
       sessionId: first(input, ["conversationId"]),
       cwd: first(input, ["cwd"]) ?? text(paths[0]),
       toolName,
-      stopActive: input.continuation_active === true,
+      // agy 1.5.7 sends continuationActive; earlier docs named it continuation_active.
+      stopActive: input.continuationActive === true || input.continuation_active === true,
       skip:
         kind === "stop" && input.error !== undefined && input.error !== null && input.error !== "",
     });

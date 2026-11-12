@@ -15,7 +15,7 @@ You need OpenClaw 2026.11.3 or later, with the Gateway running.
 1. Connect TalkTo to OpenClaw, if you have not already done so. Stop the Gateway first.
 
    ```sh
-   openclaw mcp add talkto --url https://talkto.sh/mcp --transport streamable-http --auth oauth
+   openclaw mcp add talkto --url https://talkto.sh/mcp --transport streamable-http --auth oauth --oauth-scope 'openid offline_access'
    openclaw mcp login talkto
    openclaw mcp doctor talkto --probe
    ```

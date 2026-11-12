@@ -173,11 +173,19 @@ export const extension =
       connectionHint: "Ask the person to run /login talkto in pi.",
     });
 
-    /** Registers TalkTo's own tools once a sign-in exists. */
-    const registerRemoteTools = async () => {
-      if (remoteTools || ctx === null) return;
+    /**
+     * Registers TalkTo's own tools once a sign-in exists. pi adds a tool
+     * registered mid-session to the active tools, but a turn keeps the tool
+     * list it started with, so this runs before a turn starts and right after
+     * `/login talkto`, with the new token (pi has not stored it yet).
+     */
+    const registerRemoteTools = async (freshToken: string | null = null) => {
+      if (remoteTools || (ctx === null && freshToken === null)) return;
+      const lister: Endpoint =
+        freshToken === null ? endpoint : { ...endpoint, token: async () => freshToken };
       try {
-        const tools = await listTools(endpoint);
+        const tools = await listTools(lister);
+        if (remoteTools) return;
         for (const tool of tools)
           pi.registerTool({
             name: `talkto_${tool.name}`,
@@ -192,8 +200,15 @@ export const extension =
           });
         remoteTools = true;
       } catch (cause) {
-        if (!(cause instanceof SignInRequired) || toldToSignIn || ctx === null || !ctx.hasUI)
+        if (ctx === null || !ctx.hasUI) return;
+        if (freshToken !== null) {
+          ctx.ui.notify(
+            "TalkTo: signed in, but TalkTo's tools could not be loaded yet. pi tries again before your next prompt.",
+            "warning",
+          );
           return;
+        }
+        if (!(cause instanceof SignInRequired) || toldToSignIn) return;
         toldToSignIn = true;
         ctx.ui.notify("TalkTo: run /login talkto to connect TalkTo's tools.", "info");
       }
@@ -207,7 +222,10 @@ export const extension =
       ctx = null;
     };
 
-    pi.registerProvider(providerName, provider(deps));
+    pi.registerProvider(
+      providerName,
+      provider(deps, (accessToken) => registerRemoteTools(accessToken)),
+    );
 
     pi.registerTool({
       name: "talkto_follow",
@@ -253,12 +271,16 @@ export const extension =
       timers.add(poll);
     });
     pi.on("session_shutdown", () => stop());
-    pi.on("agent_start", async (_event, context) => {
+    // Runs before the turn takes its tool list, unlike agent_start.
+    pi.on("before_agent_start", async (_event, context) => {
+      ctx = context;
+      await registerRemoteTools();
+    });
+    pi.on("agent_start", (_event, context) => {
       ctx = context;
       turn += 1;
       turnId = `pi-${turn}`;
       inbox?.onTurnStart(turnId);
-      await registerRemoteTools();
     });
     pi.on("agent_settled", async (_event, context) => {
       ctx = context;

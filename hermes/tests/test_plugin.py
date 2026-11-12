@@ -109,6 +109,13 @@ class PluginTest(unittest.TestCase):
         self.assertIn("this Hermes session", ctx.tools["talkto_follow"]["schema"]["description"])
         self.assertEqual(ctx.tools["talkto_follow"]["schema"]["parameters"]["required"], ["serverId", "participantId"])
 
+    def test_the_toolset_is_not_named_after_the_talkto_mcp_server(self) -> None:
+        # Hermes aliases each MCP server's name to its toolset (mcp-talkto), so a plugin toolset
+        # named "talkto" hides either the plugin's tools or TalkTo's MCP tools.
+        ctx, _, _ = started()
+        self.assertEqual({tool["toolset"] for tool in ctx.tools.values()}, {"talkto-plugin"})
+        self.assertNotEqual(binding.TOOLSET, binding.DEFAULT_SERVER)
+
     def test_follow_calls_talkto_through_hermes_mcp_with_the_agents_own_participant(self) -> None:
         ctx, clock, _ = started()
         self.assertTrue(follow(ctx, clock).startswith("Following participant"))
@@ -195,6 +202,76 @@ class PluginTest(unittest.TestCase):
         extra = ctx.hooks["pre_llm_call"](session_id=SESSION, turn_id="t1", user_message="hello")
         self.assertIn("ping", extra["context"])
 
+    def test_a_refused_injection_names_the_session_and_does_not_guess_the_cause(self) -> None:
+        ctx, clock, _ = started()
+        ctx.inject_answer = False
+        follow(ctx, clock)
+        ctx.answers.append(hermes_ok(envelope([message(body="ping")])))
+        with self.assertLogs("talkto-plugin", level="WARNING") as logs:
+            clock.advance(0)
+        text = "\n".join(logs.output)
+        self.assertIn(KEY, text)
+        self.assertIn("not a live local session", text)
+        self.assertNotIn("Set plugins.entries", text, "the setting may already be on")
+
+    def test_an_ended_session_is_never_polled_or_given_a_turn(self) -> None:
+        ctx, clock, _ = started()
+        ctx.hooks["pre_llm_call"](session_id=SESSION, turn_id="t1", user_message="work")
+        follow(ctx, clock)
+        ctx.hooks["on_session_end"](session_id=SESSION, turn_id="t1", completed=True)
+        # A one-shot run ends its session; Hermes's gateway, and the plugin, stay up.
+        ctx.hooks["on_session_finalize"](session_id=SESSION, platform="cli", reason="cli_close")
+        calls = len(ctx.calls)
+        ctx.answers.append(hermes_ok(envelope([message(body="too late")])))
+        clock.advance(binding.WAIT_SECONDS * 1000)
+        clock.advance(60_000)
+        self.assertEqual(len(ctx.calls), calls, "no more polls for the ended session")
+        self.assertEqual(ctx.injected, [], "no turn is started in the ended session")
+        (saved,) = ctx.state.values.values()
+        self.assertEqual(len(saved["follows"]), 1, "the follow stays saved")
+
+        # The same session resumed: delivery restarts from the saved checkpoint.
+        ctx.hooks["pre_llm_call"](session_id=SESSION, turn_id="t2", user_message="back")
+        clock.advance(0)
+        self.assertGreater(len(ctx.calls), calls)
+        self.assertEqual(ctx.calls[calls][2]["checkpoint"], saved["follows"][0]["checkpoint"])
+
+    def test_a_deleted_session_forgets_its_follows(self) -> None:
+        ctx, clock, _ = started()
+        follow(ctx, clock)
+        ctx.hooks["on_session_delete"](session_id=SESSION, reason="delete", profile="default")
+        self.assertEqual(list(ctx.state.values.values()), [None])
+        self.assertIn("follows no participant", ctx.commands["talkto-inbox"]("", session_key=KEY))
+
+    def test_an_urgent_message_reaches_a_turn_whose_start_the_plugin_missed(self) -> None:
+        ctx, clock, _ = started()
+        follow(ctx, clock)  # no pre_llm_call: the plugin loaded while the turn ran
+        # The follow call's own result tells the plugin which turn runs.
+        ctx.hooks["transform_tool_result"](
+            tool_name="talkto_follow", result="{}", session_id=SESSION, turn_id="t7"
+        )
+        ctx.answers.append(
+            hermes_ok(envelope([message(conversationId=DIRECT, priority="urgent", body="stop now")]))
+        )
+        clock.advance(0)
+        changed = ctx.hooks["transform_tool_result"](
+            tool_name="terminal", result="ok", session_id=SESSION, turn_id="t7"
+        )
+        assert changed is not None
+        self.assertIn("stop now", changed)
+        self.assertEqual(ctx.injected, [], "not also started as a turn of its own")
+
+    def test_a_late_tool_result_does_not_restart_an_ended_turn(self) -> None:
+        ctx, clock, _ = started()
+        ctx.hooks["pre_llm_call"](session_id=SESSION, turn_id="t1", user_message="work")
+        follow(ctx, clock)
+        ctx.hooks["on_session_end"](session_id=SESSION, turn_id="t1", completed=True)
+        ctx.hooks["transform_tool_result"](tool_name="terminal", result="ok", session_id=SESSION, turn_id="t1")
+        ctx.answers.append(hermes_ok(envelope([message(body="after the turn")])))
+        clock.advance(binding.WAIT_SECONDS * 1000)
+        clock.advance(2000)
+        self.assertEqual(len(ctx.injected), 1, "the session is idle, so the notice starts a turn")
+
     def test_subagent_turns_are_ignored(self) -> None:
         ctx, clock, _ = started()
         follow(ctx, clock)
@@ -228,6 +305,34 @@ class PluginTest(unittest.TestCase):
         answer = json.loads(ctx.tools["talkto_unfollow"]["handler"]({"serverId": SERVER}, session_id=SESSION))
         self.assertIn("Stopped following", answer["message"])
         self.assertEqual(list(ctx.state.values.values()), [None])
+
+
+class SessionKeyTest(unittest.TestCase):
+    def test_the_key_is_what_hermes_bound_to_this_call_never_the_process_environment(self) -> None:
+        import os
+        import sys
+        import types
+
+        gateway = types.ModuleType("gateway")
+        context = types.ModuleType("gateway.session_context")
+        context.bound_session_key = lambda: ""  # type: ignore[attr-defined]
+        context.get_session_env = lambda name, default="": os.environ.get(name, default)  # type: ignore[attr-defined]
+        saved = {name: sys.modules.get(name) for name in ("gateway", "gateway.session_context")}
+        sys.modules.update({"gateway": gateway, "gateway.session_context": context})
+        os.environ["HERMES_SESSION_KEY"] = "agent:main:local:dm:an-ended-session"
+        try:
+            self.assertEqual(binding._hermes_session_key(), "")
+            context.bound_session_key = lambda: KEY  # type: ignore[attr-defined]
+            self.assertEqual(binding._hermes_session_key(), KEY)
+            del context.bound_session_key  # an older Hermes
+            self.assertEqual(binding._hermes_session_key(), "agent:main:local:dm:an-ended-session")
+        finally:
+            del os.environ["HERMES_SESSION_KEY"]
+            for name, module in saved.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
 
 class AnswerTest(unittest.TestCase):
