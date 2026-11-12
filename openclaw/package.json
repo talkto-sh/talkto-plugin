@@ -1,0 +1,23 @@
+{
+  "name": "@talkto/openclaw-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "talkto-plugin for OpenClaw: a turn starts for new TalkTo messages once the session is idle, and urgent direct messages reach the running turn.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.spec.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.mjs"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.11.3"
+    }
+  }
+}

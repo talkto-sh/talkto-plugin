@@ -200,8 +200,10 @@ const countsFrom = (value) => {
 
 /**
  * Ask the link for counts after the saved cursor. Never throws: offline, slow or failing servers
- * become a quiet retry later.
- * @param {State} state @param {Dependencies} deps @param {number} timeoutMs
+ * become a quiet retry later. The OpenClaw plugin calls this too, with its own state.
+ * @param {Pick<State, "url" | "cursor" | "expiresAt">} state
+ * @param {Pick<Dependencies, "fetch" | "now"> & { settings: Pick<Settings, "backoffMs"> }} deps
+ * @param {number} timeoutMs
  * @returns {Promise<Check>}
  */
 export const check = async (state, deps, timeoutMs) => {

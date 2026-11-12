@@ -17,6 +17,8 @@ export const folders = [
 ];
 export const source = { scripts: join(root, "src"), skill: join(root, "skill", "SKILL.md") };
 export const scriptFolder = (name) => join(root, name, "scripts");
+/** Other plugins that reuse the signal-link core: the OpenClaw plugin reads the same links. */
+export const coreCopies = [{ folder: join(root, "..", "openclaw", "core"), names: ["core.mjs"] }];
 export const skillFile = (name) => join(root, name, "skills", "talkto-signal", "SKILL.md");
 
 if (process.argv[1] === fileURLToPath(import.meta.url))
@@ -30,4 +32,12 @@ if (process.argv[1] === fileURLToPath(import.meta.url))
       await mkdir(dirname(skillFile(folder.name)), { recursive: true });
       await copyFile(source.skill, skillFile(folder.name));
     }
+  }
+if (process.argv[1] === fileURLToPath(import.meta.url))
+  for (const copy of coreCopies) {
+    await mkdir(copy.folder, { recursive: true });
+    for (const name of await readdir(copy.folder))
+      if (!copy.names.includes(name)) await rm(join(copy.folder, name));
+    for (const name of copy.names)
+      await copyFile(join(source.scripts, name), join(copy.folder, name));
   }

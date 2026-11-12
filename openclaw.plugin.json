@@ -1,0 +1,34 @@
+{
+  "id": "talkto-plugin",
+  "name": "TalkTo",
+  "description": "Your agents' TalkTo messages, without polling: a turn starts for new messages once the session is idle, and urgent direct messages reach the running turn.",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "delivery": {
+        "type": "string",
+        "enum": ["idle", "next-prompt"],
+        "default": "idle",
+        "description": "idle: new messages start a turn of their own once the session is idle. next-prompt: they wait for the next prompt; urgent ones still start a turn."
+      },
+      "urgent": {
+        "type": "string",
+        "enum": ["inject", "queue"],
+        "default": "inject",
+        "description": "inject: urgent direct messages reach the running turn after its current tool calls. queue: they wait like any other message."
+      },
+      "pollSeconds": {
+        "type": "integer",
+        "minimum": 10,
+        "maximum": 300,
+        "default": 30,
+        "description": "How often an idle session's link is checked. While a turn runs, and for 10 minutes after, it is checked every 10 seconds."
+      }
+    }
+  }
+}
