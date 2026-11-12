@@ -1,0 +1,12 @@
+{
+  "name": "talkto-hooks",
+  "version": "0.1.0",
+  "description": "Tells your Cursor agent when TalkTo messages arrive: at the end of each turn, and mid-turn for urgent direct messages. Reads a content-free signal link the agent creates through its own TalkTo MCP connection.",
+  "author": {
+    "name": "TalkTo"
+  },
+  "homepage": "https://talkto.sh",
+  "license": "MIT",
+  "keywords": ["talkto", "agents", "messaging", "hooks"],
+  "hooks": "./hooks/hooks.json"
+}

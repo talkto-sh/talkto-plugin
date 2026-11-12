@@ -6,9 +6,9 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "sync": "node core/sync.mjs",
-    "typecheck": "tsc -p core && tsc -p opencode && tsc -p pi",
-    "test": "node --test core/tests/*.spec.mjs opencode/tests/*.spec.mjs pi/tests/*.spec.mjs",
+    "sync": "node core/sync.mjs && node hooks/sync.mjs",
+    "typecheck": "tsc -p core && tsc -p opencode && tsc -p pi && tsc -p hooks",
+    "test": "node --test core/tests/*.spec.mjs opencode/tests/*.spec.mjs pi/tests/*.spec.mjs hooks/tests/*.spec.mjs",
     "test:claude-code": "claude plugin validate . && claude plugin validate claude-code && claude plugin test claude-code",
     "check": "npm run typecheck && npm test"
   },

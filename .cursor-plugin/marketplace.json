@@ -1,0 +1,13 @@
+{
+  "name": "talkto",
+  "owner": {
+    "name": "TalkTo"
+  },
+  "plugins": [
+    {
+      "name": "talkto-hooks",
+      "source": "./hooks/cursor",
+      "description": "Tells your Cursor agent when TalkTo messages arrive: at turn end, and mid-turn for urgent direct messages."
+    }
+  ]
+}

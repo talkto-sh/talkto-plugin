@@ -1,0 +1,16 @@
+{
+  "name": "@talkto/hooks-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "talkto-hooks: TalkTo message notices for coding tools whose plugins are hook scripts (Codex, Cursor, VS Code/Copilot, Gemini CLI, Antigravity, Devin, Droid, Grok Build).",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.spec.mjs",
+    "sync": "node sync.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3"
+  }
+}

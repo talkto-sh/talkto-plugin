@@ -1,0 +1,56 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "talkto-session-start",
+            "type": "command",
+            "command": "node \"${extensionPath}${/}scripts${/}talkto-hook.mjs\" gemini session-start",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "talkto-prompt",
+            "type": "command",
+            "command": "node \"${extensionPath}${/}scripts${/}talkto-hook.mjs\" gemini prompt",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "talkto-after-tool",
+            "type": "command",
+            "command": "node \"${extensionPath}${/}scripts${/}talkto-hook.mjs\" gemini after-tool",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "talkto-stop",
+            "type": "command",
+            "command": "node \"${extensionPath}${/}scripts${/}talkto-hook.mjs\" gemini stop",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

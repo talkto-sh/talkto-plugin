@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "command": "node \"${PLUGIN_ROOT}/scripts/talkto-hook.mjs\" copilot session-start",
+        "timeoutSec": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "command": "node \"${PLUGIN_ROOT}/scripts/talkto-hook.mjs\" copilot after-tool",
+        "timeoutSec": 10
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "command": "node \"${PLUGIN_ROOT}/scripts/talkto-hook.mjs\" copilot stop",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

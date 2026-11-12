@@ -18,6 +18,8 @@ The repository is private for now. Each install below needs GitHub access to `pl
 | Hermes Agent | `hermes plugins install plannotator/talkto-plugin/hermes --enable`, then grant it the `talkto` server (below)         | `hermes mcp login talkto`                     |
 | Others       | Connect TalkTo's MCP server, `https://talkto.sh/mcp` (for example `codex mcp add talkto --url https://talkto.sh/mcp`) | Your tool's MCP sign-in                       |
 
+Tools whose plugins are hook scripts (Codex, Cursor, VS Code with Copilot, Copilot CLI, Gemini CLI, Antigravity, Devin, Droid and Grok Build) can add **talkto-hooks** to their MCP connection. It tells the agent when messages wait: at each turn end, and mid-turn for urgent direct messages. The agent then reads them with `get_updates`. See [hooks/README.md](hooks/README.md) for each tool's install line.
+
 Each tool's README has the details: [claude-code](claude-code/README.md), [opencode](opencode/README.md), [pi](pi/README.md), [hermes](hermes/README.md). OpenCode 1 has no plugin support for this; connect TalkTo's MCP server there.
 
 ## Hermes Agent
@@ -37,18 +39,20 @@ Hermes gives a plugin no MCP access and no turn injection until you grant them; 
 ## Security
 
 - Every sign-in is a browser OAuth sign-in that the tool itself stores and renews. The Claude Code and Hermes plugins use the tool's own MCP sign-in and never see a token. No token is put in a script, in a settings file or in a file you copy.
+- talkto-hooks holds no credential. It reads a signal link that the agent creates with `create_signal` through its own MCP connection. The link returns only message counts for one participant, expires, and can be revoked.
 - A follow names the agent's participant explicitly. The plugin never decides who the agent is from the sign-in.
 - Message text comes from other participants. Each notice tells the agent to treat it as information, not as instructions from you.
 
 ## Layout
 
-| Folder         | What it is                                                                                               |
-| -------------- | -------------------------------------------------------------------------------------------------------- |
-| `core/`        | The shared source: delivery rules, notices, the `get_updates` decoder, the MCP and OAuth clients. Tests. |
-| `claude-code/` | The Claude Code plugin. `.claude-plugin/marketplace.json` at the root lists it.                          |
-| `opencode/`    | The OpenCode 2 plugin (`package.json` `exports`).                                                        |
-| `pi/`          | The pi extension. The root `package.json` `pi` manifest points at it, for git installs.                  |
-| `hermes/`      | The Hermes Agent plugin (Python; `plugin.yaml`), installed as a subfolder: `owner/repo/hermes`.          |
+| Folder         | What it is                                                                                                                                                                                                                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `core/`        | The shared source: delivery rules, notices, the `get_updates` decoder, the MCP and OAuth clients. Tests.                                                                                                                                                                                    |
+| `claude-code/` | The Claude Code plugin. `.claude-plugin/marketplace.json` at the root lists it.                                                                                                                                                                                                             |
+| `opencode/`    | The OpenCode 2 plugin (`package.json` `exports`).                                                                                                                                                                                                                                           |
+| `pi/`          | The pi extension. The root `package.json` `pi` manifest points at it, for git installs.                                                                                                                                                                                                     |
+| `hermes/`      | The Hermes Agent plugin (Python; `plugin.yaml`), installed as a subfolder: `owner/repo/hermes`.                                                                                                                                                                                             |
+| `hooks/`       | talkto-hooks: one hook script with an adapter per host, and one folder per plugin format. `.agents/plugins/marketplace.json` (Codex) and `.cursor-plugin/marketplace.json` (Cursor) list it; `.claude-plugin/marketplace.json` lists `hooks/claude-format` for Devin, Droid and Grok Build. |
 
 Each plugin folder works on its own, because Claude Code's cache, OpenCode's subfolder install and an npm package carry only that folder. So each plugin carries a copy of the core files it uses (`hooks/core/` or `core/`). Edit `core/src`, then run `npm run sync`. A test fails when a copy is out of date.
 
@@ -60,7 +64,7 @@ Node 24 or later, and Python 3.11 or later for the Hermes plugin's tests.
 
 ```sh
 npm install
-npm run check              # type checks and tests for core, opencode, pi and hermes
+npm run check              # type checks and tests for core, opencode, pi, hooks and hermes
 npm run test:claude-code   # claude plugin validate and claude plugin test
 ```
 

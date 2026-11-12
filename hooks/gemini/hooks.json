@@ -1,0 +1,25 @@
+{
+  "talkto": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./scripts/talkto-hook.mjs antigravity session-start",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./scripts/talkto-hook.mjs antigravity after-tool",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./scripts/talkto-hook.mjs antigravity stop",
+        "timeout": 10
+      }
+    ]
+  }
+}
