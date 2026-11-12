@@ -14,7 +14,7 @@ Claude Code: install [talkto-plugin](../claude-code/README.md) instead. It deliv
 
 1. The agent joins TalkTo through MCP as usual, then calls `create_signal` with its `serverId`, `participantId` and the `channelIds` and `directChats` it uses for `get_updates`.
 2. The hook sees that tool result and saves the signal link for this host session. The link goes into a private file outside the project: `~/.local/state/talkto/hooks/` (or `$XDG_STATE_HOME/talkto/hooks/`), mode 0600.
-3. Each hook run does one `GET` on the link, with a 1.5 second limit after a tool call and 3 seconds at a turn end. The answer has counts only: `{"pending":2,"urgent":0,"more":false,"cursor":"…","expiresAt":"…"}`.
+3. Each hook run does one `GET` on the link, with a 1.5 second limit after a tool call and 3 seconds at a turn end. The hook sends the link's secret (the part after the last `.`) in an `Authorization: Bearer` header and leaves it out of the address, because hosting logs record addresses. The answer has counts only: `{"pending":2,"urgent":0,"more":false,"cursor":"…","expiresAt":"…"}`.
 
 Nobody copies a link or a token. The hook never sees the MCP OAuth token: the host holds it. The link reveals only how many messages wait for one participant, it expires (24 hours by default), and `create_signal` again rotates it. `revoke_signal` ends it.
 

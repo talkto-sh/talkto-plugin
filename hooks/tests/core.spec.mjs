@@ -4,7 +4,16 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defaults, fileStore, fresh, handle, linkFrom, notices, stateKey } from "../src/core.mjs";
+import {
+  checkRequest,
+  defaults,
+  fileStore,
+  fresh,
+  handle,
+  linkFrom,
+  notices,
+  stateKey,
+} from "../src/core.mjs";
 
 const server = "7c1e9a52-3b0f-4c55-9d7e-0d2f3c4b5a61";
 const signal = "0b7a3c1d-2e4f-4a6b-8c9d-1e2f3a4b5c6d";
@@ -18,6 +27,7 @@ const world = (answers = []) => {
   let state = null;
   let clock = 1_000_000;
   const requests = [];
+  const authorizations = [];
   const deps = {
     load: async () => (state === null ? null : structuredClone(state)),
     save: async (value) => {
@@ -26,8 +36,9 @@ const world = (answers = []) => {
     forget: async () => {
       state = null;
     },
-    fetch: async (target) => {
+    fetch: async (target, init) => {
       requests.push(target);
+      authorizations.push(init.headers.authorization);
       const next = answers.shift() ?? { pending: 0, urgent: 0 };
       if (next instanceof Error) throw next;
       if (Number.isInteger(next))
@@ -45,6 +56,7 @@ const world = (answers = []) => {
   return {
     deps,
     requests,
+    authorizations,
     get state() {
       return state;
     },
@@ -138,6 +150,29 @@ test("turn end continues once per batch; the cursor moves so the same messages n
   assert.deepEqual(second, {});
   assert.ok(w.requests[1].endsWith(`since=${message(2)}`));
   assert.ok(!w.requests[0].includes("since="));
+});
+
+test("a check sends the link's secret in the Authorization header, never in the URL", async () => {
+  const w = world([
+    { pending: 1, urgent: 0, cursor: message(1) },
+    { pending: 0, urgent: 0 },
+  ]);
+  linked(w);
+  await handle(hook("stop"), w.deps);
+  await handle(hook("stop", { stopActive: false }), w.deps);
+  assert.equal(w.requests[0], `https://talkto.sh/v1/signals/${server}/${signal}`);
+  assert.equal(
+    w.requests[1],
+    `https://talkto.sh/v1/signals/${server}/${signal}?since=${message(1)}`,
+  );
+  for (const request of w.requests) assert.ok(!request.includes(secret), request);
+  assert.deepEqual(w.authorizations, [`Bearer ${secret}`, `Bearer ${secret}`]);
+  assert.deepEqual(checkRequest(url), {
+    url: `https://talkto.sh/v1/signals/${server}/${signal}`,
+    secret,
+  });
+  assert.equal(checkRequest(`${url}/more`), null);
+  assert.equal(checkRequest("https://talkto.sh/v1/servers"), null);
 });
 
 test("continuations are capped even on hosts without a cap of their own", async () => {

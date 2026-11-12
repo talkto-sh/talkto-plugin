@@ -19,8 +19,10 @@ const message = "00000000-0000-4000-8000-000000000042";
 const stub = async (t) => {
   const answers = [];
   const seen = [];
+  const authorizations = [];
   const http = createServer((request, response) => {
     seen.push(request.url);
+    authorizations.push(request.headers.authorization);
     const next = answers.shift() ?? { pending: 0, urgent: 0 };
     if (next === "hang") return; // never answers
     if (Number.isInteger(next)) {
@@ -38,6 +40,7 @@ const stub = async (t) => {
   return {
     answers,
     seen,
+    authorizations,
     url: `http://127.0.0.1:${port}/v1/signals/${server}/${signal}.${secret}`,
   };
 };
@@ -112,7 +115,10 @@ test("Claude-format hosts: the link is saved from create_signal, the turn end co
     stop_hook_active: true,
   });
   assert.equal(again.out, "");
-  assert.equal(s.seen.at(-1), `/v1/signals/${server}/${signal}.${secret}?since=${message}`);
+  // The secret travels in the Authorization header, never in the URL that request logs record.
+  assert.equal(s.seen.at(-1), `/v1/signals/${server}/${signal}?since=${message}`);
+  assert.equal(s.authorizations.at(-1), `Bearer ${secret}`);
+  for (const url of s.seen) assert.ok(!url.includes(secret), url);
 
   // Grok fires Stop when a session closes: that must never continue anything.
   s.answers.push({ pending: 4, urgent: 0 });

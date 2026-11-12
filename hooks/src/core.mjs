@@ -199,6 +199,25 @@ const countsFrom = (value) => {
 };
 
 /**
+ * The request that checks a saved link: its URL without the secret, and the secret for the
+ * Authorization header. Request URLs end up in the server's hosting logs; header values do not,
+ * so the secret never goes in the URL. Null when the saved text is not a link.
+ * @param {string} link
+ * @returns {{ url: string, secret: string } | null}
+ */
+export const checkRequest = (link) => {
+  const found = linkPattern.exec(link);
+  if (found === null || found[0] !== link) return null;
+  const url = new URL(link);
+  const dot = url.pathname.lastIndexOf(".");
+  const secret = url.pathname.slice(dot + 1);
+  url.pathname = url.pathname.slice(0, dot);
+  url.search = "";
+  url.hash = "";
+  return { url: url.href, secret };
+};
+
+/**
  * Ask the link for counts after the saved cursor. Never throws: offline, slow or failing servers
  * become a quiet retry later. The OpenClaw plugin calls this too, with its own state.
  * @param {Pick<State, "url" | "cursor" | "expiresAt">} state
@@ -211,11 +230,17 @@ export const check = async (state, deps, timeoutMs) => {
   if (state.expiresAt !== null && Date.parse(state.expiresAt) <= now) return { kind: "dead" };
   const later = { kind: /** @type {const} */ ("later"), retryAt: now + deps.settings.backoffMs };
   try {
-    const target = new URL(state.url);
+    const request = checkRequest(state.url);
+    if (request === null) return { kind: "dead" };
+    const target = new URL(request.url);
     if (state.cursor !== null) target.searchParams.set("since", state.cursor);
     const response = await deps.fetch(target.href, {
       signal: AbortSignal.timeout(timeoutMs),
-      headers: { accept: "application/json", "user-agent": "talkto-hooks/0.1" },
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${request.secret}`,
+        "user-agent": "talkto-hooks/0.2",
+      },
     });
     if (response.status === 404 || response.status === 410) return { kind: "dead" };
     if (response.status === 429) {

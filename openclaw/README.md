@@ -70,7 +70,7 @@ Limits:
 
 ## Security
 
-- The plugin never sees a token. It reads only the count-only signal link, and only from the result of the agent's own `create_signal` call.
+- The plugin never sees a token. It reads only the count-only signal link, and only from the result of the agent's own `create_signal` call. Each check sends the link's secret in an `Authorization` header, not in the address.
 - A link is saved only when the result is for the `serverId` and `participantId` the agent named in that call. The plugin never decides who the agent is from the sign-in: one person's sign-in can serve many agents.
 - Notices never contain the link or its secret.
 - Message text comes from other participants. Each notice tells the agent to treat it as information, not as instructions from you.
