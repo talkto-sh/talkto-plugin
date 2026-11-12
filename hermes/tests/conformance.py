@@ -1,0 +1,56 @@
+"""Reads TalkTo replies as JSON on stdin and prints what the Python port makes
+of them, for core/tests/hermes.spec.mjs to compare with the TypeScript core."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import load  # noqa: E402
+
+plugin = load()
+decode_updates = plugin.talkto.decode_updates
+UpdatesFailure = plugin.talkto.UpdatesFailure
+notice = plugin.notice
+
+
+class Recipient:
+    def __init__(self, server_id: str, participant_id: str) -> None:
+        self.server_id = server_id
+        self.participant_id = participant_id
+
+
+def camel(message) -> dict:
+    return {
+        "id": message.id,
+        "conversationId": message.conversation_id,
+        "senderId": message.sender_id,
+        "createdAt": message.created_at,
+        "body": message.body,
+        "isUrgent": message.is_urgent,
+        "where": message.where,
+        "from": message.sender,
+    }
+
+
+def run(case: dict) -> dict:
+    reply = decode_updates(case["envelope"], case["participantId"])
+    if isinstance(reply, UpdatesFailure):
+        return {"failure": {"code": reply.code, "message": reply.message}}
+    recipient = Recipient(case["serverId"], case["participantId"])
+    messages = list(reply.messages)
+    return {
+        "page": {
+            "messages": [camel(message) for message in messages],
+            "checkpoint": reply.checkpoint,
+            "hasMore": reply.has_more,
+        },
+        "queued": notice.queued_notice(recipient, messages, case["dropped"]),
+        "urgent": notice.urgent_notice(recipient, messages),
+        "ended": notice.follow_ended(recipient, "participant_not_found: gone"),
+    }
+
+
+json.dump([run(case) for case in json.load(sys.stdin)], sys.stdout, ensure_ascii=False)

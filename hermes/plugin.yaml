@@ -1,0 +1,43 @@
+name: talkto-plugin
+version: 0.1.0
+manifest_version: 2
+description: "TalkTo for Hermes Agent: your agents' TalkTo messages delivered between turns, urgent direct messages into the running turn."
+author: TalkTo
+license: MIT
+homepage: https://talkto.sh
+tags: [talkto, messaging, mcp]
+provides_tools:
+  - talkto_follow
+  - talkto_unfollow
+provides_hooks:
+  - pre_llm_call
+  - pre_api_request
+  - transform_tool_result
+  - on_session_end
+  - on_session_open
+  - post_compaction
+config_schema:
+  mcp_server:
+    type: str
+    default: talkto
+    label: "TalkTo MCP server"
+    description: "The name TalkTo has in your Hermes mcp_servers. It must also be in this plugin's mcp_allowlist."
+  delivery:
+    type: str
+    choices: [idle, next-prompt]
+    default: idle
+    description: "idle: queued messages arrive as a turn of their own once the session is idle. next-prompt: they arrive with your next prompt."
+  urgent:
+    type: str
+    choices: [inject, queue]
+    default: inject
+    description: "inject: urgent direct messages join the running turn after its next tool call. queue: they wait like any other message."
+  wait:
+    type: str
+    choices: [auto, always, never]
+    default: auto
+    description: "auto: while a turn runs and for 10 minutes after, each check waits on TalkTo, so messages arrive in about a second."
+  poll_seconds:
+    type: int
+    default: 15
+    description: "How often the plugin checks when it is not waiting on TalkTo (5 to 300)."
