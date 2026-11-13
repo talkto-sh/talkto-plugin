@@ -94,16 +94,24 @@ export const run = async (args, env) => {
   }
   const kind = kinds[command];
   if (kind === undefined) return "";
-  const parsed = host.parse(kind, await readInput(), env);
+  const input = await readInput();
+  const parsed = host.parse(kind, input, env);
+  const foundLink =
+    host.findLink === undefined || parsed.skip
+      ? null
+      : await host.findLink(kind, input).catch(() => null);
   const store = fileStore(directory, stateKey(hostName, parsed.sessionId, parsed.cwd));
-  const reply = await handle(parsed, {
-    ...store,
-    fetch: (url, init) => fetch(url, init),
-    now: () => Date.now(),
-    settings: settingsFrom(env),
-    saveCommand: saveCommand(hostName, parsed.sessionId),
-    quietStart: env.TALKTO_HOOKS_QUIET_START === "1",
-  });
+  const reply = await handle(
+    { ...parsed, foundLink },
+    {
+      ...store,
+      fetch: (url, init) => fetch(url, init),
+      now: () => Date.now(),
+      settings: settingsFrom(env),
+      saveCommand: saveCommand(hostName, parsed.sessionId),
+      quietStart: env.TALKTO_HOOKS_QUIET_START === "1",
+    },
+  );
   return host.render(parsed, reply);
 };
 

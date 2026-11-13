@@ -71,6 +71,7 @@ const fakeTalkTo = () => {
             tools: [
               { name: "get_context", description: "Start here.", inputSchema: { type: "object" } },
               { name: "send_message", description: "Send.", inputSchema: { type: "object" } },
+              { name: "get_updates", description: "Read.", inputSchema: { type: "object" } },
             ],
           },
         });
@@ -232,6 +233,35 @@ test("queued messages arrive as one follow-up turn once pi is idle; urgent ones 
   await settle();
   const after = JSON.parse(await readFile(join(stateDir, "session-1.json"), "utf8"));
   assert.equal(after.follows[0].pending.length, 0);
+});
+
+test("an urgent message the agent read with get_updates in the turn gets no follow-up turn", async (t) => {
+  const { pi, talkto, advance } = await start(t);
+  await pi.emit("session_start", { reason: "startup" });
+  talkto.updates.push(page([], "cp-start"));
+  await follow(pi);
+
+  pi.idle = false;
+  const urgent = message({ conversationId: direct, priority: "urgent", body: "stop the deploy" });
+  talkto.updates.push(page([urgent], "cp-1"));
+  await pi.emit("agent_start");
+  await advance(0);
+  assert.equal(pi.sent.length, 1);
+  assert.equal(pi.sent[0].deliverAs, "steer");
+  // pi never shows the steered row before the turn ends, but the agent reads the message itself.
+  talkto.updates.push(page([urgent], "cp-agent"));
+  await pi.tools.get("talkto_get_updates").execute("call-2", {
+    serverId: server,
+    participantId: me,
+    mode: "poll",
+    checkpoint: "cp-start",
+  });
+
+  pi.idle = true;
+  await pi.emit("agent_settled");
+  await advance(2000);
+  assert.equal(pi.sent.length, 1, "nothing more is sent");
+  for (const sent of pi.sent) assert.doesNotMatch(sent.text, /may not have read it/);
 });
 
 test("a notice pi never shows stays queued, and a restart restores the follow", async (t) => {

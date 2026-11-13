@@ -1,7 +1,20 @@
 // Each adapter reads its host's documented hook input and writes its host's documented output.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { hosts } from "../src/hosts.mjs";
+import { hosts, transcriptLink } from "../src/hosts.mjs";
+import {
+  calls,
+  cutResult,
+  expiresAt,
+  fakeLink,
+  note,
+  result,
+  signalA,
+  signalB,
+  signalResult,
+  transcript,
+  user,
+} from "./agy-transcript.mjs";
 
 const say = { context: "TalkTo: note" };
 const go = { continueWith: "TalkTo: 2 new messages." };
@@ -157,4 +170,77 @@ test("Antigravity: Stop continues; mid-turn notices are ephemeral steps before t
   assert.equal(host.parse("stop", { continuation_active: true }, {}).stopActive, true);
   assert.equal(host.parse("stop", { continuationActive: false }, {}).stopActive, false);
   assert.equal(host.parse("stop", { error: "model failed" }, {}).skip, true);
+});
+
+test("Antigravity transcript: the newest create_signal result's link, matched to its call", () => {
+  const found = transcriptLink(
+    transcript(
+      user(),
+      calls(["send_message", "create_signal"]),
+      result({ data: { item: {}, created: true } }),
+      note(),
+      signalResult(signalA),
+      calls(["run_command"]),
+      result({ output: "hi" }),
+    ),
+  );
+  assert.deepEqual(found, {
+    link: { url: fakeLink(signalA), signalId: signalA, expiresAt },
+    truncated: false,
+  });
+  // transcript_full.jsonl records arguments without JSON encoding.
+  const full = transcript(calls(["create_signal"], false), signalResult(signalA));
+  assert.equal(transcriptLink(full).link?.url, fakeLink(signalA));
+  // A newer create_signal wins.
+  const twice = transcript(
+    calls(["create_signal"]),
+    signalResult(signalA),
+    calls(["create_signal"]),
+    signalResult(signalB),
+  );
+  assert.equal(transcriptLink(twice).link?.signalId, signalB);
+  // Damaged lines are skipped, not fatal.
+  const damaged = transcript(calls(["create_signal"]), "{not json", signalResult(signalA));
+  assert.equal(transcriptLink(damaged).link?.signalId, signalA);
+});
+
+test("Antigravity transcript: only the url field of create_signal's own result counts", () => {
+  const none = { link: null, truncated: false };
+  // No create_signal, or its result is not written yet.
+  assert.deepEqual(transcriptLink(""), none);
+  assert.deepEqual(transcriptLink(transcript(user(), calls(["get_updates"]))), none);
+  assert.deepEqual(transcriptLink(transcript(calls(["create_signal"]))), none);
+  assert.deepEqual(transcriptLink(transcript(calls(["create_signal"]), user())), none);
+  // The newest create_signal failed. It rotated the older link away, so that never counts.
+  const failed = transcript(
+    calls(["create_signal"]),
+    signalResult(signalA),
+    calls(["create_signal"]),
+    result({ error: { code: "forbidden" } }),
+  );
+  assert.deepEqual(transcriptLink(failed), none);
+  // A link-shaped result of another tool, such as a message read with get_updates.
+  assert.deepEqual(transcriptLink(transcript(calls(["get_updates"]), signalResult(signalA))), none);
+  const beside = transcript(
+    calls(["create_signal", "get_updates"]),
+    result({ error: { code: "x" } }),
+    signalResult(signalA),
+  );
+  assert.deepEqual(transcriptLink(beside), none);
+  // A link outside data.url, a signal ID that disagrees, or plain HTTP off loopback.
+  const elsewhere = transcript(
+    calls(["create_signal"]),
+    result({ data: { signalId: signalA, note: fakeLink(signalA) } }),
+  );
+  assert.deepEqual(transcriptLink(elsewhere), none);
+  const mismatch = transcript(calls(["create_signal"]), signalResult(signalB, fakeLink(signalA)));
+  assert.deepEqual(transcriptLink(mismatch), none);
+  const http = transcript(
+    calls(["create_signal"]),
+    signalResult(signalA, fakeLink(signalA, "http://talkto.example")),
+  );
+  assert.deepEqual(transcriptLink(http), none);
+  // A result that transcript.jsonl cut short says so, for a retry with transcript_full.jsonl.
+  const cut = transcript(calls(["create_signal"]), cutResult(signalA));
+  assert.deepEqual(transcriptLink(cut), { link: null, truncated: true });
 });

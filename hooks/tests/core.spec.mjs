@@ -76,6 +76,7 @@ const hook = (kind, fields = {}) => ({
   toolResponse: null,
   stopActive: false,
   skip: false,
+  foundLink: null,
   ...fields,
 });
 const linked = (w) => {
@@ -121,6 +122,40 @@ test("a create_signal result is captured from any form a host gives it; other to
   );
   assert.equal(removed.context, notices.forgotten());
   assert.equal(w.state, null);
+});
+
+test("a link the host found elsewhere is saved once, only while new and live", async () => {
+  const w = world();
+  const foundLink = { url, signalId: signal, expiresAt: later };
+  const first = await handle(hook("afterTool", { foundLink }), w.deps);
+  assert.equal(first.context, notices.saved());
+  assert.equal(w.state.url, url);
+  assert.equal(w.requests.length, 0);
+  // The host shows the newest result before every model call: the same link is not saved again.
+  w.state = { ...w.state, cursor: message(1) };
+  assert.deepEqual(await handle(hook("afterTool", { foundLink }), w.deps), {});
+  assert.equal(w.state.cursor, message(1));
+  // A link that died stays dead; only a newer create_signal result replaces it.
+  w.state = { ...w.state, dead: true, deadNoticed: true };
+  assert.deepEqual(await handle(hook("afterTool", { foundLink }), w.deps), {});
+  assert.equal(w.state.dead, true);
+  const rotated = `https://talkto.sh/v1/signals/${server}/${message(9)}.${secret}`;
+  const next = { url: rotated, signalId: message(9), expiresAt: later };
+  assert.equal(
+    (await handle(hook("afterTool", { foundLink: next }), w.deps)).context,
+    notices.saved(),
+  );
+  assert.deepEqual([w.state.url, w.state.dead], [rotated, false]);
+  // An expired link is never saved.
+  const old = world();
+  const expired = { ...foundLink, expiresAt: new Date(old.deps.now()).toISOString() };
+  assert.deepEqual(await handle(hook("afterTool", { foundLink: expired }), old.deps), {});
+  assert.equal(old.state, null);
+  // At a turn end the link is saved quietly, and the turn end checks it at once.
+  const s = world([{ pending: 2, urgent: 0, cursor: message(3) }]);
+  const stop = await handle(hook("stop", { foundLink }), s.deps);
+  assert.equal(stop.continueWith, notices.waiting({ pending: 2, urgent: 0, more: false }));
+  assert.equal(s.state.url, url);
 });
 
 test("without a link the session start says how to join, once; nothing else speaks", async () => {

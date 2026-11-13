@@ -2,12 +2,13 @@
 // local HTTP server standing in for TalkTo's signal link.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { calls, cutResult, result, signalResult, transcript, user } from "./agy-transcript.mjs";
 
 const script = fileURLToPath(new URL("../src/talkto-hook.mjs", import.meta.url));
 const server = "7c1e9a52-3b0f-4c55-9d7e-0d2f3c4b5a61";
@@ -220,6 +221,70 @@ test("a hanging or absent server never holds the agent: quiet output, exit 0, bo
     });
     assert.deepEqual(result, { out: "", code: 0 }, args.join(" "));
   }
+});
+
+test("Antigravity: the link is saved from the transcript, where the save command saves it", async (t) => {
+  const s = await stub(t);
+  const state = await mkdtemp(join(tmpdir(), "talkto-hook-state-"));
+  const brain = await mkdtemp(join(tmpdir(), "talkto-hook-brain-"));
+  t.after(() => rm(state, { recursive: true, force: true }));
+  t.after(() => rm(brain, { recursive: true, force: true }));
+  const env = { TALKTO_HOOKS_STATE_DIR: state };
+  const conversation = "94935fe4-0000-4000-8000-000000000001";
+  const logs = join(brain, conversation, ".system_generated", "logs");
+  await mkdir(logs, { recursive: true });
+  const transcriptPath = join(logs, "transcript.jsonl");
+  const base = { conversationId: conversation, workspacePaths: ["/work"], transcriptPath };
+  const local = (id) => s.url.replace(signal, id);
+  const steps = [user(), calls(["get_context"]), result({ data: {} })];
+  await writeFile(transcriptPath, transcript(...steps));
+
+  // No create_signal yet: PreInvocation stays quiet and nothing is saved.
+  assert.equal((await hook(env, ["antigravity", "after-tool"], base)).out, "");
+  assert.deepEqual(await readdir(state).catch(() => []), []);
+
+  steps.push(calls(["create_signal"]), signalResult(signal, local(signal)));
+  await writeFile(transcriptPath, transcript(...steps));
+  const saved = await hook(env, ["antigravity", "after-tool"], { ...base, invocationNum: 2 });
+  assert.deepEqual(JSON.parse(saved.out), {
+    injectSteps: [
+      {
+        ephemeralMessage:
+          "TalkTo: signal link saved for this session. You will be told here when messages arrive; then call get_updates as usual.",
+      },
+    ],
+  });
+  // The same file, mode, and session key as the save command.
+  const [file] = await readdir(state);
+  assert.equal((await stat(join(state, file))).mode & 0o777, 0o600);
+  const status = await hook(env, ["status", "antigravity", "--session", conversation]);
+  assert.match(status.out, /signal link active/);
+  assert.ok(!status.out.includes(secret));
+  assert.equal(s.seen.length, 0);
+
+  // The next model call sees the same result and says nothing more.
+  assert.equal((await hook(env, ["antigravity", "after-tool"], base)).out, "");
+  s.answers.push({ pending: 1, urgent: 0, cursor: message });
+  const stop = await hook(env, ["antigravity", "stop"], { ...base, continuationActive: false });
+  assert.equal(JSON.parse(stop.out).decision, "continue");
+
+  // A rotated link that transcript.jsonl cut short is read from transcript_full.jsonl.
+  const rotated = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b";
+  await writeFile(
+    transcriptPath,
+    transcript(...steps, calls(["create_signal"]), cutResult(rotated)),
+  );
+  const full = [...steps, calls(["create_signal"], false), signalResult(rotated, local(rotated))];
+  await writeFile(join(logs, "transcript_full.jsonl"), transcript(...full));
+  const again = await hook(env, ["antigravity", "after-tool"], base);
+  assert.match(JSON.parse(again.out).injectSteps[0].ephemeralMessage, /signal link saved/);
+  assert.equal(JSON.parse(await readFile(join(state, file), "utf8")).signalId, rotated);
+  // No transcript, or a relative path: quiet.
+  for (const path of [join(logs, "missing.jsonl"), "transcript.jsonl"])
+    assert.equal(
+      (await hook(env, ["antigravity", "after-tool"], { ...base, transcriptPath: path })).out,
+      "",
+    );
 });
 
 test("save, status and forget work by hand for hosts that never show the hook a tool result", async (t) => {

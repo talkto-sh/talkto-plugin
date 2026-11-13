@@ -12,7 +12,7 @@ import {
   settleMillis,
   waitSeconds,
 } from "../src/inbox.ts";
-import { decodeUpdates } from "../src/talkto.ts";
+import { decodeUpdates, messageIdsOf } from "../src/talkto.ts";
 import { bodyLimit } from "../src/notice.ts";
 
 const server = "11111111-1111-4111-8111-111111111111";
@@ -200,6 +200,56 @@ test("an urgent row that landed during the turn's last request gets a follow-up 
   await host.advance(settleMillis);
   assert.equal(host.submitted.length, 1);
   assert.match(host.submitted[0], /arrived as your last turn ended/);
+});
+
+test("an urgent message the agent read itself in the turn gets no follow-up turn", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  inbox.onTurnStart("t1");
+  const early = message({ conversationId: direct, priority: "urgent" });
+  const late = message({ conversationId: direct, priority: "urgent" });
+  const other = message({ conversationId: direct, priority: "urgent" });
+  // Read before the plugin injects it, and after; a read in another turn does not count.
+  inbox.onRead("t1", [early.id]);
+  host.answers.push(reply([early, late, other]));
+  await inbox.tick();
+  assert.equal(host.injected.length, 1);
+  inbox.onRead("t1", [late.id]);
+  inbox.onRead("t0", [other.id]);
+  await inbox.onTurnComplete("t1");
+  await host.advance(settleMillis);
+  assert.equal(host.submitted.length, 1);
+  assert.match(host.submitted[0], new RegExp(`\\(${other.id}\\) arrived as your last turn ended`));
+
+  // All of them read: nothing follows; the next turn starts with nothing marked read.
+  inbox.onTurnStart("t2");
+  const next = message({ conversationId: direct, priority: "urgent" });
+  host.answers.push(reply([next]));
+  await inbox.tick();
+  inbox.onRead("t2", [next.id]);
+  await inbox.onTurnComplete("t2");
+  await host.advance(settleMillis);
+  assert.equal(host.submitted.length, 1);
+  inbox.onTurnStart("t3");
+  host.answers.push(reply([message({ id: next.id, conversationId: direct, priority: "urgent" })]));
+  await inbox.tick();
+  await inbox.onTurnComplete("t3");
+  await host.advance(settleMillis);
+  assert.match(host.submitted.at(-1), /arrived as your last turn ended/);
+});
+
+test("messageIdsOf lists the messages a get_updates or read_messages answer showed", () => {
+  const shown = message();
+  assert.deepEqual(messageIdsOf(reply([shown])), [shown.id]);
+  const history = {
+    isError: false,
+    content: [
+      { type: "text", text: JSON.stringify({ data: { items: [shown], nextCursor: null } }) },
+    ],
+  };
+  assert.deepEqual(messageIdsOf(history), [shown.id]);
+  assert.deepEqual(messageIdsOf(failure("forbidden")), []);
+  assert.deepEqual(messageIdsOf({ isError: false, content: [{ type: "text", text: "no" }] }), []);
 });
 
 test("urgent handling set to queue waits like any other message", async () => {

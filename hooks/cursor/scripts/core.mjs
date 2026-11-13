@@ -94,6 +94,16 @@ const expiresPattern = /"expiresAt"\s*:\s*"(\d{4}-\d{2}-\d{2}T[^"]{1,40})"/;
  * @property {unknown} toolResponse
  * @property {boolean} stopActive The host says this stop follows a hook-caused continuation.
  * @property {boolean} skip The host says this event must not act (a session closing, an abort).
+ * @property {SignalLink | null} foundLink A create_signal result the host adapter found outside
+ *   the hook input (Antigravity's transcript). Saved only when it differs from the saved link.
+ */
+
+/**
+ * A signal link read from a create_signal result.
+ * @typedef {object} SignalLink
+ * @property {string} url
+ * @property {string} signalId
+ * @property {string | null} expiresAt
  */
 
 /**
@@ -147,7 +157,7 @@ export const notices = {
  * content blocks). Only results of a tool named create_signal are trusted.
  * @param {string | null} toolName
  * @param {unknown} response
- * @returns {{ url: string, signalId: string, expiresAt: string | null } | null}
+ * @returns {SignalLink | null}
  */
 export const linkFrom = (toolName, response) => {
   if (toolName === null || !/create_signal/.test(toolName)) return null;
@@ -299,6 +309,15 @@ const deadNotice = (state) => {
 export const handle = async (event, deps) => {
   if (event.skip) return {};
   const { settings } = deps;
+  if (event.foundLink !== null && (event.kind === "afterTool" || event.kind === "stop")) {
+    const link = event.foundLink;
+    const live = link.expiresAt === null || Date.parse(link.expiresAt) > deps.now();
+    // The same link stays saved, even once it died: the host shows the newest result every time.
+    if (live && (await deps.load())?.url !== link.url) {
+      await deps.save(fresh(link.url, link.signalId, link.expiresAt));
+      if (event.kind === "afterTool") return { context: notices.saved() };
+    }
+  }
   if (event.kind === "afterTool") {
     const link = linkFrom(event.toolName, event.toolResponse);
     if (link !== null) {

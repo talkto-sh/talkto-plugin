@@ -80,6 +80,22 @@ const failure = (code: string, message: string): UpdatesReply => ({
   failure: { code, message },
 });
 
+/**
+ * The IDs of the messages one answer showed the agent: `data.messages` of a `get_updates` page,
+ * or `data.items` of a `read_messages` page. Empty for an error or anything else.
+ */
+export const messageIdsOf = (answer: ToolAnswer): ReadonlyArray<string> => {
+  if (answer.isError) return [];
+  const envelope = envelopeOf(answer);
+  const data = envelope === null ? null : fieldsAt(envelope, "data");
+  if (data === null) return [];
+  return [...listOf(data, "messages"), ...listOf(data, "items")].flatMap((entry) => {
+    if (!isObject(entry)) return [];
+    const id = textOf(new Map(Object.entries(entry)), "id");
+    return id === null ? [] : [id];
+  });
+};
+
 /** Decode one `get_updates` answer for `participantId`, naming senders and conversations from `included`. */
 export const decodeUpdates = (answer: ToolAnswer, participantId: string): UpdatesReply => {
   const envelope = envelopeOf(answer);

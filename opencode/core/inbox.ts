@@ -169,6 +169,8 @@ export class Inbox {
   private failures = 0;
   private resumeAt = 0;
   private injected: Injected[] = [];
+  /** Messages the agent read itself in the running turn, with get_updates or read_messages. */
+  private readInTurn = new Set<string>();
   private readonly host: Host;
   private readonly settings: Settings;
 
@@ -265,6 +267,7 @@ export class Inbox {
     this.busy = true;
     this.turnId = turnId;
     this.heldForInput = false;
+    this.readInTurn.clear();
     // Start waiting now rather than at the next timer tick, so an urgent message can reach this turn.
     this.host.after(0, () => this.tick());
   }
@@ -273,15 +276,29 @@ export class Inbox {
     for (const entry of this.injected) if (entry.turnId === turnId) entry.stepped = true;
   }
 
+  /**
+   * The agent read these messages itself in the running turn (a get_updates or read_messages
+   * result). An injected urgent message among them needs no follow-up turn, whether the agent
+   * read it before or after the injection.
+   */
+  onRead(turnId: string, messageIds: ReadonlyArray<string>): void {
+    if (turnId !== this.turnId) return;
+    for (const id of messageIds) this.readInTurn.add(id);
+  }
+
   async onTurnComplete(turnId: string): Promise<void> {
     this.busy = false;
     this.turnId = null;
     this.idleSince = await this.host.now();
     this.activeAt = this.idleSince;
-    const unread = this.injected.filter((entry) => entry.turnId === turnId && !entry.stepped);
+    const unread = this.injected
+      .filter((entry) => entry.turnId === turnId && !entry.stepped)
+      .flatMap((entry) => entry.ids)
+      .filter((id) => !this.readInTurn.has(id));
     this.injected = this.injected.filter((entry) => entry.turnId !== turnId);
+    this.readInTurn.clear();
     if (unread.length > 0) {
-      this.notes.push(urgentFollowUp(unread.flatMap((entry) => entry.ids)));
+      this.notes.push(urgentFollowUp(unread));
       await this.persist();
     }
     this.host.after(settleMillis, () => this.deliver());

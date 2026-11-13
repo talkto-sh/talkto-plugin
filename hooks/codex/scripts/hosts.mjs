@@ -2,10 +2,14 @@
 // Thin per-host adapters: parse a host's hook input into a HookEvent, and render a Reply as that
 // host's documented output. Sources are listed in the README, per host.
 
-import { fieldsOf, isNumber, isText } from "./core.mjs";
+import { open } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { fieldsOf, isNumber, isText, linkPattern } from "./core.mjs";
 
 /** @typedef {import("./core.mjs").HookEvent} HookEvent */
 /** @typedef {import("./core.mjs").Reply} Reply */
+/** @typedef {import("./core.mjs").SignalLink} SignalLink */
+/** @typedef {import("./core.mjs").Fields} Fields */
 /** @typedef {HookEvent["kind"]} Kind */
 
 /**
@@ -13,6 +17,9 @@ import { fieldsOf, isNumber, isText } from "./core.mjs";
  * @property {string} name
  * @property {(kind: Kind, input: Record<string, unknown>, env: NodeJS.ProcessEnv) => HookEvent} parse
  * @property {(event: HookEvent, reply: Reply) => string} render JSON for stdout, or "" for nothing.
+ * @property {(kind: Kind, input: Record<string, unknown>) => Promise<SignalLink | null>} [findLink]
+ *   For a host whose hook input never carries the tool result: find the newest create_signal
+ *   result some other way. It may throw; the caller treats that as nothing found.
  */
 
 /** @param {unknown} value @returns {string | null} */
@@ -34,6 +41,7 @@ const event = (kind, fields) => ({
   toolResponse: null,
   stopActive: false,
   skip: false,
+  foundLink: null,
   ...fields,
 });
 
@@ -173,10 +181,145 @@ export const gemini = {
 };
 
 /**
+ * A value as an Antigravity transcript records it: agy 1.5.7's transcript.jsonl JSON-encodes each
+ * tool argument, and its transcript_full.jsonl does not.
+ * @param {unknown} value @returns {string | null}
+ */
+const recorded = (value) => {
+  if (!isText(value)) return null;
+  try {
+    return text(JSON.parse(value));
+  } catch {
+    return text(value);
+  }
+};
+/** The tool that a transcript tool call ran. MCP calls are `call_mcp_tool` with `ToolName` in args. @param {unknown} call */
+const calledTool = (call) => {
+  const fields = fieldsOf(call);
+  if (fields === null) return null;
+  return recorded(fieldsOf(fields.get("args"))?.get("ToolName")) ?? text(fields.get("name"));
+};
+const createSignal = /(?:^|[^A-Za-z0-9])create_signal$/;
+/** Steps that can follow a tool call but are not a tool's result. */
+const notResults = new Set(["EPHEMERAL_MESSAGE", "SYSTEM_MESSAGE"]);
+/** Steps after the results of a model step's tool calls. */
+const nextTurn = new Set(["PLANNER_RESPONSE", "USER_INPUT"]);
+
+/**
+ * The signal link in one recorded create_signal result. Its content is some header lines, then
+ * the tool's JSON. Only the `data.url` field counts, and its signal ID must equal `data.signalId`.
+ * @param {unknown} content @returns {SignalLink | null}
+ */
+const resultLink = (content) => {
+  if (!isText(content)) return null;
+  const start = content.search(/^\{/m);
+  if (start === -1) return null;
+  /** @type {unknown} */
+  let parsed;
+  try {
+    parsed = JSON.parse(content.slice(start));
+  } catch {
+    return null;
+  }
+  const data = fieldsOf(fieldsOf(parsed)?.get("data"));
+  const url = data?.get("url");
+  const signalId = data?.get("signalId");
+  const expiresAt = data?.get("expiresAt");
+  if (!isText(url) || !isText(signalId)) return null;
+  const found = linkPattern.exec(url);
+  if (found === null || found[0] !== url || found[1] !== signalId) return null;
+  return {
+    url,
+    signalId,
+    expiresAt: isText(expiresAt) && !Number.isNaN(Date.parse(expiresAt)) ? expiresAt : null,
+  };
+};
+
+/**
+ * Find the newest create_signal call in an Antigravity transcript (JSON Lines, one step per
+ * line) and the signal link in its result. A model step (PLANNER_RESPONSE) lists its tool calls,
+ * and their results follow it in the same order. Older calls never count: a newer create_signal
+ * rotates the link, so when its result is missing or failed there is no link. `truncated` says
+ * that this file cut the result short, so a fuller transcript can still hold the link.
+ * @param {string} transcript
+ * @returns {{ link: SignalLink | null, truncated: boolean }}
+ */
+export const transcriptLink = (transcript) => {
+  const none = { link: null, truncated: false };
+  if (!transcript.includes("create_signal")) return none;
+  /** @type {Array<Fields>} */
+  const steps = [];
+  for (const line of transcript.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      const step = fieldsOf(JSON.parse(line));
+      if (step !== null) steps.push(step);
+    } catch {
+      // A line that is still being written, or a damaged one.
+    }
+  }
+  for (let index = steps.length - 1; index >= 0; index--) {
+    const step = steps[index];
+    if (step === undefined || step.get("type") !== "PLANNER_RESPONSE") continue;
+    const calls = step.get("tool_calls");
+    if (!Array.isArray(calls)) continue;
+    const position = calls.findIndex((call) => createSignal.test(calledTool(call) ?? ""));
+    if (position === -1) continue;
+    /** @type {Array<Fields>} */
+    const results = [];
+    for (const later of steps.slice(index + 1)) {
+      const type = later.get("type");
+      if (isText(type) && nextTurn.has(type)) break;
+      if (!(isText(type) && notResults.has(type))) results.push(later);
+    }
+    const result = results[position];
+    if (result === undefined) return none;
+    const link = resultLink(result.get("content"));
+    const cut = result.get("truncated_fields");
+    return { link, truncated: link === null && Array.isArray(cut) && cut.includes("content") };
+  }
+  return none;
+};
+
+/** The last `limit` bytes of a file, from its first whole line. @param {string} path @param {number} limit */
+const tail = async (path, limit) => {
+  const file = await open(path, "r");
+  try {
+    const { size } = await file.stat();
+    const start = Math.max(0, size - limit);
+    const buffer = Buffer.alloc(size - start);
+    await file.read(buffer, 0, buffer.length, start);
+    const content = buffer.toString("utf8");
+    return start === 0 ? content : content.slice(content.indexOf("\n") + 1);
+  } finally {
+    await file.close();
+  }
+};
+const transcriptLimit = 16 * 1024 * 1024;
+
+/**
+ * Antigravity's hook input names the conversation transcript (`transcriptPath`). agy 1.5.7
+ * writes it as `brain/<conversationId>/.system_generated/logs/transcript.jsonl`. That file cuts
+ * long step content short and lists the field in `truncated_fields`; `transcript_full.jsonl`
+ * next to it keeps the content whole, so the hook reads it only then.
+ * @param {Record<string, unknown>} input @returns {Promise<SignalLink | null>}
+ */
+const antigravityLink = async (input) => {
+  const path = text(input.transcriptPath);
+  if (path === null || !isAbsolute(path) || !path.endsWith(".jsonl")) return null;
+  const found = transcriptLink(await tail(path, transcriptLimit));
+  if (found.link !== null || !found.truncated) return found.link;
+  if (basename(path) !== "transcript.jsonl") return null;
+  const full = await tail(join(dirname(path), "transcript_full.jsonl"), transcriptLimit);
+  return transcriptLink(full).link;
+};
+
+/**
  * Google Antigravity plugins. PostToolUse output never reaches the model and carries no tool
  * output, so mid-turn checks run on PreInvocation (before every model call) and inject an
- * ephemeral step. Stop continues with decision "continue". The agent saves its link with the
- * `save` command, because no hook sees create_signal's result.
+ * ephemeral step. Stop continues with decision "continue". No hook input has create_signal's
+ * result, so PreInvocation and Stop read it from the conversation transcript; the `save`
+ * command stays as the fallback.
  * @type {Host}
  */
 export const antigravity = {
@@ -194,6 +337,8 @@ export const antigravity = {
         kind === "stop" && input.error !== undefined && input.error !== null && input.error !== "",
     });
   },
+  findLink: (kind, input) =>
+    kind === "afterTool" || kind === "stop" ? antigravityLink(input) : Promise.resolve(null),
   render: (hook, reply) => {
     if (hook.kind === "stop")
       return reply.continueWith === undefined

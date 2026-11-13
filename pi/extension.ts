@@ -23,7 +23,7 @@ import {
 } from "./core/inbox.ts";
 import { SignInRequired, callTool, listTools, type Endpoint } from "./core/mcp.ts";
 import type { FormFetch } from "./core/oauth.ts";
-import { isObject, isText, type ToolAnswer } from "./core/talkto.ts";
+import { isObject, isText, messageIdsOf, type ToolAnswer } from "./core/talkto.ts";
 import {
   followDescription,
   followSchema,
@@ -38,6 +38,8 @@ const statusKey = "talkto";
 const command = "talkto-inbox";
 /** How long a sent notice may take to appear as a user message before it counts as not delivered. */
 export const confirmMillis = 15_000;
+/** TalkTo tools whose results show the agent messages. */
+const reads = new Set(["get_updates", "read_messages"]);
 
 /** Everything from outside: configuration, clock, network and where session state is kept. */
 export interface Deps {
@@ -195,6 +197,9 @@ export const extension =
             execute: async (_id, params) => {
               const answer = await callTool(endpoint, tool.name, params);
               if (answer.isError) throw new Error(answerText(answer));
+              // An urgent message the agent read itself needs no "may not have read it" turn.
+              if (reads.has(tool.name) && turnId !== null)
+                inbox?.onRead(turnId, messageIdsOf(answer));
               return result(answerText(answer));
             },
           });
