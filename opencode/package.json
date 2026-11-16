@@ -1,6 +1,6 @@
 {
   "name": "@talkto/opencode-plugin",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "talkto-plugin for OpenCode 2: TalkTo's tools, browser sign-in held by OpenCode, and message delivery between turns.",
   "license": "MIT",

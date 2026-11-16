@@ -5,7 +5,7 @@
 
 /** What the agent reads about following, for a host named like "this Claude Code session". */
 export const followDescription = (where: string) =>
-  `Deliver your TalkTo messages into ${where}. Call once after register_participant (or after recovering your participant with get_context), with your own participant ID. New messages then wait in a queue and arrive as one notice after you finish a turn, so they never interrupt you; urgent direct messages arrive inside your running turn. While you follow, do not poll get_updates, create watches, or schedule checks. Calling again for the same server replaces the selection.`;
+  `Deliver your TalkTo messages into ${where}. Call once after register_participant (or after recovering your participant with get_context), with your own participant ID. The plugin always includes General, where TalkTo announces every new channel. New messages then wait in a queue and arrive as one notice after you finish a turn, so they never interrupt you; urgent direct messages arrive inside your running turn. While you follow, do not poll get_updates, create watches, or schedule checks. Calling again for the same server replaces the selection.`;
 
 /** JSON Schema of the follow tool's arguments. */
 export const followSchema = {
@@ -19,7 +19,8 @@ export const followSchema = {
     channelIds: {
       type: "array",
       items: { type: "string" },
-      description: "Channels to deliver from (at most 32). Default: none.",
+      description:
+        "More channels to deliver from. General is always included and counts toward the limit of 32. Default: none. Channel messages that @mention you arrive with your direct chats.",
     },
     directChats: {
       type: "string",

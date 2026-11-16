@@ -49,6 +49,7 @@ from .talkto import (
     UpdatesFailure,
     UpdatesPage,
     decode_updates,
+    general_id_of,
 )
 
 Delivery = Literal["idle", "next-prompt"]
@@ -58,6 +59,8 @@ DirectChats = Literal["own", "none"]
 
 #: Participants one session may follow at once (one per server).
 FOLLOW_LIMIT = 4
+#: Channels one follow may watch: TalkTo's limit for get_updates.
+CHANNEL_LIMIT = 32
 #: Messages kept per follow; past this the oldest are counted as dropped.
 QUEUE_LIMIT = 100
 #: Pages read per follow per tick.
@@ -231,6 +234,47 @@ def read_saved(value: object) -> Optional[tuple[list[Follow], list[str]]]:
     return kept, [str(note) for note in notes]
 
 
+@dataclass(frozen=True)
+class Watched:
+    """The channels a follow watches, from the agent's choice and the server's General channel."""
+
+    #: The chosen channels without repeats, with General added when it is known.
+    channel_ids: tuple[str, ...]
+    #: Whether General is among them.
+    general: bool
+    #: The chosen channel left out so General fits within CHANNEL_LIMIT, or None.
+    displaced: Optional[str]
+
+
+def watched_channels(chosen: Sequence[str], general: Optional[str]) -> Watched:
+    """Adds General to the chosen channels: TalkTo announces every new channel there. With
+    CHANNEL_LIMIT channels chosen and General not among them, General takes the last one's place.
+    When General is unknown (None), the choice stands as it is."""
+    unique = tuple(dict.fromkeys(chosen))
+    if general is None:
+        return Watched(unique, False, None)
+    if general in unique:
+        return Watched(unique, True, None)
+    displaced = unique[CHANNEL_LIMIT - 1] if len(unique) >= CHANNEL_LIMIT else None
+    return Watched((general, *unique[: CHANNEL_LIMIT - 1]), True, displaced)
+
+
+def _general_note(watched: Watched) -> str:
+    """What the follow answer says about General."""
+    if not watched.general:
+        return (
+            "TalkTo did not name this server's General channel, so the plugin could not add it; "
+            "to hear about new channels, add General's ID from get_context to channelIds."
+        )
+    if watched.displaced is None:
+        return "General is always included: TalkTo announces new channels there."
+    return (
+        f"General is always included and took one of the {CHANNEL_LIMIT} channel places, so channel "
+        f"{watched.displaced} is not delivered; to keep it, follow again with at most "
+        f"{CHANNEL_LIMIT - 1} other channels."
+    )
+
+
 def read_follow_input(args: Mapping[str, Any]) -> Union[FollowInput, str]:
     """The follow tool's arguments decoded, or what is wrong with them."""
     server_id, participant_id = args.get("serverId"), args.get("participantId")
@@ -242,6 +286,8 @@ def read_follow_input(args: Mapping[str, Any]) -> Union[FollowInput, str]:
     channels = args.get("channelIds", [])
     if not isinstance(channels, list) or not all(isinstance(item, str) for item in channels):
         return "channelIds must be a list of channel IDs."
+    if len(set(channels)) > CHANNEL_LIMIT:
+        return f"channelIds holds at most {CHANNEL_LIMIT} channels."
     direct_chats = args.get("directChats", "own")
     if direct_chats not in ("own", "none"):
         return 'directChats must be "own" or "none".'
@@ -331,6 +377,8 @@ class Inbox:
         #: Each follow's cadence in milliseconds from its newest page, by server.
         self._cadence: dict[str, float] = {}
         self._cadence_timer = False
+        #: Each server's General channel, by server, once get_context named it.
+        self._generals: dict[str, str] = {}
 
     # -- what the plugin and the agent use --------------------------------
 
@@ -373,13 +421,14 @@ class Inbox:
                 item.server_id == given.server_id for item in self._follows
             ):
                 return f"This session already follows {FOLLOW_LIMIT} participants. Call unfollow for one first."
+        watched = watched_channels(given.channel_ids, self._general_of(given.server_id))
         try:
             answer = self._updates(
                 {
                     "serverId": given.server_id,
                     "participantId": given.participant_id,
                     "mode": "start",
-                    "channelIds": list(given.channel_ids),
+                    "channelIds": list(watched.channel_ids),
                     "directChats": given.direct_chats,
                     "startAt": given.start_at,
                 },
@@ -393,7 +442,7 @@ class Inbox:
         follow = Follow(
             server_id=given.server_id,
             participant_id=given.participant_id,
-            channel_ids=given.channel_ids,
+            channel_ids=watched.channel_ids,
             direct_chats=given.direct_chats,
             checkpoint=reply.checkpoint,
             pending=[_keep(message) for message in reply.messages],
@@ -413,7 +462,8 @@ class Inbox:
         return " ".join(
             [
                 f"Following participant {given.participant_id} on server {given.server_id} "
-                f"({len(given.channel_ids)} channels, direct chats: {given.direct_chats}).",
+                f"({len(watched.channel_ids)} channels, direct chats: {given.direct_chats}).",
+                _general_note(watched),
                 "New messages wait in a queue and arrive as one notice after you finish a turn; "
                 "urgent direct messages arrive inside your running turn.",
                 "Do not poll get_updates, create watches, or schedule checks for this participant "
@@ -423,6 +473,21 @@ class Inbox:
                 else "Nothing is waiting yet.",
             ]
         )
+
+    def _general_of(self, server_id: str) -> Optional[str]:
+        """The server's General channel, asked of get_context once per server; None when TalkTo did not say."""
+        with self._lock:
+            known = self._generals.get(server_id)
+        if known is not None:
+            return known
+        try:
+            found = general_id_of(self._host.call("get_context", {"serverId": server_id}).envelope)
+        except TransportError:
+            return None
+        if found is not None:
+            with self._lock:
+                self._generals[server_id] = found
+        return found
 
     def unfollow(self, server_id: str) -> str:
         """Stops delivery for the participant this session follows on one server."""

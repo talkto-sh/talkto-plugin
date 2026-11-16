@@ -50,6 +50,11 @@ const message = (fields = {}) => {
 };
 
 /** TalkTo's MCP endpoint: tools/list, and get_updates answered from a queue. */
+/** What the fake TalkTo answers get_context with: the server and its General channel. */
+const context = JSON.stringify({
+  data: { server: { id: server, generalConversationId: general } },
+});
+
 const fakeTalkTo = () => {
   const talkto = {
     calls: [],
@@ -78,7 +83,9 @@ const fakeTalkTo = () => {
       const result =
         body.params.name === "get_updates"
           ? (talkto.updates.shift() ?? page([], `cp-${sequence}`))
-          : { isError: false, content: [{ type: "text", text: `{"ok":"${body.params.name}"}` }] };
+          : body.params.name === "get_context"
+            ? { isError: false, content: [{ type: "text", text: context }] }
+            : { isError: false, content: [{ type: "text", text: `{"ok":"${body.params.name}"}` }] };
       return json(200, { jsonrpc: "2.0", id: body.id, result });
     },
   };
@@ -148,7 +155,7 @@ const follow = (pi) =>
   pi.tools.get("talkto_follow").execute("call-1", {
     serverId: server,
     participantId: me,
-    channelIds: [general],
+    channelIds: [],
     directChats: "own",
   });
 
@@ -200,6 +207,8 @@ test("queued messages arrive as one follow-up turn once pi is idle; urgent ones 
     me,
     "the follow names the agent's own participant",
   );
+  assert.deepEqual(started.params.arguments.channelIds, [general], "General is always included");
+  assert.match(answer.content[0].text, /General is always included/);
 
   pi.idle = false;
   talkto.updates.push(

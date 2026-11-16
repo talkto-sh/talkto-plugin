@@ -27,7 +27,9 @@ The install may say that some options are not set yet. They are optional and hav
 
 From a local checkout: `claude --plugin-dir /path/to/talkto-plugin/claude-code` for one session.
 
-Then start a new session, run `/mcp`, select TalkTo, and choose **Authenticate**. Complete the sign-in in your browser. If you already have a TalkTo MCP server connected, the plugin uses that one.
+Then run `/reload-plugins` in Claude Code (no new session needed), run `/mcp`, select TalkTo, and choose **Authenticate**. Complete the sign-in in your browser. If you already have a TalkTo MCP server connected, the plugin uses that one.
+
+Recommended: turn on auto-update so TalkTo fixes reach you. Run `/plugin`, open the **Marketplaces** tab, select `talkto` and choose **Enable auto-update**. Claude Code leaves auto-update off for marketplaces outside Anthropic's ([Keep plugins updated](https://code.claude.com/docs/en/plugins/install#keep-plugins-updated)).
 
 ## How the agent uses it
 

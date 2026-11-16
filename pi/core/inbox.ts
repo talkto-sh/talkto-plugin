@@ -35,6 +35,7 @@
  */
 import {
   decodeUpdates,
+  generalIdOf,
   isObject,
   isText,
   listOf,
@@ -133,6 +134,43 @@ export interface FollowInput extends Recipient {
   readonly startAt: "now" | "beginning";
 }
 
+/** Channels one follow may watch: TalkTo's limit for get_updates. */
+export const channelLimit = 32;
+
+/** The channels a follow watches, from the agent's choice and the server's General channel. */
+export interface Watched {
+  /** The chosen channels without repeats, with General added when it is known. */
+  readonly channelIds: ReadonlyArray<string>;
+  /** Whether General is among them. */
+  readonly general: boolean;
+  /** The chosen channel left out so General fits within `channelLimit`, or null. */
+  readonly displaced: string | null;
+}
+
+/**
+ * Adds General to the chosen channels: TalkTo announces every new channel there. With
+ * `channelLimit` channels chosen and General not among them, General takes the last one's place.
+ * When General is unknown (null), the choice stands as it is.
+ */
+export const watchedChannels = (chosen: ReadonlyArray<string>, general: string | null): Watched => {
+  const unique = [...new Set(chosen)];
+  if (general === null) return { channelIds: unique, general: false, displaced: null };
+  if (unique.includes(general)) return { channelIds: unique, general: true, displaced: null };
+  return {
+    channelIds: [general, ...unique.slice(0, channelLimit - 1)],
+    general: true,
+    displaced: unique[channelLimit - 1] ?? null,
+  };
+};
+
+/** What the follow answer says about General. */
+const generalNote = (watched: Watched): string =>
+  !watched.general
+    ? "TalkTo did not name this server's General channel, so the plugin could not add it; to hear about new channels, add General's ID from get_context to channelIds."
+    : watched.displaced === null
+      ? "General is always included: TalkTo announces new channels there."
+      : `General is always included and took one of the ${channelLimit} channel places, so channel ${watched.displaced} is not delivered; to keep it, follow again with at most ${channelLimit - 1} other channels.`;
+
 /** Participants one session may follow at once (one per server). */
 export const followLimit = 4;
 /** Messages kept per follow; past this the oldest are counted as dropped. */
@@ -227,6 +265,8 @@ export class Inbox {
   private lastWakeAt = Number.NEGATIVE_INFINITY;
   /** Each follow's cadence from its newest page, by server; unknown until the first poll. */
   private readonly cadence = new Map<string, number>();
+  /** Each server's General channel, by server, once get_context named it. */
+  private readonly generals = new Map<string, string>();
   private cadenceTimer = false;
   /** Messages the agent read itself in the running turn, with get_updates or read_messages. */
   private readInTurn = new Set<string>();
@@ -258,6 +298,7 @@ export class Inbox {
   async follow(input: FollowInput): Promise<string> {
     if (this.follows.length >= followLimit && !this.follows.some((item) => same(item, input)))
       return `This session already follows ${followLimit} participants. Call unfollow for one first.`;
+    const watched = watchedChannels(input.channelIds, await this.generalOf(input.serverId));
     let answer: ToolAnswer;
     try {
       answer = await this.updates(
@@ -265,7 +306,7 @@ export class Inbox {
           serverId: input.serverId,
           participantId: input.participantId,
           mode: "start",
-          channelIds: input.channelIds,
+          channelIds: watched.channelIds,
           directChats: input.directChats,
           startAt: input.startAt,
           limit: 50,
@@ -283,7 +324,7 @@ export class Inbox {
     const follow: Follow = {
       serverId: input.serverId,
       participantId: input.participantId,
-      channelIds: [...input.channelIds],
+      channelIds: watched.channelIds,
       directChats: input.directChats,
       checkpoint: reply.page.checkpoint,
       pending: reply.page.messages.map(keep),
@@ -296,13 +337,28 @@ export class Inbox {
     this.host.after(0, () => this.tick());
     const waiting = follow.pending.length;
     return [
-      `Following participant ${input.participantId} on server ${input.serverId} (${input.channelIds.length} channels, direct chats: ${input.directChats}).`,
+      `Following participant ${input.participantId} on server ${input.serverId} (${watched.channelIds.length} channels, direct chats: ${input.directChats}).`,
+      generalNote(watched),
       deliveryRules(this.settings),
       "Do not poll get_updates, create watches, or schedule checks for this participant while the plugin follows it.",
       waiting > 0 || reply.page.hasMore
         ? `${waiting}${reply.page.hasMore ? "+" : ""} earlier messages were found; they arrive ${this.settings.delivery === "idle" ? "after this turn" : "with the person's next prompt"}.`
         : "Nothing is waiting yet.",
     ].join(" ");
+  }
+
+  /** The server's General channel, asked of get_context once per server; null when TalkTo did not say. */
+  private async generalOf(serverId: string): Promise<string | null> {
+    const known = this.generals.get(serverId);
+    if (known !== undefined) return known;
+    let found: string | null;
+    try {
+      found = generalIdOf(await this.host.call("get_context", { serverId }));
+    } catch {
+      return null;
+    }
+    if (found !== null) this.generals.set(serverId, found);
+    return found;
   }
 
   /** Stops delivery for the participant this session follows on one server. */
@@ -823,6 +879,8 @@ export const readFollowInput = (fields: Fields): FollowRead => {
   const channels = fields.get("channelIds") ?? [];
   if (!Array.isArray(channels) || !channels.every(isText))
     return problem("channelIds must be a list of channel IDs.");
+  if (new Set(channels).size > channelLimit)
+    return problem(`channelIds holds at most ${channelLimit} channels.`);
   const directChats = textOf(fields, "directChats") ?? "own";
   if (directChats !== "own" && directChats !== "none")
     return problem('directChats must be "own" or "none".');

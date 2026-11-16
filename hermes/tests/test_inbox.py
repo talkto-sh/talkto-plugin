@@ -5,7 +5,19 @@ from __future__ import annotations
 
 import unittest
 
-from support import DIRECT, GENERAL, ME, PEER, SERVER, FakeHost, envelope, load, message, refusal
+from support import (
+    DIRECT,
+    GENERAL,
+    ME,
+    PEER,
+    SERVER,
+    FakeHost,
+    context,
+    envelope,
+    load,
+    message,
+    refusal,
+)
 
 plugin = load()
 inbox_module = plugin.inbox
@@ -24,6 +36,21 @@ def followed(host: FakeHost, settings=None) -> "Inbox":
     host.clock.time = SETTLE * 10
     host.clock.timers.clear()
     return inbox
+
+
+TASK = "66666666-6666-4666-8666-666666666666"
+LIMIT = inbox_module.CHANNEL_LIMIT
+
+
+def follow_with(inbox: "Inbox", channels: list[str], direct_chats: str = "own") -> str:
+    given = inbox_module.read_follow_input(
+        {"serverId": SERVER, "participantId": ME, "channelIds": channels, "directChats": direct_chats}
+    )
+    return inbox.follow(given)
+
+
+def started_with(host: FakeHost) -> list[str]:
+    return next(args for tool, args in host.calls if args.get("mode") == "start")["channelIds"]
 
 
 def pending(host: FakeHost) -> int:
@@ -70,6 +97,62 @@ class InboxTest(unittest.TestCase):
         )
         self.assertIsNotNone(inbox_module.read_saved(host.stored))
         self.assertEqual(host.stored["follows"][0]["participant_id"], ME)
+
+    def test_follow_always_adds_general_found_with_get_context(self) -> None:
+        host = FakeHost()
+        inbox = Inbox(host, Settings())
+        answer = follow_with(inbox, [TASK])
+        self.assertEqual(host.contexts, [{"serverId": SERVER}], "asks for the server, not a participant")
+        self.assertEqual(started_with(host), [GENERAL, TASK])
+        self.assertEqual(host.stored["follows"][0]["channel_ids"], [GENERAL, TASK])
+        self.assertIn("(2 channels, direct chats: own). General is always included", answer)
+        # With no channels and no direct chats, General alone still makes a valid feed.
+        follow_with(inbox, [], "none")
+        self.assertEqual(host.calls[-1][1]["channelIds"], [GENERAL])
+        self.assertEqual(len(host.contexts), 1, "General's ID is asked once per server")
+
+    def test_general_chosen_or_repeated_is_watched_once(self) -> None:
+        host = FakeHost()
+        answer = follow_with(Inbox(host, Settings()), [TASK, GENERAL, TASK])
+        self.assertEqual(started_with(host), [TASK, GENERAL])
+        self.assertIn("(2 channels,", answer)
+
+    def test_with_the_limit_chosen_general_takes_the_last_place_and_says_so(self) -> None:
+        chosen = [f"channel-{index}" for index in range(LIMIT)]
+        host = FakeHost()
+        answer = follow_with(Inbox(host, Settings()), chosen)
+        self.assertEqual(started_with(host), [GENERAL, *chosen[: LIMIT - 1]])
+        self.assertIn(f"channel channel-{LIMIT - 1} is not delivered", answer)
+        self.assertIn(f"at most {LIMIT - 1} other channels", answer)
+        with_general = [GENERAL, *chosen[1:]]
+        self.assertEqual(
+            inbox_module.watched_channels(with_general, GENERAL).channel_ids, tuple(with_general)
+        )
+        self.assertIsInstance(
+            inbox_module.read_follow_input(
+                {"serverId": SERVER, "participantId": ME, "channelIds": [*chosen, "x"]}
+            ),
+            str,
+            "more than the limit is refused before TalkTo is asked",
+        )
+
+    def test_without_general_follow_watches_the_chosen_channels_and_says_so(self) -> None:
+        for missing in (
+            refusal("server_unavailable"),
+            {"data": {}, "meta": {}},
+            inbox_module.TransportError("offline"),
+        ):
+            host = FakeHost()
+            host.context = missing
+            inbox = Inbox(host, Settings())
+            answer = follow_with(inbox, [TASK])
+            self.assertTrue(answer.startswith("Following participant"), answer)
+            self.assertEqual(started_with(host), [TASK])
+            self.assertIn("could not add it; to hear about new channels, add General's ID", answer)
+            # Not remembered: the next follow asks again.
+            host.context = context()
+            follow_with(inbox, [TASK])
+            self.assertEqual(host.calls[-1][1]["channelIds"], [GENERAL, TASK])
 
     def test_queued_messages_wait_for_idle_and_count_only_once_a_turn_shows_them(self) -> None:
         host = FakeHost()

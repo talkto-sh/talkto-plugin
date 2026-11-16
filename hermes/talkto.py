@@ -252,3 +252,13 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
             latest if latest is not None and VERSION_PATTERN.fullmatch(latest) else None
         ),
     )
+
+
+def general_id_of(envelope: object) -> Optional[str]:
+    """The server's General channel from a ``get_context`` reply envelope
+    (``data.server.generalConversationId``), or None for an error or any reply that does not name it."""
+    if not isinstance(envelope, Mapping) or _fields(envelope, "error") is not None:
+        return None
+    data = _fields(envelope, "data")
+    server = None if data is None else _fields(data, "server")
+    return None if server is None else _text(server, "generalConversationId")

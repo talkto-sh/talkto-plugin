@@ -46,6 +46,11 @@ const message = (fields = {}) => {
   };
 };
 
+/** What the fake TalkTo answers get_context with: the server and its General channel. */
+const context = JSON.stringify({
+  data: { server: { id: server, generalConversationId: general } },
+});
+
 const fakeTalkTo = () => {
   const talkto = {
     calls: [],
@@ -71,7 +76,9 @@ const fakeTalkTo = () => {
       const result =
         body.params.name === "get_updates"
           ? (talkto.updates.shift() ?? page([], `cp-${sequence}`))
-          : { isError: false, content: [{ type: "text", text: `{"ok":"${body.params.name}"}` }] };
+          : body.params.name === "get_context"
+            ? { isError: false, content: [{ type: "text", text: context }] }
+            : { isError: false, content: [{ type: "text", text: `{"ok":"${body.params.name}"}` }] };
       return json(200, { jsonrpc: "2.0", id: body.id, result });
     },
   };
@@ -193,7 +200,7 @@ const follow = (opencode, sessionID = "ses_1") =>
     .tools()
     .get("talkto_follow")
     .execute(
-      { serverId: server, participantId: me, channelIds: [general], directChats: "own" },
+      { serverId: server, participantId: me, channelIds: [], directChats: "own" },
       { sessionID },
     );
 
@@ -214,7 +221,7 @@ test("setup adds the TalkTo integration with a browser sign-in and TalkTo's tool
   const reply = await tools
     .get("talkto_get_context")
     .execute({ serverId: server }, { sessionID: "ses_1" });
-  assert.equal(reply.content, '{"ok":"get_context"}');
+  assert.equal(reply.content, context);
   assert.equal(talkto.calls.at(-1).token, "Bearer live-token");
 });
 
@@ -234,9 +241,12 @@ test("without a connection the tools wait for sign-in and a failed call is answe
 test("queued messages go in as a queued prompt once idle; urgent ones are steered and confirmed", async (t) => {
   const { opencode, talkto, advance } = await start(t);
   talkto.updates.push(page([], "cp-start"));
-  assert.match((await follow(opencode)).content, /^Following participant/);
+  const followed = (await follow(opencode)).content;
+  assert.match(followed, /^Following participant/);
+  assert.match(followed, /General is always included/);
   const started = talkto.calls.findLast((call) => call.params.name === "get_updates");
   assert.equal(started.params.arguments.participantId, me);
+  assert.deepEqual(started.params.arguments.channelIds, [general], "General is always included");
 
   opencode.push({ type: "session.execution.started", data: { sessionID: "ses_1" } });
   await settle();

@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from support import DIRECT, GENERAL, ME, SERVER, Clock, envelope, load, message, refusal
+from support import DIRECT, GENERAL, ME, SERVER, Clock, context, envelope, load, message, refusal
 
 plugin = load()
 binding = plugin.plugin
@@ -46,6 +46,8 @@ class FakeContext:
         self.commands: dict[str, Any] = {}
         self.answers: list[Any] = []
         self.calls: list[tuple[str, str, dict[str, Any], float]] = []
+        #: get_context calls, answered apart with the server's General channel.
+        self.contexts: list[tuple[str, dict[str, Any]]] = []
         self.injected: list[tuple[str, str, str]] = []
         self.inject_answer = True
         self.config: dict[str, Any] = {}
@@ -61,6 +63,9 @@ class FakeContext:
         self.commands[name] = handler
 
     def call_mcp(self, server, tool, arguments=None, timeout=30):
+        if tool == "get_context":
+            self.contexts.append((server, dict(arguments or {})))
+            return hermes_ok(context())
         self.calls.append((server, tool, dict(arguments or {}), timeout))
         answer = self.answers.pop(0) if self.answers else hermes_ok(envelope([]))
         if isinstance(answer, Exception):
@@ -88,7 +93,7 @@ def started(ctx: FakeContext | None = None):
 def follow(ctx: FakeContext, clock: Clock) -> str:
     ctx.answers.append(hermes_ok(envelope([])))
     answer = ctx.tools["talkto_follow"]["handler"](
-        {"serverId": SERVER, "participantId": ME, "channelIds": [GENERAL]},
+        {"serverId": SERVER, "participantId": ME},
         task_id=SESSION,
         session_id=SESSION,
     )
@@ -118,10 +123,14 @@ class PluginTest(unittest.TestCase):
 
     def test_follow_calls_talkto_through_hermes_mcp_with_the_agents_own_participant(self) -> None:
         ctx, clock, _ = started()
-        self.assertTrue(follow(ctx, clock).startswith("Following participant"))
+        answer = follow(ctx, clock)
+        self.assertTrue(answer.startswith("Following participant"))
+        self.assertIn("General is always included", answer)
+        self.assertEqual(ctx.contexts, [("talkto", {"serverId": SERVER})])
         server, tool, args, timeout = ctx.calls[0]
         self.assertEqual((server, tool), ("talkto", "get_updates"))
         self.assertEqual(args["participantId"], ME)
+        self.assertEqual(args["channelIds"], [GENERAL], "General is always included")
         self.assertGreater(timeout, 20, "longer than TalkTo's 20 second wait")
 
     def test_the_mcp_server_name_comes_from_the_settings(self) -> None:

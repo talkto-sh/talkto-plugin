@@ -10,6 +10,7 @@ const server = "11111111-1111-4111-8111-111111111111";
 const me = "22222222-2222-4222-8222-222222222222";
 const peer = "33333333-3333-4333-8333-333333333333";
 const chat = "55555555-5555-4555-8555-555555555555";
+const general = "44444444-4444-4444-8444-444444444444";
 /** A T3 thread ID that is not a UUID, as T3 gives an MCP-launched thread. */
 const thread = `mcp:launch:${"a".repeat(64)}`;
 const t3Env = { CLAUDE_CODE_ENTRYPOINT: "t3-code", T3CODE_THREAD_ID: thread };
@@ -35,6 +36,16 @@ const page = (messages: ReadonlyArray<Incoming>, checkpoint: string) => ({
     meta: {},
   },
 });
+/** TalkTo's get_context answer: the server and its General channel. */
+const context = {
+  isError: false,
+  content: [],
+  structuredContent: {
+    data: { server: { id: server, generalConversationId: general } },
+    included: { participants: [], conversations: [] },
+    meta: {},
+  },
+};
 const incoming = (id: string, body: string) => ({
   id,
   conversationId: chat,
@@ -58,9 +69,13 @@ interface Rig {
   readonly store?: Map<string, unknown>;
 }
 
-/** The engine beneath the plugin: TalkTo's answers in order, and what the plugin submits and registers. */
+/**
+ * The engine beneath the plugin: TalkTo's get_updates answers in order, get_context's apart, and
+ * what the plugin submits and registers.
+ */
 const engine = (on: On, rig: Rig) => {
   const calls: { server: string; tool: string; args: unknown }[] = [];
+  const contexts: unknown[] = [];
   const submitted: string[] = [];
   const descriptions: string[] = [];
   const tools = rig.tools ?? [];
@@ -69,6 +84,10 @@ const engine = (on: On, rig: Rig) => {
     value: { isConnected: true, server: "plugin:talkto-plugin:talkto" },
   }));
   on("mcp.call", (_$, e) => {
+    if (e.tool === "get_context") {
+      contexts.push(e.args);
+      return { value: context };
+    }
     calls.push(e);
     return { value: rig.answers.shift() ?? page([], "cp-n") };
   });
@@ -100,7 +119,7 @@ const engine = (on: On, rig: Rig) => {
   on("turn.start", (_$, e) => ({ turnId: e.turnId }));
   on("turn.complete", () => ({ text: "" }));
   on("ui.status", () => ({ value: undefined }));
-  return { calls, submitted, descriptions, store };
+  return { calls, contexts, submitted, descriptions, store };
 };
 
 const complete = { reason: "answer", answer: "done", durationMs: 10, isAborted: false } as const;
@@ -125,7 +144,7 @@ const holderOf = (store: Map<string, unknown>) =>
 test("follow, poll through the session's MCP connection, queue while busy, deliver when idle", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 });
   const session = mock.session(on);
-  const { calls, submitted, descriptions } = engine(on, {
+  const { calls, contexts, submitted, descriptions } = engine(on, {
     answers: [
       page([], "cp-0"),
       page(
@@ -146,6 +165,8 @@ test("follow, poll through the session's MCP connection, queue while busy, deliv
   });
   expect(String(followed.result)).toMatch(/^Following participant/);
   expect(String(followed.result)).not.toMatch(/T3/);
+  expect(String(followed.result)).toMatch(/General is always included/);
+  expect(contexts).toEqual([{ serverId: server }]);
   expect(calls[0]).toEqual({
     server: "plugin:talkto-plugin:talkto",
     tool: "get_updates",
@@ -153,7 +174,7 @@ test("follow, poll through the session's MCP connection, queue while busy, deliv
       serverId: server,
       participantId: me,
       mode: "start",
-      channelIds: [],
+      channelIds: [general],
       directChats: "own",
       startAt: "now",
       limit: 50,

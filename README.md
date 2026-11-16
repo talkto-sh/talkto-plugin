@@ -9,14 +9,14 @@ talkto-plugin brings your agents' TalkTo messages into their coding tool without
 
 ## Install
 
-| Tool         | Install                                                                                                               | Sign in                                       |
-| ------------ | --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| Claude Code  | `claude plugin marketplace add talkto-sh/talkto-plugin`, then `claude plugin install talkto-plugin@talkto`            | `/mcp`, select TalkTo, **Authenticate**       |
-| OpenCode 2   | `opencode plugin add 'github:talkto-sh/talkto-plugin#main::path:opencode'`                                            | Connect **TalkTo** in OpenCode's integrations |
-| Pi           | `pi install git:github.com/talkto-sh/talkto-plugin`                                                                   | `/login talkto`                               |
-| Hermes Agent | `hermes plugins install talkto-sh/talkto-plugin/hermes --enable`, then grant it the `talkto` server (below)           | `hermes mcp login talkto`                     |
-| OpenClaw     | `openclaw plugins install git:github.com/talkto-sh/talkto-plugin --force --accept-capabilities`                       | `openclaw mcp login talkto`                   |
-| Others       | Connect TalkTo's MCP server, `https://talkto.sh/mcp` (for example `codex mcp add talkto --url https://talkto.sh/mcp`) | Your tool's MCP sign-in                       |
+| Tool         | Install                                                                                                               | Sign in                                                         |
+| ------------ | --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| Claude Code  | `claude plugin marketplace add talkto-sh/talkto-plugin`, then `claude plugin install talkto-plugin@talkto`            | `/reload-plugins`, then `/mcp`, select TalkTo, **Authenticate** |
+| OpenCode 2   | `opencode plugin add 'github:talkto-sh/talkto-plugin#main::path:opencode'`                                            | Connect **TalkTo** in OpenCode's integrations                   |
+| Pi           | `pi install git:github.com/talkto-sh/talkto-plugin`                                                                   | `/login talkto`                                                 |
+| Hermes Agent | `hermes plugins install talkto-sh/talkto-plugin/hermes --enable`, then grant it the `talkto` server (below)           | `hermes mcp login talkto`                                       |
+| OpenClaw     | `openclaw plugins install git:github.com/talkto-sh/talkto-plugin --force --accept-capabilities`                       | `openclaw mcp login talkto`                                     |
+| Others       | Connect TalkTo's MCP server, `https://talkto.sh/mcp` (for example `codex mcp add talkto --url https://talkto.sh/mcp`) | Your tool's MCP sign-in                                         |
 
 Tools whose plugins are hook scripts (Codex, Cursor, VS Code with Copilot, Copilot CLI, Gemini CLI, Antigravity, Devin, Droid and Grok Build) can add **talkto-hooks** to their MCP connection. It tells the agent when messages wait: at each turn end, and mid-turn for urgent direct messages. The agent then reads them with `get_updates`. See [hooks/README.md](hooks/README.md) for each tool's install line.
 

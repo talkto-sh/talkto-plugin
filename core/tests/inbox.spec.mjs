@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   Inbox,
+  channelLimit,
   engagedMillis,
   isSaved,
   queueLimit,
@@ -11,8 +12,9 @@ import {
   rearmMillis,
   settleMillis,
   waitSeconds,
+  watchedChannels,
 } from "../src/inbox.ts";
-import { decodeUpdates, messageIdsOf } from "../src/talkto.ts";
+import { decodeUpdates, generalIdOf, messageIdsOf } from "../src/talkto.ts";
 import { bodyLimit } from "../src/notice.ts";
 
 const server = "11111111-1111-4111-8111-111111111111";
@@ -49,17 +51,32 @@ const reply = (messages, { nextCursor = null, checkpoint = `cp-${sequence}` } = 
     meta: {},
   },
 });
+/** A get_context answer naming the server's General channel. */
+const context = (generalId = general) => ({
+  isError: false,
+  content: [],
+  structuredContent: {
+    data: { server: { id: server, name: "Team", generalConversationId: generalId } },
+    included: { participants: [], conversations: [] },
+    meta: {},
+  },
+});
 const failure = (code, message = "no") => ({
   isError: true,
   content: [],
   structuredContent: { error: { code, message }, meta: {} },
 });
 
-/** A host whose TalkTo answers come from a queue and whose effects are recorded. */
+/**
+ * A host whose TalkTo answers come from a queue and whose effects are recorded. get_context is
+ * answered apart, from `context` (an answer or an Error), and recorded in `contexts`.
+ */
 const fakeHost = () => {
   const host = {
     answers: [],
     calls: [],
+    contexts: [],
+    context: context(),
     submitted: [],
     injected: [],
     timers: [],
@@ -68,6 +85,11 @@ const fakeHost = () => {
     time: 0,
     submitAnswer: true,
     call: async (tool, args) => {
+      if (tool === "get_context") {
+        host.contexts.push(args);
+        if (host.context instanceof Error) throw host.context;
+        return host.context;
+      }
       host.calls.push({ tool, args });
       const next = host.answers.shift();
       if (next === undefined) return reply([]);
@@ -135,6 +157,88 @@ test("follow starts the participant's own feed and saves it before anything is d
   });
   assert.ok(isSaved(host.stored));
   assert.equal(host.stored.follows[0].participantId, me);
+});
+
+const task = "66666666-6666-4666-8666-666666666666";
+const followWith = (inbox, channelIds, directChats = "own") =>
+  inbox.follow({ serverId: server, participantId: me, channelIds, directChats, startAt: "now" });
+const startedWith = (host) => host.calls.find((call) => call.args.mode === "start").args.channelIds;
+
+test("follow always adds General, found with get_context, to the chosen channels", async () => {
+  const host = fakeHost();
+  const inbox = new Inbox(host, settings);
+  const answer = await followWith(inbox, [task]);
+  assert.deepEqual(host.contexts, [{ serverId: server }], "asks for the server, not a participant");
+  assert.deepEqual(startedWith(host), [general, task]);
+  assert.deepEqual(host.stored.follows[0].channelIds, [general, task], "a restart keeps General");
+  assert.match(answer, /\(2 channels, direct chats: own\)\. General is always included/);
+  // With no channels and no direct chats, General alone still makes a valid feed.
+  await followWith(inbox, [], "none");
+  assert.deepEqual(host.calls.at(-1).args.channelIds, [general]);
+  assert.equal(host.contexts.length, 1, "General's ID is asked once per server");
+});
+
+test("General chosen or repeated is watched once", async () => {
+  const host = fakeHost();
+  const answer = await followWith(new Inbox(host, settings), [task, general, task]);
+  assert.deepEqual(startedWith(host), [task, general]);
+  assert.match(answer, /\(2 channels,/);
+  assert.deepEqual(watchedChannels([general, general], general), {
+    channelIds: [general],
+    general: true,
+    displaced: null,
+  });
+});
+
+test("with the channel limit chosen, General takes the last one's place and the answer says so", async () => {
+  const chosen = Array.from({ length: channelLimit }, (_, index) => `channel-${index}`);
+  const host = fakeHost();
+  const answer = await followWith(new Inbox(host, settings), chosen);
+  const watched = startedWith(host);
+  assert.equal(watched.length, channelLimit);
+  assert.deepEqual(watched, [general, ...chosen.slice(0, channelLimit - 1)]);
+  assert.match(answer, new RegExp(`channel channel-${channelLimit - 1} is not delivered`));
+  assert.match(answer, new RegExp(`at most ${channelLimit - 1} other channels`));
+  const withGeneral = [general, ...chosen.slice(1)];
+  assert.deepEqual(watchedChannels(withGeneral, general).channelIds, withGeneral);
+  assert.equal(
+    readFollowInput(
+      new Map(
+        Object.entries({ serverId: server, participantId: me, channelIds: [...chosen, "x"] }),
+      ),
+    ).ok,
+    false,
+    "more than the limit is refused before TalkTo is asked",
+  );
+});
+
+test("when General cannot be found, follow watches the chosen channels and says General is missing", async () => {
+  for (const missing of [
+    failure("server_unavailable"),
+    { isError: false, content: [], structuredContent: { data: {}, meta: {} } },
+    new Error("offline"),
+  ]) {
+    const host = fakeHost();
+    host.context = missing;
+    const inbox = new Inbox(host, settings);
+    const answer = await followWith(inbox, [task]);
+    assert.match(answer, /^Following participant/);
+    assert.deepEqual(startedWith(host), [task]);
+    assert.match(answer, /could not add it; to hear about new channels, add General's ID/);
+    // Not remembered: the next follow asks again.
+    host.context = context();
+    await followWith(inbox, [task]);
+    assert.deepEqual(host.calls.at(-1).args.channelIds, [general, task]);
+  }
+  assert.equal(generalIdOf(context()), general);
+  assert.equal(
+    generalIdOf({
+      isError: false,
+      content: [{ type: "text", text: JSON.stringify(context().structuredContent) }],
+    }),
+    general,
+    "read from the text block when there is no structured content",
+  );
 });
 
 test("queued messages wait for an idle session and arrive as one notice", async () => {

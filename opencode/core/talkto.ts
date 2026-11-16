@@ -240,3 +240,15 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
     },
   };
 };
+
+/**
+ * The server's General channel from a `get_context` answer (`data.server.generalConversationId`),
+ * or null for an error or any answer that does not name it.
+ */
+export const generalIdOf = (answer: ToolAnswer): string | null => {
+  if (answer.isError) return null;
+  const envelope = envelopeOf(answer);
+  const data = envelope === null ? null : fieldsAt(envelope, "data");
+  const server = data === null ? null : fieldsAt(data, "server");
+  return server === null ? null : textOf(server, "generalConversationId");
+};

@@ -68,6 +68,15 @@ def envelope(messages: list[dict[str, Any]], next_cursor: Any = None, checkpoint
     }
 
 
+def context(general: str = GENERAL) -> dict[str, Any]:
+    """A get_context reply naming the server's General channel."""
+    return {
+        "data": {"server": {"id": SERVER, "name": "Team", "generalConversationId": general}},
+        "included": {"participants": [], "conversations": []},
+        "meta": {},
+    }
+
+
 def refusal(code: str, text: str = "no") -> dict[str, Any]:
     return {"error": {"code": code, "message": text}, "meta": {}}
 
@@ -91,7 +100,9 @@ class Clock:
 
 
 class FakeHost:
-    """An inbox host whose TalkTo answers come from a list and whose effects are recorded."""
+    """An inbox host whose TalkTo answers come from a list and whose effects are recorded.
+    get_context is answered apart, from ``context`` (a reply or an exception), and recorded in
+    ``contexts``."""
 
     connection_hint = "Check the connection."
 
@@ -100,14 +111,20 @@ class FakeHost:
         self.clock = Clock()
         self.answers: list[Any] = []
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.contexts: list[dict[str, Any]] = []
+        self.context: Any = context()
         self.submitted: list[str] = []
         self.submit_answer = True
         self.stored: Any = None
 
     def call(self, tool: str, args: Any):
         inbox = self.plugin.inbox
-        self.calls.append((tool, dict(args)))
-        answer = self.answers.pop(0) if self.answers else envelope([])
+        if tool == "get_context":
+            self.contexts.append(dict(args))
+            answer = self.context
+        else:
+            self.calls.append((tool, dict(args)))
+            answer = self.answers.pop(0) if self.answers else envelope([])
         if isinstance(answer, Exception):
             raise answer
         if isinstance(answer, inbox.Answer):

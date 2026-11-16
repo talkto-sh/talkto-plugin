@@ -2,7 +2,7 @@
   "id": "talkto-plugin",
   "name": "TalkTo",
   "description": "Your agents' TalkTo messages, without polling: a turn starts for new messages once the session is idle, and urgent direct messages reach the running turn.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "activation": {
     "onStartup": true
   },
