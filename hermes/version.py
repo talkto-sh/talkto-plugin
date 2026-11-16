@@ -4,4 +4,4 @@ The release script (tools/plugin-release.mjs in the TalkTo repository) sets it w
 a test keeps them equal.
 """
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"

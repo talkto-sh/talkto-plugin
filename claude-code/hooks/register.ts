@@ -39,6 +39,7 @@ import {
   leaseStaleMillis,
   mayHold,
   notThreadRefusal,
+  reconnectHintOf,
   sessionKindOf,
   standbyRefusal,
   startingRefusal,
@@ -101,6 +102,19 @@ const serverOf = async ($: EngineInterface, configured: string): Promise<string>
   throw new Error(
     "no TalkTo MCP server is connected in this session; run /mcp and authenticate TalkTo",
   );
+};
+
+/**
+ * The TalkTo tools this session lists for `server`, by their TalkTo names. Claude Code names an MCP
+ * tool `mcp__<server>__<tool>`, the server's name with anything but letters, digits, `_` and `-`
+ * made `_`. Empty when none match, which the inbox reads as unknown.
+ */
+const toolsOf = async ($: EngineInterface, server: string): Promise<ReadonlyArray<string>> => {
+  const prefix = `mcp__${server.replace(/[^A-Za-z0-9_-]/g, "_")}__`;
+  return (await $.tool.list())
+    .map((tool) => tool.name)
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => name.slice(prefix.length));
 };
 
 /** The session's kind, from what Claude Code says and the variables T3 Code sets. */
@@ -257,6 +271,8 @@ const hostOf = (
     },
     status: (text) => $.ui.status(text),
     connectionHint: connectionHintOf(kind),
+    reconnectHint: reconnectHintOf(kind),
+    tools: async () => toolsOf($, (server ??= await serverOf($, configured))),
     plugin: { name: "claude-code", version },
     lease,
   };

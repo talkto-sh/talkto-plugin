@@ -60,7 +60,10 @@ const urgent = (id: string, body: string) => ({
 
 /** What the engine beneath the plugin holds for one test. */
 interface Rig {
-  readonly answers: ReturnType<typeof page>[];
+  /** get_updates answers in order; an Error makes the call fail, as a refused answer does. */
+  readonly answers: (ReturnType<typeof page> | Error)[];
+  /** get_context's answer; `context` when absent. */
+  readonly context?: unknown;
   readonly sessionId?: string;
   readonly registered?: Promise<void>;
   /** The session's tool names, which the test can change: T3 adds its server after start. */
@@ -86,10 +89,12 @@ const engine = (on: On, rig: Rig) => {
   on("mcp.call", (_$, e) => {
     if (e.tool === "get_context") {
       contexts.push(e.args);
-      return { value: context };
+      return { value: rig.context ?? context };
     }
     calls.push(e);
-    return { value: rig.answers.shift() ?? page([], "cp-n") };
+    const answer = rig.answers.shift() ?? page([], "cp-n");
+    // `deny` rejects the plugin's $.mcp.call, as Claude Code does when it refuses an answer.
+    return answer instanceof Error ? { deny: answer.message } : { value: answer };
   });
   on("prompt.submit", (_$, e) => {
     submitted.push(e.text);
@@ -423,6 +428,66 @@ test("thread records nobody renewed for a month are removed", async ($, on) => {
   await $.session.start({ cwd: "/", surface: null, isInteractive: false });
   await clock.advance(2_000);
   expect([...store.keys()].sort()).toEqual(["session:terminal", `t3:${thread}`, "t3:recent"]);
+});
+
+test("after a reload or compaction a terminal session resumes its stored follow and polls at once", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 });
+  const store = new Map<string, unknown>([["session:session-1", record("cp-saved")]]);
+  const { calls, submitted } = engine(on, {
+    answers: [page([incoming("m1", "sent while reloading")], "cp-1")],
+    store,
+  });
+  // A reload runs register and session.start again; only $.store carries the follow over.
+  await $.session.start({ cwd: "/", surface: "terminal", isInteractive: true });
+  await clock.advance(0);
+  expect(calls[0]?.args).toMatchObject({ mode: "poll", checkpoint: "cp-saved" });
+  await clock.advance(2_000);
+  expect(submitted.join("\n")).toMatch(/sent while reloading/);
+});
+
+test("a stale TalkTo connection is named at follow, and a refused answer restarts and says to reconnect", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 });
+  const listed = "mcp__plugin_talkto-plugin_talkto__";
+  const { calls, submitted } = engine(on, {
+    answers: [
+      page([], "cp-0"),
+      new Error(
+        "MCP error -32602: Structured content does not match the tool's output schema: data/data/messages/0 must NOT have additional properties",
+      ),
+      page([], "cp-restarted"),
+      page([incoming("m1", "after the restart")], "cp-2"),
+    ],
+    context: {
+      ...context,
+      structuredContent: {
+        ...context.structuredContent,
+        data: { ...context.structuredContent.data, capabilities: ["transfers"] },
+      },
+    },
+    tools: [`${listed}get_updates`, `${listed}send_message`, `${listed}share_file`],
+  });
+
+  await $.session.start({ cwd: "/", surface: "terminal", isInteractive: true });
+  const followed = await $.tool.call({
+    tool: "mcp__talkto-plugin__follow",
+    serverId: server,
+    participantId: me,
+  });
+  expect(String(followed.result)).toMatch(
+    /older than the server: it lacks prepare_transfer, complete_transfer, fetch_transfer/,
+  );
+  expect(String(followed.result)).toMatch(
+    /run \/mcp, select the TalkTo server and choose Reconnect/,
+  );
+
+  // The follow just started, so polls wait on TalkTo and chain one after another.
+  await clock.advance(15_000);
+  expect(calls[1]?.args).toMatchObject({ mode: "poll", checkpoint: "cp-0" });
+  expect(calls[2]?.args).toMatchObject({ mode: "start", startAt: "now" });
+  expect(calls[3]?.args).toMatchObject({ mode: "poll", checkpoint: "cp-restarted" });
+  expect(submitted[0]).toMatch(/refused TalkTo's answer for participant/);
+  expect(submitted[0]).toMatch(/choose Reconnect/);
+  expect(submitted.join("\n")).toMatch(/after the restart/);
 });
 
 for (const [name, env] of [

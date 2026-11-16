@@ -11,6 +11,9 @@ import {
   readFollowInput,
   rearmMillis,
   settleMillis,
+  stallChecks,
+  stallRepeatMillis,
+  stuckMillis,
   waitSeconds,
   watchedChannels,
 } from "../src/inbox.ts";
@@ -513,6 +516,66 @@ test("transient failures back off; revoked access ends the follow with a notice"
   assert.deepEqual(host.stored.follows, []);
 });
 
+const removedMessage = "A person removed this participant; a person can restore it.";
+
+test("a participant a person removed ends its follow at once and the agent is told plainly", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(failure("participant_removed", removedMessage));
+  await inbox.tick();
+  assert.deepEqual(host.stored.follows, [], "no backoff and no retry");
+  const [notice] = host.submitted;
+  assert.match(notice, /a person removed you \(participant 2{8}-.*\) from "Team", server 1{8}-/);
+  assert.match(notice, /Ask them to restore you; until then you can't send or receive there\./);
+  assert.match(notice, /Do not register again under a new name unless they ask you to\./);
+  const calls = host.calls.length;
+  host.time += 60 * 60 * 1000;
+  await inbox.tick();
+  assert.equal(host.calls.length, calls, "nothing is asked of TalkTo for it again");
+  assert.equal(host.submitted.length, 1, "told once");
+});
+
+test("a removal found after a restart names the server it asks get_context for", async () => {
+  const host = fakeHost();
+  await followed(host);
+  const restarted = new Inbox(host, settings);
+  await restarted.restore();
+  host.contexts.length = 0;
+  host.answers.push(failure("participant_removed", removedMessage));
+  await restarted.tick();
+  assert.deepEqual(host.contexts, [{ serverId: server }]);
+  assert.match(host.submitted.at(-1), /from "Team", server /);
+
+  const unnamed = fakeHost();
+  await followed(unnamed);
+  const later = new Inbox(unnamed, settings);
+  await later.restore();
+  unnamed.context = new Error("offline");
+  unnamed.answers.push(failure("participant_removed", removedMessage));
+  await later.tick();
+  assert.match(unnamed.submitted.at(-1), new RegExp(`from server ${server}, on TalkTo`));
+  assert.deepEqual(unnamed.stored.follows, []);
+});
+
+test("a follow refused because a person removed the participant says so in plain words", async () => {
+  const host = fakeHost();
+  const inbox = new Inbox(host, settings);
+  host.answers.push(failure("participant_removed", removedMessage));
+  const answer = await followWith(inbox, []);
+  assert.match(answer, /a person removed you .* from "Team", server /);
+  assert.match(answer, /Ask them to restore you/);
+  assert.equal(host.stored, null);
+});
+
+test("forbidden ends a follow like other permanent refusals", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(failure("forbidden", "This participant is a person."));
+  await inbox.tick();
+  assert.deepEqual(host.stored.follows, []);
+  assert.match(host.submitted.at(-1), /stopped delivering messages .*forbidden/);
+});
+
 test("a reset history restarts from now and says messages may be missing", async () => {
   const host = fakeHost();
   const inbox = await followed(host);
@@ -876,4 +939,222 @@ test("a session saved before renames existed restores, and queued renames surviv
     isSaved({ ...old, follows: [{ ...old.follows[0], renames: [{ id: "r-1" }] }] }),
     false,
   );
+});
+
+// November 16, 2026: a session's MCP client had read TalkTo's tool list, with strict reply schemas,
+// before a TalkTo deploy added an optional `notice` field to messages (channel announcements in
+// General). From the first announcement on, the client refused every get_updates answer that held
+// it, so each poll failed from the same checkpoint. The plugin backed off and retried for three and
+// a half hours, the status line still said "following", and the agent was never told.
+const refusal = () =>
+  new Error(
+    "MCP error -32602: Structured content does not match the tool's output schema: data/data/messages/0 must NOT have additional properties",
+  );
+
+test("replay of November 16: a page the host refuses restarts the follow from now and tells the agent", async () => {
+  const host = fakeHost();
+  host.reconnectHint = "Ask your person to reconnect TalkTo in /mcp.";
+  const inbox = await followed(host);
+  host.answers.push(reply([message({ body: "before the deploy" })]));
+  await inbox.tick();
+  assert.match(host.submitted.at(-1), /before the deploy/);
+  const delivered = host.submitted.length;
+
+  host.time += 60_000;
+  host.answers.push(refusal(), reply([], { checkpoint: "after-restart" }));
+  await inbox.tick();
+  const restart = host.calls.at(-1).args;
+  assert.equal(restart.mode, "start");
+  assert.equal(restart.startAt, "now");
+  assert.deepEqual(restart.channelIds, [general]);
+  assert.equal(host.stored.follows[0].checkpoint, "after-restart");
+  assert.equal(host.submitted.length, delivered + 1, "the agent is told at once");
+  const told = host.submitted.at(-1);
+  assert.match(told, /refused TalkTo's answer for participant/);
+  assert.match(told, /must NOT have additional properties/);
+  assert.match(told, /Messages sent between \d{4}-\d\d-\d\dT[\d:]+Z and now were skipped/);
+  assert.match(told, /reconnect TalkTo in \/mcp/);
+
+  host.time += 60_000;
+  host.answers.push(reply([message({ body: "after the restart" })]));
+  await inbox.tick();
+  assert.equal(host.calls.at(-1).args.checkpoint, "after-restart");
+  assert.match(host.submitted.at(-1), /after the restart/, "later messages are delivered again");
+});
+
+test("a refusal the host returns as an error result is handled like a thrown one", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(
+    { isError: true, content: [{ type: "text", text: refusal().message }] },
+    reply([], { checkpoint: "after-restart" }),
+  );
+  await inbox.tick();
+  assert.equal(host.stored.follows[0].checkpoint, "after-restart");
+  assert.match(host.submitted.at(-1), /refused TalkTo's answer/);
+  assert.match(
+    host.submitted.at(-1),
+    /Check the connection\./,
+    "connectionHint without reconnectHint",
+  );
+});
+
+test("checks that keep failing tell the agent, again each hour, and say when delivery works again", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  const failOnce = async () => {
+    host.answers.push(new Error("fetch failed: connect ECONNREFUSED"));
+    host.time += 10 * 60 * 1000;
+    await inbox.tick();
+  };
+  for (let check = 1; check < stallChecks; check += 1) await failOnce();
+  assert.equal(host.submitted.length, 0, "a short outage stays quiet");
+  await failOnce();
+  assert.equal(host.submitted.length, 1);
+  assert.match(host.submitted[0], /is not delivering new messages for participant/);
+  assert.match(host.submitted[0], /ECONNREFUSED/);
+  assert.match(host.submitted[0], /Check the connection\./);
+  assert.match(host.submitted[0], /read the conversations you are waiting on with read_messages/);
+  assert.equal(host.statuses.at(-1), "TalkTo: not delivering, checks fail (see /talkto-inbox)");
+  assert.match(inbox.describe(), /Not delivering: 3 checks in a row failed since/);
+  assert.equal(host.stored.follows.length, 1, "the follow is kept and retried");
+
+  await failOnce();
+  await failOnce();
+  assert.equal(host.submitted.length, 1, "not again within the hour");
+  host.time += stallRepeatMillis;
+  await failOnce();
+  assert.equal(host.submitted.length, 2, "again after an hour");
+
+  host.time += 10 * 60 * 1000;
+  host.answers.push(reply([message({ body: "sent during the outage" })]));
+  await inbox.tick();
+  const resumed = host.submitted.at(-1);
+  assert.match(resumed, /delivery for participant .* works again; checks had failed since/);
+  assert.match(resumed, /sent during the outage/, "what waited is delivered with it");
+  assert.equal(host.statuses.at(-1), "TalkTo: following");
+});
+
+test("a check that never answers is given up, and its late answer changes nothing", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  let answerLate;
+  const hanging = new Promise((resolve) => {
+    answerLate = resolve;
+  });
+  const call = host.call;
+  host.call = async (tool, args) => {
+    if (tool === "get_updates" && args.mode === "poll" && answerLate !== undefined) {
+      host.calls.push({ tool, args });
+      return hanging;
+    }
+    return call(tool, args);
+  };
+  const stuck = inbox.tick();
+  await Promise.resolve();
+  const asked = host.calls.length;
+  host.time += 30_000;
+  await inbox.tick();
+  assert.equal(host.calls.length, asked, "a check in flight is not doubled");
+
+  host.time += stuckMillis;
+  const late = answerLate;
+  answerLate = undefined;
+  host.answers.push(reply([message({ body: "after giving up" })], { checkpoint: "fresh" }));
+  await inbox.tick();
+  assert.equal(host.calls.length, asked + 1, "a new check starts");
+  assert.match(host.submitted.at(-1), /after giving up/);
+  late(reply([message({ body: "too late" })], { checkpoint: "stale" }));
+  await stuck;
+  assert.equal(host.stored.follows[0].checkpoint, "fresh", "the late answer is ignored");
+  assert.ok(host.submitted.every((text) => !/too late/.test(text)));
+});
+
+test("following again while a check hangs gives it up and polls at once", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  const call = host.call;
+  let hang = true;
+  host.call = async (tool, args) => {
+    if (hang && tool === "get_updates" && args.mode === "poll") {
+      host.calls.push({ tool, args });
+      return new Promise(() => {});
+    }
+    return call(tool, args);
+  };
+  void inbox.tick();
+  while (polls(host).length === 0) await Promise.resolve();
+  host.answers.push(reply([], { checkpoint: "refollowed" }), reply([message({ body: "at once" })]));
+  await inbox.follow({
+    serverId: server,
+    participantId: me,
+    channelIds: [general],
+    directChats: "own",
+    startAt: "now",
+  });
+  hang = false;
+  await host.advance(0);
+  assert.equal(polls(host)[1].args.checkpoint, "refollowed", "polled at once, from the new follow");
+  await host.advance(settleMillis);
+  assert.match(host.submitted.at(-1), /at once/);
+});
+
+test("follow says when the session's connection lacks the tools a capability brings", async () => {
+  const withCapabilities = (capabilities) => ({
+    ...context(),
+    structuredContent: {
+      ...context().structuredContent,
+      data: { ...context().structuredContent.data, capabilities },
+    },
+  });
+  const follow = async (tools, capabilities) => {
+    const host = fakeHost();
+    host.context = withCapabilities(capabilities);
+    host.reconnectHint = "Reconnect TalkTo in /mcp.";
+    if (tools !== undefined) host.tools = async () => tools;
+    host.answers.push(reply([]));
+    return new Inbox(host, settings).follow({
+      serverId: server,
+      participantId: me,
+      channelIds: [],
+      directChats: "own",
+      startAt: "now",
+    });
+  };
+  const stale = await follow(["get_updates", "send_message", "share_file"], ["transfers", "wakes"]);
+  assert.match(
+    stale,
+    /connection is older than the server: it lacks prepare_transfer, complete_transfer, fetch_transfer/,
+  );
+  assert.match(stale, /Reconnect TalkTo in \/mcp\./);
+  for (const answer of [
+    await follow(
+      ["get_updates", "prepare_transfer", "complete_transfer", "fetch_transfer"],
+      ["transfers"],
+    ),
+    await follow(["get_updates"], ["wakes"]),
+    await follow([], ["transfers"]),
+    await follow(undefined, ["transfers"]),
+  ])
+    assert.doesNotMatch(answer, /older than the server/);
+});
+
+test("a store that refuses to save does not stop delivery, and the agent hears once", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.save = async () => {
+    throw new Error("store over 4 MiB");
+  };
+  host.answers.push(reply([message({ body: "still delivered" })]));
+  await inbox.tick();
+  assert.match(
+    host.submitted.at(-1),
+    /could not save what this session follows \(store over 4 MiB\)/,
+  );
+  assert.match(host.submitted.at(-1), /still delivered/);
+  host.time += 60_000;
+  host.answers.push(reply([message({ body: "and again" })]));
+  await inbox.tick();
+  assert.match(host.submitted.at(-1), /and again/);
+  assert.doesNotMatch(host.submitted.at(-1), /could not save/);
 });

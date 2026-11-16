@@ -29,16 +29,27 @@
  * - The follow, its checkpoint and the queue are saved in the plugin's store
  *   before anything is delivered, so a crash, restart or compaction neither
  *   loses nor repeats a message.
+ * - A follow never stops quietly. Checks that keep failing (`stallChecks` in a
+ *   row) put a note in front of the agent saying delivery has stopped and why,
+ *   again every hour while they fail, and one more when delivery works again.
+ *   The status line says "not delivering" meanwhile. A check that never
+ *   answers is given up after `stuckMillis`. When the host refuses TalkTo's
+ *   answer outright (its MCP client checks answers against the tool list it
+ *   read when it connected, and a TalkTo update added a field), the follow
+ *   starts again from now, and the agent is told what was skipped and how to
+ *   reconnect.
  *
  * Identity: a follow names the participant explicitly (the agent's own
  * `follow` call after it registered); the MCP connection identifies nobody.
  */
 import {
+  capabilitiesOf,
   decodeUpdates,
   generalIdOf,
   isObject,
   isText,
   listOf,
+  serverNameOf,
   textOf,
   type Fields,
   type IncomingMessage,
@@ -49,10 +60,17 @@ import {
 } from "./talkto.ts";
 import {
   bodyLimit,
+  deliveryResumed,
+  deliveryStalled,
   followEnded,
   isNewer,
+  participantRemoved,
   queuedNotice,
   releaseText,
+  replyRejected,
+  saveFailed,
+  stamp,
+  staleConnection,
   updateNotice,
   urgentFollowUp,
   urgentNotice,
@@ -94,6 +112,17 @@ export interface Host {
   readonly status: (text: string | undefined) => void;
   /** What the agent should do when TalkTo cannot be reached, e.g. "Check /mcp." */
   readonly connectionHint: string;
+  /**
+   * What the agent should do when the host's connection refuses TalkTo's answers because it was
+   * set up before a TalkTo update (e.g. "Ask your person to reconnect TalkTo in /mcp.").
+   * `connectionHint` when absent.
+   */
+  readonly reconnectHint?: string;
+  /**
+   * The TalkTo tools this session's connection offers, by their TalkTo names; empty when unknown.
+   * Absent where the plugin connects to TalkTo itself and always has the server's current list.
+   */
+  readonly tools?: () => Promise<ReadonlyArray<string>>;
   /** This plugin and its version, reported to TalkTo on every get_updates call. */
   readonly plugin: PluginRelease;
 }
@@ -189,14 +218,35 @@ export const rearmMillis = 1000;
 export const updateNoticeMillis = 24 * 60 * 60 * 1000;
 /** Longest wait between polls after repeated failures. */
 const backoffLimitMillis = 5 * 60 * 1000;
-/** Failures that mean the follow can never work again as it stands. */
+/** Failed checks in a row after which the agent is told that delivery has stopped. */
+export const stallChecks = 3;
+/** While checks keep failing, the agent is told again this often. */
+export const stallRepeatMillis = 60 * 60 * 1000;
+/**
+ * A check still running after this long is given up and counts as failed; its answer, if it ever
+ * comes, is ignored. Hosts may never time out a call themselves (Claude Code's MCP calls wait for
+ * hours), and one call that never answers must not stop every later check.
+ */
+export const stuckMillis = waitSeconds * 1000 + 60 * 1000;
+/** The tools a capability brings: a connection without them was set up before the server had them. */
+const capabilityTools: ReadonlyMap<string, ReadonlyArray<string>> = new Map([
+  ["transfers", ["prepare_transfer", "complete_transfer", "fetch_transfer"]],
+]);
+/**
+ * Failures that mean the follow can never work again as it stands: retrying them only hides the
+ * problem, so the follow ends and the agent is told. `forbidden` is a participant TalkTo will not
+ * deliver to, such as a person's.
+ */
 const permanent = new Set([
   "participant_not_found",
   "server_unavailable",
   "conversation_not_found",
   "wrong_conversation_kind",
   "invalid_input",
+  "forbidden",
 ]);
+/** A person removed the participant on the dashboard; it ends the follow with its own notice. */
+const removed = "participant_removed";
 
 /** How the agent hears about messages under these settings: the follow answer's promise. */
 export const deliveryRules = (settings: Settings): string => {
@@ -230,6 +280,34 @@ interface Snapshot {
   /** When it was sent, if it carried the plugin update line. */
   readonly updateAt: number | null;
 }
+
+/** What one follow's check came to. */
+type Check =
+  | { readonly kind: "ok" }
+  | { readonly kind: "failed"; readonly reason: string }
+  /** The tick it belonged to was given up (`stuckMillis`): nothing it read counts. */
+  | { readonly kind: "abandoned" };
+
+const ok: Check = { kind: "ok" };
+const abandoned: Check = { kind: "abandoned" };
+
+/** One follow's run of failed checks. */
+interface Outage {
+  readonly since: number;
+  failures: number;
+  reason: string;
+  /** When the agent was last told; null before the first time. */
+  toldAt: number | null;
+}
+
+/** Whether a failure is the host refusing TalkTo's answer against the tool list it read on connecting. */
+const hostRefused = (reason: string) => /output schema|structured content/i.test(reason);
+
+/** The text of a thrown failure, short enough for a notice. */
+const reasonOf = (cause: unknown): string => {
+  const text = (cause instanceof Error ? cause.message : String(cause)).trim();
+  return (text === "" ? "the call failed without a message" : text).slice(0, 300);
+};
 
 /** Injected urgent messages of one turn, until a model request carries them. */
 interface Injected {
@@ -267,6 +345,20 @@ export class Inbox {
   private readonly cadence = new Map<string, number>();
   /** Each server's General channel, by server, once get_context named it. */
   private readonly generals = new Map<string, string>();
+  /** Each server's name, by server, once get_context named it; only notices use it. */
+  private readonly serverNames = new Map<string, string>();
+  /** Each server's capabilities, by server, from its last get_context answer. */
+  private readonly capabilities = new Map<string, ReadonlyArray<string>>();
+  /** Each follow's run of failed checks, by server; absent while its checks work. */
+  private readonly outages = new Map<string, Outage>();
+  /** When each follow's checks last worked, by server; unknown before the first since a restart. */
+  private readonly readAt = new Map<string, number>();
+  /** When the tick in flight started; with `polling`, how a check that never answers is found. */
+  private pollingSince = 0;
+  /** Counts given-up ticks, so a check that answers after it was given up changes nothing. */
+  private generation = 0;
+  /** Whether the agent was told that saving failed; once per session. */
+  private saveFailureTold = false;
   private cadenceTimer = false;
   /** Messages the agent read itself in the running turn, with get_updates or read_messages. */
   private readInTurn = new Set<string>();
@@ -317,6 +409,8 @@ export class Inbox {
       return `Could not reach TalkTo (${String(cause)}). ${this.host.connectionHint} Then call follow again.`;
     }
     const reply = decodeUpdates(answer, input.participantId);
+    if (reply.kind === "failure" && reply.failure.code === removed)
+      return participantRemoved(input, this.serverNames.get(input.serverId) ?? null);
     if (reply.kind === "failure")
       return `TalkTo refused the follow: ${reply.failure.code}: ${reply.failure.message}`;
     this.learnCadence(input.serverId, reply.page);
@@ -332,10 +426,19 @@ export class Inbox {
       renames: [...reply.page.renames],
     };
     this.follows = [...this.follows.filter((item) => !same(item, input)), follow];
+    this.outages.delete(input.serverId);
+    // A follow restarts delivery now: a check still in flight (perhaps one that never answers)
+    // is given up, so the next tick polls at once.
+    if (this.polling) {
+      this.generation += 1;
+      this.polling = false;
+    }
     this.activeAt = await this.host.now();
+    this.readAt.set(input.serverId, this.activeAt);
     await this.persist();
     this.host.after(0, () => this.tick());
     const waiting = follow.pending.length;
+    const missing = await this.missingTools(input.serverId);
     return [
       `Following participant ${input.participantId} on server ${input.serverId} (${watched.channelIds.length} channels, direct chats: ${input.directChats}).`,
       generalNote(watched),
@@ -344,19 +447,47 @@ export class Inbox {
       waiting > 0 || reply.page.hasMore
         ? `${waiting}${reply.page.hasMore ? "+" : ""} earlier messages were found; they arrive ${this.settings.delivery === "idle" ? "after this turn" : "with the person's next prompt"}.`
         : "Nothing is waiting yet.",
+      ...(missing.length === 0 ? [] : [staleConnection(missing, this.reconnectHint())]),
     ].join(" ");
+  }
+
+  /** What to do when the host's connection is older than TalkTo. */
+  private reconnectHint(): string {
+    return this.host.reconnectHint ?? this.host.connectionHint;
+  }
+
+  /**
+   * The tools the server's capabilities bring that this session's connection lacks: a sign that it
+   * was set up before a TalkTo update. Empty when the host cannot say.
+   */
+  private async missingTools(serverId: string): Promise<ReadonlyArray<string>> {
+    if (this.host.tools === undefined) return [];
+    let offered: ReadonlySet<string>;
+    try {
+      offered = new Set(await this.host.tools());
+    } catch {
+      return [];
+    }
+    if (offered.size === 0) return [];
+    return (this.capabilities.get(serverId) ?? []).flatMap((capability) =>
+      (capabilityTools.get(capability) ?? []).filter((name) => !offered.has(name)),
+    );
   }
 
   /** The server's General channel, asked of get_context once per server; null when TalkTo did not say. */
   private async generalOf(serverId: string): Promise<string | null> {
     const known = this.generals.get(serverId);
     if (known !== undefined) return known;
-    let found: string | null;
+    let answer: ToolAnswer;
     try {
-      found = generalIdOf(await this.host.call("get_context", { serverId }));
+      answer = await this.host.call("get_context", { serverId });
     } catch {
       return null;
     }
+    this.capabilities.set(serverId, capabilitiesOf(answer));
+    const name = serverNameOf(answer);
+    if (name !== null) this.serverNames.set(serverId, name);
+    const found = generalIdOf(answer);
     if (found !== null) this.generals.set(serverId, found);
     return found;
   }
@@ -366,6 +497,7 @@ export class Inbox {
     const found = this.follows.find((item) => item.serverId === serverId);
     if (found === undefined) return `This session does not follow anyone on server ${serverId}.`;
     this.follows = this.follows.filter((item) => item !== found);
+    this.outages.delete(serverId);
     await this.persist();
     return `Stopped following participant ${found.participantId} on server ${serverId}. ${found.pending.length} queued messages were discarded; they remain in TalkTo's history.`;
   }
@@ -378,7 +510,8 @@ export class Inbox {
       .map(
         (item) =>
           `TalkTo: participant ${item.participantId} on server ${item.serverId}: ${item.pending.length} queued` +
-          `${item.pending.some((message) => message.isUrgent) ? " (urgent waiting)" : ""}.`,
+          `${item.pending.some((message) => message.isUrgent) ? " (urgent waiting)" : ""}.` +
+          this.outageLine(item.serverId),
       )
       .concat(
         this.settings.delivery === "idle"
@@ -463,28 +596,89 @@ export class Inbox {
    * tick starts as soon as this one ends; the timer is only a backstop then.
    */
   async tick(): Promise<void> {
-    if (this.polling || this.follows.length === 0) return;
+    if (this.follows.length === 0) return;
     const now = await this.host.now();
-    if (now < this.resumeAt) return;
+    if (this.polling) {
+      if (now - this.pollingSince < stuckMillis) return;
+      // The check in flight never answered: give it up, so one call that hangs cannot stop delivery.
+      this.generation += 1;
+      this.polling = false;
+      const reason = `TalkTo did not answer a check for ${Math.round((now - this.pollingSince) / 1000)} seconds.`;
+      for (const follow of this.follows) this.track(follow, { kind: "failed", reason }, now);
+    } else if (now < this.resumeAt) return;
     this.polling = true;
+    this.pollingSince = now;
+    const generation = this.generation;
     let failed = false;
     try {
       const before = this.queued();
-      const results = await Promise.all(
-        [...this.follows].map((follow) => this.poll(follow, this.waitFor(now))),
+      const checks = await Promise.all(
+        [...this.follows].map(
+          async (follow) =>
+            [follow, await this.poll(follow, this.waitFor(now), generation)] as const,
+        ),
       );
-      failed = results.includes(false);
+      // Given up while it ran: a newer tick owns the follows now.
+      if (generation !== this.generation) return;
+      const at = await this.host.now();
+      for (const [follow, check] of checks) this.track(follow, check, at);
+      failed = checks.some(([, check]) => check.kind === "failed");
       this.failures = failed ? this.failures + 1 : 0;
       this.resumeAt = failed
         ? now + Math.min(backoffLimitMillis, this.settings.pollMillis * 2 ** this.failures)
         : 0;
-      if (this.queued() > before) this.activeAt = await this.host.now();
-      await this.persist();
+      if (this.queued() > before) this.activeAt = at;
+      await this.persistOrSay();
     } finally {
-      this.polling = false;
+      if (generation === this.generation) this.polling = false;
     }
     await this.deliver();
     if (!failed) await this.chain(now);
+  }
+
+  /**
+   * Records how one follow's check went. Failed checks in a row tell the agent once there are
+   * `stallChecks` of them and again every `stallRepeatMillis`; a working check after that says so.
+   */
+  private track(follow: Follow, check: Check, at: number): void {
+    // A follow replaced or ended meanwhile: what its check found belongs to nobody.
+    if (check.kind === "abandoned" || !this.follows.includes(follow)) return;
+    const outage = this.outages.get(follow.serverId);
+    if (check.kind === "ok") {
+      this.readAt.set(follow.serverId, at);
+      if (outage === undefined) return;
+      this.outages.delete(follow.serverId);
+      if (outage.toldAt !== null) this.notes.push(deliveryResumed(follow, stamp(outage.since)));
+      return;
+    }
+    const current = outage ?? { since: at, failures: 0, reason: check.reason, toldAt: null };
+    current.failures += 1;
+    current.reason = check.reason;
+    this.outages.set(follow.serverId, current);
+    if (current.failures < stallChecks) return;
+    if (current.toldAt !== null && at - current.toldAt < stallRepeatMillis) return;
+    current.toldAt = at;
+    const hint = hostRefused(check.reason) ? this.reconnectHint() : this.host.connectionHint;
+    this.notes.push(deliveryStalled(follow, stamp(current.since), check.reason, hint));
+  }
+
+  /** The /talkto-inbox line for a follow whose checks fail; empty while they work. */
+  private outageLine(serverId: string): string {
+    const outage = this.outages.get(serverId);
+    return outage === undefined
+      ? ""
+      : ` Not delivering: ${outage.failures} checks in a row failed since ${stamp(outage.since)} (${outage.reason}).`;
+  }
+
+  /** Saves; when the store refuses, says so once and lets delivery go on, which matters more. */
+  private async persistOrSay(): Promise<void> {
+    try {
+      await this.persist();
+    } catch (cause) {
+      if (this.saveFailureTold) return;
+      this.saveFailureTold = true;
+      this.notes.push(saveFailed(reasonOf(cause)));
+    }
   }
 
   /** Seconds the next poll may wait on the server. */
@@ -559,18 +753,28 @@ export class Inbox {
     return call({});
   }
 
-  /** Reads one follow's new messages into its queue; false on a failure worth retrying. */
-  private async poll(follow: Follow, wait: number): Promise<boolean> {
+  /** Reads one follow's new messages into its queue. */
+  private async poll(follow: Follow, wait: number, generation: number): Promise<Check> {
     for (let page = 0; page < pagesPerTick; page += 1) {
       let answer: ToolAnswer;
       try {
         // Only the first page waits; a continuation already has messages to read.
         answer = await this.page(follow, page === 0 ? wait : 0);
-      } catch {
-        return false;
+      } catch (cause) {
+        if (generation !== this.generation) return abandoned;
+        const reason = reasonOf(cause);
+        return hostRefused(reason)
+          ? this.skipRefused(follow, reason, generation)
+          : { kind: "failed", reason };
       }
+      if (generation !== this.generation) return abandoned;
       const reply = decodeUpdates(answer, follow.participantId);
-      if (reply.kind === "failure") return this.failed(follow, reply.failure);
+      if (reply.kind === "failure")
+        return answer.isError &&
+          reply.failure.code === "unreadable" &&
+          hostRefused(reply.failure.message)
+          ? this.skipRefused(follow, reply.failure.message, generation)
+          : this.failed(follow, reply.failure, generation);
       const known = new Set(follow.pending.map((message) => message.id));
       for (const message of reply.page.messages)
         if (!known.has(message.id)) follow.pending.push(keep(message));
@@ -588,42 +792,105 @@ export class Inbox {
       this.learnLatest(reply.page);
       if (!reply.page.hasMore) break;
     }
-    return true;
+    return ok;
   }
 
   /** Ends a follow TalkTo will never accept again; anything else is retried. */
-  private async failed(follow: Follow, failure: UpdatesFailure): Promise<boolean> {
+  private async failed(
+    follow: Follow,
+    failure: UpdatesFailure,
+    generation: number,
+  ): Promise<Check> {
     if (failure.code === "invalid_cursor") {
       // The server's history was restored: start again from now and say what may be missing.
-      let restarted: ToolAnswer | null = null;
-      try {
-        restarted = await this.updates(
-          {
-            serverId: follow.serverId,
-            participantId: follow.participantId,
-            mode: "start",
-            channelIds: follow.channelIds,
-            directChats: follow.directChats,
-            startAt: "now",
-            limit: 1,
-          },
-          0,
-        );
-      } catch {
-        return false;
-      }
-      const reply = decodeUpdates(restarted, follow.participantId);
-      if (reply.kind === "failure") return this.failed(follow, reply.failure);
-      follow.checkpoint = reply.page.checkpoint;
+      const restarted = await this.restart(follow, generation);
+      if (restarted.kind !== "page") return restarted.check;
+      follow.checkpoint = restarted.checkpoint;
       this.notes.push(
         `TalkTo: the server's history position for participant ${follow.participantId} was reset (${failure.message}). Messages sent around the reset may not have been delivered; read recent history with read_messages.`,
       );
-      return true;
+      return ok;
     }
-    if (!permanent.has(failure.code)) return false;
+    if (failure.code !== removed && !permanent.has(failure.code))
+      return { kind: "failed", reason: `${failure.code}: ${failure.message}` };
     this.follows = this.follows.filter((item) => item !== follow);
-    this.notes.push(followEnded(follow, `${failure.code}: ${failure.message}`));
-    return true;
+    this.outages.delete(follow.serverId);
+    this.notes.push(
+      failure.code === removed
+        ? participantRemoved(follow, await this.nameOfServer(follow.serverId))
+        : followEnded(follow, `${failure.code}: ${failure.message}`),
+    );
+    return ok;
+  }
+
+  /** The server's name for a notice: known since its follow, or asked of get_context now. */
+  private async nameOfServer(serverId: string): Promise<string | null> {
+    const known = this.serverNames.get(serverId);
+    if (known !== undefined) return known;
+    try {
+      return serverNameOf(await this.host.call("get_context", { serverId }));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The host refused TalkTo's answer: its connection checks answers against the tool list it read
+   * when it connected, and the page holds a field added since. Asking again from the same
+   * checkpoint returns the same page forever, so start again from now (an answer with no messages
+   * passes) and tell the agent what was skipped and how to reconnect.
+   */
+  private async skipRefused(follow: Follow, reason: string, generation: number): Promise<Check> {
+    const restarted = await this.restart(follow, generation);
+    if (restarted.kind !== "page")
+      return restarted.check.kind === "failed" ? { kind: "failed", reason } : restarted.check;
+    follow.checkpoint = restarted.checkpoint;
+    const since = this.readAt.get(follow.serverId);
+    this.notes.push(
+      replyRejected(
+        follow,
+        reason,
+        this.reconnectHint(),
+        since === undefined ? null : stamp(since),
+      ),
+    );
+    return ok;
+  }
+
+  /** Starts one follow again from TalkTo's newest message, keeping its selection. */
+  private async restart(
+    follow: Follow,
+    generation: number,
+  ): Promise<
+    | { readonly kind: "page"; readonly checkpoint: string }
+    | { readonly kind: "not"; readonly check: Check }
+  > {
+    let answer: ToolAnswer;
+    try {
+      answer = await this.updates(
+        {
+          serverId: follow.serverId,
+          participantId: follow.participantId,
+          mode: "start",
+          channelIds: follow.channelIds,
+          directChats: follow.directChats,
+          startAt: "now",
+          limit: 1,
+        },
+        0,
+      );
+    } catch (cause) {
+      return {
+        kind: "not",
+        check:
+          generation === this.generation ? { kind: "failed", reason: reasonOf(cause) } : abandoned,
+      };
+    }
+    if (generation !== this.generation) return { kind: "not", check: abandoned };
+    const reply = decodeUpdates(answer, follow.participantId);
+    if (reply.kind === "failure")
+      return { kind: "not", check: await this.failed(follow, reply.failure, generation) };
+    return { kind: "page", checkpoint: reply.page.checkpoint };
   }
 
   /** Delivers what is due: urgent messages into a running turn, everything else once idle. */
@@ -787,12 +1054,18 @@ export class Inbox {
 
   private showStatus(): void {
     const waiting = this.follows.reduce((sum, item) => sum + item.pending.length, 0);
+    const stalled = this.follows.some((item) => {
+      const outage = this.outages.get(item.serverId);
+      return outage !== undefined && outage.failures >= stallChecks;
+    });
     this.host.status(
       this.follows.length === 0
         ? undefined
-        : waiting === 0
-          ? "TalkTo: following"
-          : `TalkTo: ${waiting} queued${this.heldForInput ? " (held until you type)" : ""}`,
+        : stalled
+          ? "TalkTo: not delivering, checks fail (see /talkto-inbox)"
+          : waiting === 0
+            ? "TalkTo: following"
+            : `TalkTo: ${waiting} queued${this.heldForInput ? " (held until you type)" : ""}`,
     );
   }
 }

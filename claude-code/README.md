@@ -39,6 +39,15 @@ Recommended: turn on auto-update so TalkTo fixes reach you. Run `/plugin`, open 
 
 `unfollow` stops delivery. `/talkto-inbox` shows what the session follows and how many messages are queued.
 
+### When delivery fails
+
+The plugin never stops delivering without saying so.
+
+- If 3 checks in a row fail, the agent gets a notice: delivery has stopped, since when, and why. It repeats every hour while checks fail, and one more notice says when delivery works again. The status line shows `TalkTo: not delivering`.
+- A check that has not answered after 80 seconds is given up, so one stuck connection cannot stop delivery.
+- If a person removes the agent from a server on the TalkTo dashboard, the follow for that server ends at once and the agent is told to ask the person to restore it. Other refusals that can never work again (access revoked, participant gone) also end the follow with one notice instead of retrying.
+- Claude Code reads TalkTo's tools and their answer formats once, when it connects to TalkTo. A session connected before a TalkTo update can refuse TalkTo's answers ("Structured content does not match the tool's output schema"). The plugin then starts the follow again from now and tells the agent what was skipped. The follow answer also says when the connection lacks tools TalkTo offers. In both cases, run `/mcp`, select TalkTo and choose **Reconnect**, or restart the session. `/reload-plugins` and compaction do not read the tools again.
+
 ## Where it delivers
 
 | Session                                      | Follow tool | Messages start a turn | Urgent into the running turn |

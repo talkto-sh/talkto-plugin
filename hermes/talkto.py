@@ -254,6 +254,15 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
     )
 
 
+def server_name_of(envelope: object) -> Optional[str]:
+    """The server's name from a ``get_context`` reply envelope (``data.server.name``), or None."""
+    if not isinstance(envelope, Mapping) or _fields(envelope, "error") is not None:
+        return None
+    data = _fields(envelope, "data")
+    server = None if data is None else _fields(data, "server")
+    return None if server is None else _text(server, "name")
+
+
 def general_id_of(envelope: object) -> Optional[str]:
     """The server's General channel from a ``get_context`` reply envelope
     (``data.server.generalConversationId``), or None for an error or any reply that does not name it."""

@@ -153,10 +153,27 @@ const renamesOf = (data: Fields): ReadonlyArray<ParticipantRename> =>
     return [{ id, participantId, previousName, name, by }];
   });
 
-/** Decode one `get_updates` answer for `participantId`, naming senders and conversations from `included`. */
+/** Longest part of an error's text a failure keeps. */
+const reasonLimit = 300;
+
+/**
+ * Decode one `get_updates` answer for `participantId`, naming senders and conversations from `included`.
+ * An error answer that is not TalkTo's own (the host refused the reply, for example) keeps the host's
+ * words, so the agent can be told what failed.
+ */
 export const decodeUpdates = (answer: ToolAnswer, participantId: string): UpdatesReply => {
   const envelope = envelopeOf(answer);
-  if (envelope === null) return failure("unreadable", "TalkTo answered with no readable result.");
+  if (envelope === null) {
+    const said = answer.isError
+      ? answer.content.find((block) => block.type === "text")?.text?.trim()
+      : undefined;
+    return failure(
+      "unreadable",
+      said === undefined || said === ""
+        ? "TalkTo answered with no readable result."
+        : said.slice(0, reasonLimit),
+    );
+  }
   const error = fieldsAt(envelope, "error");
   if (error !== null)
     return failure(
@@ -239,6 +256,26 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
       latestPluginVersion: latest !== null && versionPattern.test(latest) ? latest : null,
     },
   };
+};
+
+/**
+ * The capabilities a `get_context` answer names (`data.capabilities`, as in "transfers"); empty for
+ * an error or an answer that names none.
+ */
+export const capabilitiesOf = (answer: ToolAnswer): ReadonlyArray<string> => {
+  if (answer.isError) return [];
+  const envelope = envelopeOf(answer);
+  const data = envelope === null ? null : fieldsAt(envelope, "data");
+  return data === null ? [] : listOf(data, "capabilities").filter(isText);
+};
+
+/** The server's name from a `get_context` answer (`data.server.name`), or null when it is absent. */
+export const serverNameOf = (answer: ToolAnswer): string | null => {
+  if (answer.isError) return null;
+  const envelope = envelopeOf(answer);
+  const data = envelope === null ? null : fieldsAt(envelope, "data");
+  const server = data === null ? null : fieldsAt(data, "server");
+  return server === null ? null : textOf(server, "name");
 };
 
 /**

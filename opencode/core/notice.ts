@@ -133,6 +133,49 @@ export const urgentFollowUp = (ids: ReadonlyArray<string>) =>
 export const followEnded = (recipient: Recipient, reason: string) =>
   `TalkTo: the TalkTo plugin stopped delivering messages for participant ${recipient.participantId} on server ${recipient.serverId}: ${reason} Call the follow tool again once you can read messages there.`;
 
+/**
+ * A person removed the participant from its server on the dashboard. Every call naming it is
+ * refused until they restore it, so the follow ends and the agent hears it in plain words.
+ */
+export const participantRemoved = (recipient: Recipient, serverName: string | null) =>
+  `TalkTo: a person removed you (participant ${recipient.participantId}) from ${serverName === null ? "server" : `"${serverName}", server`} ${recipient.serverId}, on TalkTo, so the TalkTo plugin stopped delivering messages from there. Ask them to restore you; until then you can't send or receive there. Do not register again under a new name unless they ask you to.`;
+
+/** A time as notices show it: UTC to the second, as in 2026-11-16T15:33:51Z. */
+export const stamp = (millis: number) => `${new Date(millis).toISOString().slice(0, 19)}Z`;
+
+/** Every check for one follow failed for a while: nothing new reaches the agent until they work. */
+export const deliveryStalled = (
+  recipient: Recipient,
+  since: string,
+  reason: string,
+  hint: string,
+) =>
+  `TalkTo: the TalkTo plugin is not delivering new messages for participant ${recipient.participantId} on server ${recipient.serverId}. Every check since ${since} failed: ${reason} ${hint} The plugin keeps trying and tells you here when delivery works again. Until then, read the conversations you are waiting on with read_messages.`;
+
+/** Checks work again after the agent was told they failed. */
+export const deliveryResumed = (recipient: Recipient, since: string) =>
+  `TalkTo: delivery for participant ${recipient.participantId} on server ${recipient.serverId} works again; checks had failed since ${since}. Messages sent meanwhile arrive with this notice or the next.`;
+
+/**
+ * The host refused TalkTo's answer (it checks answers against the tool list it read when it
+ * connected), so the plugin started the follow again from now.
+ */
+export const replyRejected = (
+  recipient: Recipient,
+  reason: string,
+  hint: string,
+  since: string | null,
+) =>
+  `TalkTo: this session's connection to TalkTo refused TalkTo's answer for participant ${recipient.participantId} on server ${recipient.serverId}: ${reason} The connection was set up before a TalkTo update, so it checks answers against an older format and the plugin could not read new messages. To keep delivery going, the plugin started the follow again from now. Messages sent ${since === null ? "after the last one it delivered" : `between ${since} and now`} were skipped: read the conversations you are waiting on with read_messages. ${hint}`;
+
+/** The plugin could not save its state; delivery goes on. */
+export const saveFailed = (reason: string) =>
+  `TalkTo: the TalkTo plugin could not save what this session follows (${reason}). Delivery continues, but after a restart or reload, call the follow tool again.`;
+
+/** This session's TalkTo connection lacks tools the server offers: it was set up before an update. */
+export const staleConnection = (missing: ReadonlyArray<string>, hint: string) =>
+  `This session's TalkTo connection is older than the server: it lacks ${missing.join(", ")}, and TalkTo answers with newer fields can fail its checks. ${hint}`;
+
 /** The plugins that share this core (and its Hermes port), by the folder each ships from. */
 export type PluginName = "claude-code" | "opencode" | "pi" | "hermes";
 

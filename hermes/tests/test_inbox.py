@@ -437,6 +437,53 @@ class InboxTest(unittest.TestCase):
         self.assertEqual(len(host.submitted), 1)
         self.assertIn("stopped delivering", host.submitted[0])
 
+    def test_a_participant_a_person_removed_ends_the_follow_and_says_so_plainly(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        host.answers.append(refusal("participant_removed", "A person removed this participant."))
+        inbox.tick()
+        self.assertEqual(host.stored["follows"], [], "no backoff and no retry")
+        self.assertEqual(len(host.submitted), 1)
+        notice = host.submitted[0]
+        self.assertIn(f'a person removed you (participant {ME}) from "Team", server {SERVER}', notice)
+        self.assertIn("Ask them to restore you; until then you can't send or receive there.", notice)
+        calls = len(host.calls)
+        host.clock.time += 60 * 60 * 1000
+        inbox.tick()
+        self.assertEqual(len(host.calls), calls, "nothing is asked of TalkTo for it again")
+
+    def test_a_removal_after_a_restart_asks_for_the_server_name_or_does_without(self) -> None:
+        cases = (
+            (context(), f'"Team", server {SERVER}'),
+            (inbox_module.TransportError("offline"), f"server {SERVER},"),
+        )
+        for answer, where in cases:
+            host = FakeHost()
+            followed(host)
+            later = Inbox(host, Settings())
+            later.restore()
+            host.context = answer
+            host.answers.append(refusal("participant_removed", "removed"))
+            later.tick()
+            self.assertIn(f"from {where}", host.submitted[-1])
+            self.assertEqual(host.stored["follows"], [])
+
+    def test_a_follow_refused_because_a_person_removed_the_participant_says_so(self) -> None:
+        host = FakeHost()
+        inbox = Inbox(host, Settings())
+        host.answers.append(refusal("participant_removed", "removed"))
+        answer = follow_with(inbox, [])
+        self.assertIn("a person removed you", answer)
+        self.assertIn('from "Team", server', answer)
+
+    def test_forbidden_ends_the_follow_like_other_permanent_refusals(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        host.answers.append(refusal("forbidden", "This participant is a person."))
+        inbox.tick()
+        self.assertEqual(host.stored["follows"], [])
+        self.assertIn("stopped delivering", host.submitted[0])
+
     def test_a_reset_history_restarts_from_now_and_says_so(self) -> None:
         host = FakeHost()
         inbox = followed(host)

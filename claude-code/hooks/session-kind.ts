@@ -184,6 +184,16 @@ export const connectionHintOf = (kind: SessionKind): string =>
     : "Check /mcp and authenticate TalkTo.";
 
 /**
+ * What the agent should do when this session's TalkTo connection refuses TalkTo's answers. Claude
+ * Code reads an MCP server's tools, with the format of each answer, once when it connects, and
+ * TalkTo cannot tell it that they changed; only a new connection reads them again.
+ */
+export const reconnectHintOf = (kind: SessionKind): string =>
+  kind.kind === "t3"
+    ? "To fix it, ask your person to start this thread's Claude again (for example by restarting T3 Code), so that it connects to TalkTo again. Until then, read_messages can fail the same way, and another message with a newer field stops delivery again."
+    : "To fix it, ask your person to run /mcp, select the TalkTo server and choose Reconnect, or to restart this session. Until then, read_messages can fail the same way, and another message with a newer field stops delivery again.";
+
+/**
  * Whether a prompt is the person's own. In a T3 thread the person's message
  * reaches Claude Code as the SDK host's turn (`sdk`), not from the composer.
  * T3's own automatic turns (usage-limit recovery, scheduled tasks) also

@@ -37,6 +37,7 @@ from .notice import (
     BODY_LIMIT,
     follow_ended,
     is_newer,
+    participant_removed,
     queued_notice,
     release_text,
     update_notice,
@@ -50,6 +51,7 @@ from .talkto import (
     UpdatesPage,
     decode_updates,
     general_id_of,
+    server_name_of,
 )
 
 Delivery = Literal["idle", "next-prompt"]
@@ -83,7 +85,8 @@ _BACKOFF_LIMIT_MILLIS = 5 * 60 * 1000
 UPDATE_NOTICE_MILLIS = 24 * 60 * 60 * 1000
 #: This plugin, as it names itself to TalkTo on every get_updates call.
 PLUGIN_NAME = "hermes"
-#: Failures that mean the follow can never work again as it stands.
+#: Failures that mean the follow can never work again as it stands; ``forbidden`` is a participant
+#: TalkTo will not deliver to, such as a person's.
 _PERMANENT = frozenset(
     {
         "participant_not_found",
@@ -91,8 +94,11 @@ _PERMANENT = frozenset(
         "conversation_not_found",
         "wrong_conversation_kind",
         "invalid_input",
+        "forbidden",
     }
 )
+#: A person removed the participant on the dashboard; it ends the follow with its own notice.
+_REMOVED = "participant_removed"
 
 
 @dataclass(frozen=True)
@@ -379,6 +385,8 @@ class Inbox:
         self._cadence_timer = False
         #: Each server's General channel, by server, once get_context named it.
         self._generals: dict[str, str] = {}
+        #: Each server's name, by server, once get_context named it; only notices use it.
+        self._server_names: dict[str, str] = {}
 
     # -- what the plugin and the agent use --------------------------------
 
@@ -437,6 +445,10 @@ class Inbox:
         except TransportError as cause:
             return f"Could not reach TalkTo ({cause}). {self._host.connection_hint} Then call follow again."
         reply = decode_updates(answer.envelope, given.participant_id)
+        if isinstance(reply, UpdatesFailure) and reply.code == _REMOVED:
+            with self._lock:
+                name = self._server_names.get(given.server_id)
+            return participant_removed(given, name)
         if isinstance(reply, UpdatesFailure):
             return f"TalkTo refused the follow: {reply.code}: {reply.message}"
         follow = Follow(
@@ -481,13 +493,28 @@ class Inbox:
         if known is not None:
             return known
         try:
-            found = general_id_of(self._host.call("get_context", {"serverId": server_id}).envelope)
+            envelope = self._host.call("get_context", {"serverId": server_id}).envelope
         except TransportError:
             return None
-        if found is not None:
-            with self._lock:
+        found = general_id_of(envelope)
+        name = server_name_of(envelope)
+        with self._lock:
+            if found is not None:
                 self._generals[server_id] = found
+            if name is not None:
+                self._server_names[server_id] = name
         return found
+
+    def _name_of_server(self, server_id: str) -> Optional[str]:
+        """The server's name for a notice: known since its follow, or asked of get_context now."""
+        with self._lock:
+            known = self._server_names.get(server_id)
+        if known is not None:
+            return known
+        try:
+            return server_name_of(self._host.call("get_context", {"serverId": server_id}).envelope)
+        except TransportError:
+            return None
 
     def unfollow(self, server_id: str) -> str:
         """Stops delivery for the participant this session follows on one server."""
@@ -823,6 +850,12 @@ class Inbox:
                     f"was reset ({failure.message}). Messages sent around the reset may not have been "
                     "delivered; read recent history with read_messages."
                 )
+            return True
+        if failure.code == _REMOVED:
+            name = self._name_of_server(follow.server_id)
+            with self._lock:
+                self._follows = [item for item in self._follows if item is not follow]
+                self._notes.append(participant_removed(follow, name))
             return True
         if failure.code not in _PERMANENT:
             return False

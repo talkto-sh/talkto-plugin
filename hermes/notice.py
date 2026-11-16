@@ -7,7 +7,7 @@ messages and fails when they differ.
 
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from typing import Optional, Protocol, Sequence
 
 from .talkto import IncomingMessage, ParticipantRename
 
@@ -168,6 +168,17 @@ def follow_ended(recipient: Recipient, reason: str) -> str:
         f"TalkTo: the TalkTo plugin stopped delivering messages for participant "
         f"{recipient.participant_id} on server {recipient.server_id}: {reason} "
         "Call the follow tool again once you can read messages there."
+    )
+
+
+def participant_removed(recipient: Recipient, server_name: Optional[str]) -> str:
+    """A person removed the participant from its server: the follow ends, said in plain words."""
+    where = "server" if server_name is None else f'"{server_name}", server'
+    return (
+        f"TalkTo: a person removed you (participant {recipient.participant_id}) from {where} "
+        f"{recipient.server_id}, on TalkTo, so the TalkTo plugin stopped delivering messages from there. "
+        "Ask them to restore you; until then you can't send or receive there. "
+        "Do not register again under a new name unless they ask you to."
     )
 
 

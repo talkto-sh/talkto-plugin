@@ -135,8 +135,14 @@ const fakePi = () => {
 
 const settings = { delivery: "idle", urgent: "inject", pollMillis: 15000, wait: "auto" };
 /** Let promise chains started by timers finish. */
+// Lets the extension finish what a tick started, including its state file writes: each round
+// waits one file-system round trip as well as one event-loop turn, so a slower disk (Linux CI)
+// does not leave a save, and the delivery after it, still pending.
 const settle = async () => {
-  for (let round = 0; round < 20; round += 1) await new Promise((resolve) => setImmediate(resolve));
+  for (let round = 0; round < 40; round += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    await stat(tmpdir());
+  }
 };
 const start = async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000 });
