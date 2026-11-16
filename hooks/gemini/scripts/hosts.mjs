@@ -25,6 +25,8 @@ import { fieldsOf, isNumber, isText, linkPattern } from "./core.mjs";
  *   one clause after "To install it,".
  * @property {(script: string) => string} idleNote The session-start sentence on what happens to
  *   messages while the agent is idle on this host. It must say only what this host really does.
+ * @property {(script: string) => string} [savedNote] What the agent does next once the hook
+ *   saved its link, added to the confirmation.
  * @property {(env: NodeJS.ProcessEnv) => Watcher | null} [watcher] For a host where a process
  *   beside the session can start a turn in it: how, from the environment the host gives the
  *   agent's commands. Null when that environment is missing.
@@ -350,6 +352,10 @@ const antigravityLink = async (input) => {
   return transcriptLink(full).link;
 };
 
+/** The exact command that starts the Antigravity watcher. @param {string} script */
+const startWatcher = (script) =>
+  `run \`node "${script}" watch antigravity\` with run_command as a background task (WaitMsBeforeAsync 3000).`;
+
 /**
  * Google Antigravity plugins. PostToolUse output never reaches the model and carries no tool
  * output, so mid-turn checks run on PreInvocation (before every model call) and inject an
@@ -363,7 +369,9 @@ export const antigravity = {
   updateSteps:
     "run `git pull` in your clone of talkto-sh/talkto-plugin, then `agy plugin install <clone>/hooks/gemini` again, then restart Antigravity",
   idleNote: (script) =>
-    `While you are idle, messages wait for your next turn, unless the TalkTo watcher runs. Start it only when the person asks you to stay reachable while idle, after the hook confirms the link: run \`node "${script}" watch antigravity\` with run_command as a background task (WaitMsBeforeAsync 3000). If the sandbox blocks node, run it again with BypassSandbox so the person can allow it once. While you are idle it starts a turn in this conversation when messages wait. The person sees your reply in their window, but not the notice. It stops when Antigravity closes or its background task is stopped.`,
+    `While you are idle, the TalkTo watcher starts a turn in this conversation when messages wait. Start it in every session that joins TalkTo, right after the hook confirms the link: ${startWatcher(script)} If the sandbox blocks node, run it again with BypassSandbox so the person can allow it. The person sees your reply in their window, but not the notice. It stops when Antigravity closes. If the person asks you to stop watching, stop its background task and do not start it again in this conversation. If Antigravity stopped it, for example after a resume, start it again.`,
+  savedNote: (script) =>
+    `Now start the TalkTo watcher, unless the person asked you to stop watching: ${startWatcher(script)}`,
   watcher: (env) => {
     const conversation = text(env.ANTIGRAVITY_CONVERSATION_ID);
     if (conversation === null || text(env.ANTIGRAVITY_LS_ADDRESS) === null) return null;

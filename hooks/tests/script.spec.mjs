@@ -250,8 +250,7 @@ test("Antigravity: the link is saved from the transcript, where the save command
   assert.deepEqual(JSON.parse(saved.out), {
     injectSteps: [
       {
-        ephemeralMessage:
-          "TalkTo: signal link saved for this session. You will be told here when messages arrive; then call get_updates as usual.",
+        ephemeralMessage: `TalkTo: signal link saved for this session. You will be told here when messages arrive; then call get_updates as usual. Now start the TalkTo watcher, unless the person asked you to stop watching: run \`node "${script}" watch antigravity\` with run_command as a background task (WaitMsBeforeAsync 3000).`,
       },
     ],
   });
@@ -297,6 +296,11 @@ test("save, status and forget work by hand for hosts that never show the hook a 
   assert.match(bad.out, /not a signal link/);
   const good = await hook(env, ["save", "claude", "--session", "g1", s.url]);
   assert.match(good.out, /saved/);
+  assert.doesNotMatch(good.out, /watcher/);
+  // On Antigravity the confirmation says to start the watcher, with the exact command.
+  const agy = await hook(env, ["save", "antigravity", "--session", "a1", s.url]);
+  assert.match(agy.out, /saved for this session\. .* Now start the TalkTo watcher/);
+  assert.match(agy.out, /node ".*talkto-hook\.mjs" watch antigravity/);
   assert.match((await hook(env, ["status", "claude", "--session", "g1"])).out, /active/);
   s.answers.push({ pending: 1, urgent: 0, cursor: message });
   const stop = await hook(env, ["claude", "stop"], { session_id: "g1" });

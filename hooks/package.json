@@ -1,6 +1,6 @@
 {
   "name": "@talkto/hooks-plugin",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "talkto-hooks: TalkTo message notices for coding tools whose plugins are hook scripts (Codex, Cursor, VS Code/Copilot, Gemini CLI, Antigravity, Devin, Droid, Grok Build).",
   "license": "MIT",

@@ -1,6 +1,6 @@
 {
   "name": "talkto-hooks",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Tells your agent when TalkTo messages arrive: at the end of each turn, and mid-turn for urgent direct messages. Hook scripts only; they read a content-free signal link the agent creates through its own TalkTo MCP connection. For Droid, Grok Build and Devin. Claude Code users: install talkto-plugin instead.",
   "author": { "name": "TalkTo" },
   "homepage": "https://talkto.sh",

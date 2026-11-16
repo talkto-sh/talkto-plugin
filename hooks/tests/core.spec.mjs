@@ -136,6 +136,13 @@ test("a link the host found elsewhere is saved once, only while new and live", a
   assert.equal(first.context, notices.saved());
   assert.equal(w.state.url, url);
   assert.equal(w.requests.length, 0);
+  // A host can add what the agent does next (Antigravity: start the watcher).
+  const withNote = world();
+  withNote.deps.savedNote = "START THE WATCHER.";
+  assert.equal(
+    (await handle(hook("afterTool", { foundLink }), withNote.deps)).context,
+    `${notices.saved()} START THE WATCHER.`,
+  );
   // The host shows the newest result before every model call: the same link is not saved again.
   w.state = { ...w.state, cursor: message(1) };
   assert.deepEqual(await handle(hook("afterTool", { foundLink }), w.deps), {});

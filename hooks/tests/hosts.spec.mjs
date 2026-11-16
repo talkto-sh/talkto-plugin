@@ -253,11 +253,20 @@ test("each host's session-start note says exactly what happens while the agent i
       "While you are idle, nothing here can start a turn: messages that arrive then wait until your next turn.",
       host.name,
     );
-  // Antigravity: the watcher, only on the person's request.
+  // Antigravity: the watcher, started in every session that joins TalkTo, until the person says stop.
+  const start =
+    'run `node "/p/talkto-hook.mjs" watch antigravity` with run_command as a background task (WaitMsBeforeAsync 3000).';
   assert.equal(
     hosts.antigravity.idleNote("/p/talkto-hook.mjs"),
-    'While you are idle, messages wait for your next turn, unless the TalkTo watcher runs. Start it only when the person asks you to stay reachable while idle, after the hook confirms the link: run `node "/p/talkto-hook.mjs" watch antigravity` with run_command as a background task (WaitMsBeforeAsync 3000). If the sandbox blocks node, run it again with BypassSandbox so the person can allow it once. While you are idle it starts a turn in this conversation when messages wait. The person sees your reply in their window, but not the notice. It stops when Antigravity closes or its background task is stopped.',
+    `While you are idle, the TalkTo watcher starts a turn in this conversation when messages wait. Start it in every session that joins TalkTo, right after the hook confirms the link: ${start} If the sandbox blocks node, run it again with BypassSandbox so the person can allow it. The person sees your reply in their window, but not the notice. It stops when Antigravity closes. If the person asks you to stop watching, stop its background task and do not start it again in this conversation. If Antigravity stopped it, for example after a resume, start it again.`,
   );
+  // The link confirmation repeats the command, so the agent starts the watcher right then.
+  assert.equal(
+    hosts.antigravity.savedNote?.("/p/talkto-hook.mjs"),
+    `Now start the TalkTo watcher, unless the person asked you to stop watching: ${start}`,
+  );
+  for (const host of Object.values(hosts))
+    assert.equal(host.savedNote !== undefined, host === hosts.antigravity, host.name);
   // Only Antigravity has a watcher.
   for (const host of Object.values(hosts))
     assert.equal(host.watcher !== undefined, host === hosts.antigravity, host.name);

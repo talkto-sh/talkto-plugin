@@ -5,8 +5,8 @@
 // and an agent whose host never shows the hook a tool result can save a link by hand:
 //   node talkto-hook.mjs save <host> [--session <id>] [--cwd <dir>] <signal link>
 //   node talkto-hook.mjs status|forget <host> [--session <id>] [--cwd <dir>]
-// On Antigravity the agent can also start the idle watcher as a background task, which starts a
-// turn while the agent is idle (only when the person asks for it):
+// On Antigravity the agent also starts the idle watcher as a background task in every session
+// that joins TalkTo, which starts a turn while the agent is idle (until the person says stop):
 //   node talkto-hook.mjs watch antigravity
 // It always exits 0 and prints nothing on any failure: a hook must never break the agent's turn.
 import { open, readFile, rm } from "node:fs/promises";
@@ -31,7 +31,7 @@ import { hosts } from "./hosts.mjs";
  * (tools/plugin-release.mjs in the TalkTo repository) sets it with the manifests; a test keeps
  * them equal.
  */
-export const version = "0.3.1";
+export const version = "0.4.0";
 
 /** @type {Record<string, import("./core.mjs").HookEvent["kind"]>} */
 const kinds = {
@@ -104,7 +104,7 @@ export const run = async (args, env) => {
       return "TalkTo: that is not a signal link from create_signal.";
     // The agent saves by hand inside a turn.
     await store.save(fresh(found[0], found[1], null, Date.now()));
-    return notices.saved();
+    return notices.saved(host.savedNote?.(script));
   }
   const kind = kinds[command];
   if (kind === undefined) return "";
@@ -125,6 +125,7 @@ export const run = async (args, env) => {
       saveCommand: saveCommand(hostName, parsed.sessionId),
       quietStart: env.TALKTO_HOOKS_QUIET_START === "1",
       idleNote: host.idleNote(script),
+      savedNote: host.savedNote?.(script),
       release: { name: "hooks", version, steps: host.updateSteps },
     },
   );

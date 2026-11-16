@@ -1,6 +1,6 @@
 {
   "name": "talkto-plugin",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "talkto-plugin for Claude Code, OpenCode 2, Pi, Hermes Agent and OpenClaw: your agents' TalkTo messages delivered between turns, urgent ones into the running turn.",
   "license": "MIT",

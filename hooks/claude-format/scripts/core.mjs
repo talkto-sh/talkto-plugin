@@ -155,6 +155,7 @@ const expiresPattern = /"expiresAt"\s*:\s*"(\d{4}-\d{2}-\d{2}T[^"]{1,40})"/;
  * @property {string} saveCommand How the agent saves a link by hand, if the host never shows it a tool result.
  * @property {boolean} quietStart Skip the setup line at session start when no link is saved.
  * @property {string} idleNote What happens to messages while the agent is idle, on this host.
+ * @property {string | undefined} [savedNote] What the agent does next once its link is saved, on this host.
  * @property {Release} [release] This plugin, reported on each check; absent in older callers.
  */
 
@@ -188,8 +189,9 @@ export const notices = {
   /** @param {string} saveCommand @param {string} idleNote What happens while the agent is idle, on this host. */
   setup: (saveCommand, idleNote) =>
     `TalkTo hooks are installed. If you join TalkTo in this session, call create_signal right after register_participant (or recovering your participant) with your serverId, participantId and the channelIds and directChats you use for get_updates. This hook saves the link from the result and tells you when messages arrive; it never sees message text. ${idleNote} If the hook does not confirm the link, save it with: ${saveCommand}`,
-  saved: () =>
-    "TalkTo: signal link saved for this session. You will be told here when messages arrive; then call get_updates as usual.",
+  /** @param {string} [next] What this host asks the agent to do once the link is saved. */
+  saved: (next) =>
+    `TalkTo: signal link saved for this session. You will be told here when messages arrive; then call get_updates as usual.${next === undefined ? "" : ` ${next}`}`,
   forgotten: () => "TalkTo: signal link removed for this session.",
   /** @param {Counts} counts */
   waiting: (counts) => {
@@ -206,7 +208,7 @@ export const notices = {
     "TalkTo: this session's signal link stopped working (expired or revoked). If you are still collaborating on TalkTo, call create_signal again with the same arguments; the hook saves the new link.",
   /** The idle watcher (Antigravity) is running and says so once, in its command's output. */
   watching: () =>
-    "TalkTo watcher running for this conversation. While you are idle it checks every 15 seconds and starts a turn here when TalkTo messages wait, at most as often as the person's wake setting allows; urgent direct messages skip that wait. It stops when Antigravity closes, when the link stops working, or when its background task is stopped.",
+    "TalkTo watcher running for this conversation. While you are idle it checks every 15 seconds and starts a turn here when TalkTo messages wait, at most as often as the person's wake setting allows; urgent direct messages skip that wait. It stops when Antigravity closes, when the link stops working, or when its background task is stopped. If the person asks you to stop watching, stop this background task.",
   watchNoLink: () =>
     "TalkTo watcher stopped: no signal link is saved for this conversation. Call create_signal first, wait for the hook to confirm the link, then start the watcher again.",
   watchTwice: () => "TalkTo watcher already running for this conversation; this one stopped.",
@@ -214,7 +216,7 @@ export const notices = {
     "TalkTo watcher stopped: it runs only inside an Antigravity agent's command, which provides the conversation and agy's agent API. Messages wait for your next turn.",
   /** The watcher could not start a turn; its exit (a finished background task) tells the agent instead. @param {string} notice */
   watchFailed: (notice) =>
-    `${notice} (The TalkTo watcher could not start a turn through agy's agent API and has stopped. Start it again after you read, if the person still wants it.)`,
+    `${notice} (The TalkTo watcher could not start a turn through agy's agent API and has stopped. Start it again after you read, unless the person asked you to stop watching.)`,
   /**
    * Added to a line the agent sees anyway, at most once a day, when TalkTo has a newer version.
    * @param {Release} release @param {string} latest
@@ -222,7 +224,7 @@ export const notices = {
   update: (release, latest) =>
     `Tell your person: a ${release.name === "hooks" ? "TalkTo hooks" : "TalkTo plugin"} update is available (${release.version} → ${latest}). To install it, ${release.steps}. What changed: ${updatesPage}`,
   watchDead: () =>
-    "TalkTo watcher stopped: this conversation's signal link stopped working (expired or revoked). If you are still collaborating on TalkTo and the person still wants it, call create_signal again, then start the watcher again.",
+    "TalkTo watcher stopped: this conversation's signal link stopped working (expired or revoked). If you are still collaborating on TalkTo, call create_signal again, then start the watcher again, unless the person asked you to stop watching.",
 };
 
 /**
@@ -466,14 +468,14 @@ export const handle = async (event, deps) => {
     // The same link stays saved, even once it died: the host shows the newest result every time.
     if (live && (await deps.load())?.url !== link.url) {
       await deps.save(fresh(link.url, link.signalId, link.expiresAt, deps.now()));
-      if (event.kind === "afterTool") return { context: notices.saved() };
+      if (event.kind === "afterTool") return { context: notices.saved(deps.savedNote) };
     }
   }
   if (event.kind === "afterTool") {
     const link = linkFrom(event.toolName, event.toolResponse);
     if (link !== null) {
       await deps.save(fresh(link.url, link.signalId, link.expiresAt, deps.now()));
-      return { context: notices.saved() };
+      return { context: notices.saved(deps.savedNote) };
     }
     if (event.toolName !== null && /revoke_signal/.test(event.toolName)) {
       const known = await deps.load();
