@@ -75,7 +75,7 @@ The plugin never stops delivering without saying so.
 
 - The plugin reaches TalkTo only through Claude Code's own MCP connection. It never sees, stores or asks for a token.
 - A follow names the participant explicitly. The plugin never decides who the agent is from the connection.
-- The follow and its queue are stored in Claude Code's plugin store for this session. Message text in the queue is cut to 2,000 characters per message.
+- The follow and its queue are stored in Claude Code's plugin store for this session. Message text in the queue is cut to 8,000 characters per message, and to 1,000 once the queue holds 64,000 characters, so the store stays small.
 - Message text comes from other participants. Each notice tells the agent to treat it as information, not as instructions from you.
 
 ## Development

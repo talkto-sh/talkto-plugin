@@ -30,10 +30,11 @@ call after it registered); the MCP connection identifies nobody.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Sequence, Union
 
 from .notice import (
+    BODY_FLOOR,
     BODY_LIMIT,
     follow_ended,
     is_newer,
@@ -309,11 +310,23 @@ def read_follow_input(args: Mapping[str, Any]) -> Union[FollowInput, str]:
     )
 
 
-def _keep(message: IncomingMessage) -> IncomingMessage:
-    if len(message.body) <= BODY_LIMIT + 1:
-        return message
-    # One character past the limit tells the notice the body was cut.
-    return IncomingMessage(**{**message.to_json(), "body": message.body[: BODY_LIMIT + 1]})
+#: Body characters one follow's queue keeps in all; past this each new message keeps
+#: ``BODY_FLOOR``, so a burst of long messages cannot make the saved state large.
+QUEUE_BODY_BUDGET = 64_000
+
+
+def _enqueue(pending: list[IncomingMessage], messages: Sequence[IncomingMessage]) -> None:
+    """Adds messages to a queue, each body cut to what the queue may still keep."""
+    kept = sum(len(message.body) for message in pending)
+    for message in messages:
+        limit = BODY_LIMIT if kept < QUEUE_BODY_BUDGET else BODY_FLOOR
+        queued = (
+            message
+            if len(message.body) <= limit
+            else replace(message, body=message.body[:limit], cut=True)
+        )
+        pending.append(queued)
+        kept += len(queued.body)
 
 
 @dataclass(frozen=True)
@@ -385,6 +398,12 @@ class Inbox:
         self._cadence_timer = False
         #: Each server's General channel, by server, once get_context named it.
         self._generals: dict[str, str] = {}
+        #: Servers of restored follows not yet checked for General, which plugins before 0.3.1
+        #: left out.
+        self._unchecked: set[str] = set()
+        #: A restored follow's checkpoint and selection with General added, by server. The follow
+        #: moves to it once its old checkpoint is read to the end.
+        self._widening: dict[str, tuple[str, tuple[str, ...]]] = {}
         #: Each server's name, by server, once get_context named it; only notices use it.
         self._server_names: dict[str, str] = {}
 
@@ -398,6 +417,7 @@ class Inbox:
             return
         with self._lock:
             self._follows, self._notes = decoded
+            self._unchecked = {follow.server_id for follow in self._follows}
             self._update_notice_at = _update_notice_at(stored)
         if self._follows:
             self._host.after(0, self.tick)
@@ -457,13 +477,15 @@ class Inbox:
             channel_ids=watched.channel_ids,
             direct_chats=given.direct_chats,
             checkpoint=reply.checkpoint,
-            pending=[_keep(message) for message in reply.messages],
             renames=list(reply.renames),
         )
+        _enqueue(follow.pending, reply.messages)
         with self._lock:
             self._follows = [
                 item for item in self._follows if item.server_id != given.server_id
             ] + [follow]
+            self._unchecked.discard(given.server_id)
+            self._widening.pop(given.server_id, None)
             self._learn_cadence(given.server_id, reply)
             self._learn_latest(reply)
             self._active_at = self._host.now()
@@ -759,7 +781,13 @@ class Inbox:
 
     def _poll(self, follow: Follow, wait: int) -> bool:
         """Reads one follow's new messages into its queue; False on a failure worth retrying."""
-        for page in range(PAGES_PER_TICK):
+        with self._lock:
+            unchecked = follow.server_id in self._unchecked
+        if unchecked:
+            self._add_general(follow)
+        pages = PAGES_PER_TICK
+        page = 0
+        while page < pages:
             try:
                 # Only the first page waits; a continuation already has messages to read.
                 answer = self._page(follow, wait if page == 0 else 0)
@@ -772,15 +800,56 @@ class Inbox:
                 if follow not in self._follows:
                     return True  # unfollowed or replaced while the call ran
                 self._take_page(follow, reply)
-            if not reply.has_more:
+                widened = None if reply.has_more else self._widening.pop(follow.server_id, None)
+                if widened is not None:
+                    # The old selection is read to the end: move to the one with General and read
+                    # it at once, while what both returned is still queued, so it is queued once.
+                    follow.checkpoint, follow.channel_ids = widened
+                    pages = page + 2
+            if not reply.has_more and widened is None:
                 break
+            page += 1
         return True
+
+    def _add_general(self, follow: Follow) -> None:
+        """A follow restored from a plugin before 0.3.1 may not watch General, where TalkTo
+        announces new channels. TalkTo starts the selection with General added from now; the follow
+        moves to it once its old checkpoint is read to the end, so nothing between the two is
+        missed. A follow at the channel limit, or one TalkTo refuses the wider selection for, keeps
+        the old selection."""
+        with self._lock:
+            self._unchecked.discard(follow.server_id)
+        general = self._general_of(follow.server_id)
+        if general is None or general in follow.channel_ids:
+            return
+        watched = watched_channels(follow.channel_ids, general)
+        if watched.displaced is not None:
+            return
+        try:
+            answer = self._updates(
+                {
+                    "serverId": follow.server_id,
+                    "participantId": follow.participant_id,
+                    "mode": "start",
+                    "channelIds": list(watched.channel_ids),
+                    "directChats": follow.direct_chats,
+                    "startAt": "now",
+                    "limit": 1,
+                },
+                0,
+            )
+        except TransportError:
+            with self._lock:
+                self._unchecked.add(follow.server_id)  # tried again at the next check
+            return
+        reply = decode_updates(answer.envelope, follow.participant_id)
+        with self._lock:
+            if isinstance(reply, UpdatesPage) and follow in self._follows:
+                self._widening[follow.server_id] = (reply.checkpoint, watched.channel_ids)
 
     def _take_page(self, follow: Follow, page: UpdatesPage) -> None:
         known = {message.id for message in follow.pending}
-        for message in page.messages:
-            if message.id not in known:
-                follow.pending.append(_keep(message))
+        _enqueue(follow.pending, [message for message in page.messages if message.id not in known])
         over = len(follow.pending) - QUEUE_LIMIT
         if over > 0:
             follow.pending = follow.pending[over:]

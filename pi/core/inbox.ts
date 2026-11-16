@@ -49,6 +49,7 @@ import {
   isObject,
   isText,
   listOf,
+  offerOf,
   serverNameOf,
   textOf,
   type Fields,
@@ -59,6 +60,7 @@ import {
   type UpdatesPage,
 } from "./talkto.ts";
 import {
+  bodyFloor,
   bodyLimit,
   deliveryResumed,
   deliveryStalled,
@@ -127,12 +129,13 @@ export interface Host {
   readonly plugin: PluginRelease;
 }
 
-/** A message waiting in the queue; its body is already cut to what a notice shows. */
+/** A message waiting in the queue; `cut` when the queue kept only the start of its body. */
 export type QueuedMessage = IncomingMessage;
 
 /** One followed participant and its queue. */
 export interface Follow extends Recipient {
-  readonly channelIds: ReadonlyArray<string>;
+  /** The channels it watches; General is added to one restored from before plugins always did. */
+  channelIds: ReadonlyArray<string>;
   readonly directChats: "own" | "none";
   checkpoint: string;
   pending: QueuedMessage[];
@@ -265,11 +268,26 @@ export const deliveryRules = (settings: Settings): string => {
   return `${normal}; ${urgent}.`;
 };
 
-const keep = (message: IncomingMessage): QueuedMessage =>
-  message.body.length <= bodyLimit + 1
-    ? message
-    : // One character past the limit tells the notice the body was cut.
-      { ...message, body: message.body.slice(0, bodyLimit + 1) };
+/**
+ * Body characters one follow's queue keeps in all; past this each new message keeps `bodyFloor`.
+ * Claude Code's plugin store holds 4 MiB for every session on the machine together, so a burst of
+ * long messages must not fill it: a full queue of 100 keeps at most about 172,000 characters.
+ */
+export const queueBodyBudget = 64_000;
+
+/** Adds messages to a queue, each body cut to what the queue may still keep. */
+const enqueue = (pending: QueuedMessage[], messages: ReadonlyArray<IncomingMessage>): void => {
+  let kept = pending.reduce((sum, message) => sum + message.body.length, 0);
+  for (const message of messages) {
+    const limit = kept < queueBodyBudget ? bodyLimit : bodyFloor;
+    const queued =
+      message.body.length <= limit
+        ? message
+        : { ...message, body: message.body.slice(0, limit), cut: true };
+    pending.push(queued);
+    kept += queued.body.length;
+  }
+};
 
 const same = (follow: Recipient, other: Recipient) => follow.serverId === other.serverId;
 
@@ -309,6 +327,16 @@ const reasonOf = (cause: unknown): string => {
   return (text === "" ? "the call failed without a message" : text).slice(0, 300);
 };
 
+/**
+ * Waits before each new try of a save refused because the store was locked: four tries over
+ * about 1.2 to 1.8 seconds. Every Claude Code session on a machine shares one plugin store, and
+ * Claude Code refuses a write while another holds its lock ("Lock file is already being held").
+ */
+export const lockRetryMillis: ReadonlyArray<number> = [150, 350, 700];
+
+/** Whether a save failed because another session held the store's lock. */
+const lockHeld = (cause: unknown): boolean => /lock/i.test(reasonOf(cause));
+
 /** Injected urgent messages of one turn, until a model request carries them. */
 interface Injected {
   readonly turnId: string;
@@ -333,6 +361,8 @@ export class Inbox {
   private updateNoticeAt: number | null = null;
   private chained = false;
   private submitting = false;
+  /** A delivery was asked for while one ran; it runs again when that one ends. */
+  private deliverAgain = false;
   private heldForInput = false;
   private polling = false;
   private injecting = false;
@@ -345,6 +375,16 @@ export class Inbox {
   private readonly cadence = new Map<string, number>();
   /** Each server's General channel, by server, once get_context named it. */
   private readonly generals = new Map<string, string>();
+  /** Servers of restored follows not yet checked for General, which plugins before 0.3.1 left out. */
+  private readonly unchecked = new Set<string>();
+  /**
+   * A restored follow's selection with General added, by server, and the checkpoint TalkTo started
+   * for it. The follow moves to it once its old checkpoint is read to the end.
+   */
+  private readonly widening = new Map<
+    string,
+    { readonly checkpoint: string; readonly channelIds: ReadonlyArray<string> }
+  >();
   /** Each server's name, by server, once get_context named it; only notices use it. */
   private readonly serverNames = new Map<string, string>();
   /** Each server's capabilities, by server, from its last get_context answer. */
@@ -379,6 +419,7 @@ export class Inbox {
       pending: [...follow.pending],
       renames: [...(follow.renames ?? [])],
     }));
+    for (const follow of this.follows) this.unchecked.add(follow.serverId);
     this.notes = [...saved.notes];
     this.updateNoticeAt = Number.isFinite(saved.updateNoticeAt)
       ? Number(saved.updateNoticeAt)
@@ -411,6 +452,10 @@ export class Inbox {
     const reply = decodeUpdates(answer, input.participantId);
     if (reply.kind === "failure" && reply.failure.code === removed)
       return participantRemoved(input, this.serverNames.get(input.serverId) ?? null);
+    // The host checks answers against the tool list it read when it connected; a connection older
+    // than TalkTo's last change refuses them, and only a reconnect helps.
+    if (reply.kind === "failure" && hostRefused(reply.failure.message))
+      return `Not following: this session's connection to TalkTo is older than TalkTo's last update, so it refuses TalkTo's answers (${reply.failure.message.slice(0, 160)}). ${this.reconnectHint()} Then call follow again. Until then, read your direct chats and channels with read_messages. A send that fails this way was usually stored: retry it only with the same requestKey.`;
     if (reply.kind === "failure")
       return `TalkTo refused the follow: ${reply.failure.code}: ${reply.failure.message}`;
     this.learnCadence(input.serverId, reply.page);
@@ -421,11 +466,14 @@ export class Inbox {
       channelIds: watched.channelIds,
       directChats: input.directChats,
       checkpoint: reply.page.checkpoint,
-      pending: reply.page.messages.map(keep),
+      pending: [],
       dropped: 0,
       renames: [...reply.page.renames],
     };
+    enqueue(follow.pending, reply.page.messages);
     this.follows = [...this.follows.filter((item) => !same(item, input)), follow];
+    this.unchecked.delete(input.serverId);
+    this.widening.delete(input.serverId);
     this.outages.delete(input.serverId);
     // A follow restarts delivery now: a check still in flight (perhaps one that never answers)
     // is given up, so the next tick polls at once.
@@ -755,7 +803,9 @@ export class Inbox {
 
   /** Reads one follow's new messages into its queue. */
   private async poll(follow: Follow, wait: number, generation: number): Promise<Check> {
-    for (let page = 0; page < pagesPerTick; page += 1) {
+    if (this.unchecked.has(follow.serverId)) await this.addGeneral(follow, generation);
+    let pages = pagesPerTick;
+    for (let page = 0; page < pages; page += 1) {
       let answer: ToolAnswer;
       try {
         // Only the first page waits; a continuation already has messages to read.
@@ -776,8 +826,10 @@ export class Inbox {
           ? this.skipRefused(follow, reply.failure.message, generation)
           : this.failed(follow, reply.failure, generation);
       const known = new Set(follow.pending.map((message) => message.id));
-      for (const message of reply.page.messages)
-        if (!known.has(message.id)) follow.pending.push(keep(message));
+      enqueue(
+        follow.pending,
+        reply.page.messages.filter((message) => !known.has(message.id)),
+      );
       const over = follow.pending.length - queueLimit;
       if (over > 0) {
         follow.pending = follow.pending.slice(over);
@@ -790,9 +842,57 @@ export class Inbox {
       follow.checkpoint = reply.page.checkpoint;
       this.learnCadence(follow.serverId, reply.page);
       this.learnLatest(reply.page);
-      if (!reply.page.hasMore) break;
+      if (reply.page.hasMore) continue;
+      const widened = this.widening.get(follow.serverId);
+      if (widened === undefined) break;
+      // The old selection is read to the end: move to the one with General and read it at once,
+      // while what both returned is still queued, so it is queued only once.
+      this.widening.delete(follow.serverId);
+      follow.checkpoint = widened.checkpoint;
+      follow.channelIds = widened.channelIds;
+      pages = page + 2;
     }
     return ok;
+  }
+
+  /**
+   * A follow restored from a plugin before 0.3.1 may not watch General, where TalkTo announces new
+   * channels. TalkTo starts the selection with General added from now; the follow moves to it once
+   * its old checkpoint is read to the end, so nothing between the two is missed. A follow at the
+   * channel limit, or one TalkTo refuses the wider selection for, keeps the old selection.
+   */
+  private async addGeneral(follow: Follow, generation: number): Promise<void> {
+    this.unchecked.delete(follow.serverId);
+    const general = await this.generalOf(follow.serverId);
+    if (general === null || follow.channelIds.includes(general)) return;
+    const watched = watchedChannels(follow.channelIds, general);
+    if (watched.displaced !== null) return;
+    let answer: ToolAnswer;
+    try {
+      answer = await this.updates(
+        {
+          serverId: follow.serverId,
+          participantId: follow.participantId,
+          mode: "start",
+          channelIds: watched.channelIds,
+          directChats: follow.directChats,
+          startAt: "now",
+          limit: 1,
+        },
+        0,
+      );
+    } catch {
+      // Tried again at the next check.
+      this.unchecked.add(follow.serverId);
+      return;
+    }
+    if (generation !== this.generation || !this.follows.includes(follow)) return;
+    const reply = decodeUpdates(answer, follow.participantId);
+    if (reply.kind === "page")
+      this.widening.set(follow.serverId, {
+        checkpoint: reply.page.checkpoint,
+        channelIds: watched.channelIds,
+      });
   }
 
   /** Ends a follow TalkTo will never accept again; anything else is retried. */
@@ -898,7 +998,28 @@ export class Inbox {
     if (this.busy && this.turnId !== null && this.settings.urgent === "inject")
       await this.injectUrgent(this.turnId);
     this.showStatus();
-    if (this.busy || this.submitting || this.heldForInput) return;
+    if (this.busy || this.heldForInput) return;
+    // One delivery at a time, claimed before the first await: deliveries started together (a tick
+    // that queued a message and the settle timer of the turn that just ended) would otherwise both
+    // submit the same notice. A delivery asked for meanwhile runs once the current one ends.
+    if (this.submitting) {
+      this.deliverAgain = true;
+      return;
+    }
+    this.submitting = true;
+    try {
+      do {
+        this.deliverAgain = false;
+        await this.submitDue();
+      } while (this.deliverAgain && !this.busy && !this.heldForInput);
+    } finally {
+      this.submitting = false;
+      this.showStatus();
+    }
+  }
+
+  /** Submits everything queued as one notice when it is due; the caller holds `submitting`. */
+  private async submitDue(): Promise<void> {
     if ((await this.host.now()) - this.idleSince < settleMillis) return;
     const hasUrgent = this.follows.some((item) => item.pending.some((message) => message.isUrgent));
     // With next-prompt delivery only urgent messages wake an idle session.
@@ -913,7 +1034,6 @@ export class Inbox {
       return;
     }
     const snapshot = this.snapshot(update ? now : null);
-    this.submitting = true;
     try {
       if (await this.host.submit(text)) {
         this.lastWakeAt = now;
@@ -922,9 +1042,6 @@ export class Inbox {
       } else this.heldForInput = true;
     } catch {
       // Not delivered: the queue is unchanged and the next tick tries again.
-    } finally {
-      this.submitting = false;
-      this.showStatus();
     }
   }
 
@@ -1045,11 +1162,32 @@ export class Inbox {
     }
   }
 
+  /**
+   * Saves the current state. A save refused because another session holds the store's lock is
+   * tried again after `lockRetryMillis`, each wait stretched by up to half at random, so sessions
+   * that all saved for the same General message do not collide again. Each try saves what is
+   * current then.
+   */
   private async persist(): Promise<void> {
-    const saved: Saved = { version: 1, follows: this.follows, notes: this.notes };
-    await this.host.save(
-      this.updateNoticeAt === null ? saved : { ...saved, updateNoticeAt: this.updateNoticeAt },
-    );
+    for (const wait of [...lockRetryMillis, null]) {
+      const saved: Saved = { version: 1, follows: this.follows, notes: this.notes };
+      try {
+        await this.host.save(
+          this.updateNoticeAt === null ? saved : { ...saved, updateNoticeAt: this.updateNoticeAt },
+        );
+        return;
+      } catch (cause) {
+        if (wait === null || !lockHeld(cause)) throw cause;
+      }
+      await this.pause(wait * (1 + Math.random() / 2));
+    }
+  }
+
+  /** Waits on the host's clock. */
+  private pause(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      this.host.after(ms, async () => resolve());
+    });
   }
 
   private showStatus(): void {
@@ -1079,11 +1217,18 @@ const refused = (answer: ToolAnswer): boolean => {
 const isMessage = (value: unknown): value is QueuedMessage => {
   if (!isObject(value)) return false;
   const fields: Fields = new Map(Object.entries(value));
+  const transfer = fields.get("transfer");
+  const cut = fields.get("cut");
   return (
     ["id", "conversationId", "senderId", "createdAt", "body", "where", "from"].every(
       (key) => textOf(fields, key) !== null,
     ) &&
-    (fields.get("isUrgent") === true || fields.get("isUrgent") === false)
+    (fields.get("isUrgent") === true || fields.get("isUrgent") === false) &&
+    // Absent for a whole body, and in a message saved before the queue marked cut bodies.
+    (cut === undefined || cut === true || cut === false) &&
+    // Absent in a message saved before offers were kept, and in one that offers nothing.
+    (transfer === undefined ||
+      (isObject(transfer) && offerOf(new Map(Object.entries(transfer))) !== null))
   );
 };
 

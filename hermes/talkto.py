@@ -12,6 +12,53 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Optional, Union
 
 
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**53 - 1
+
+
+@dataclass(frozen=True)
+class FileOffer:
+    """A file or folder a message offers. The receiver fetches it with fetch_transfer, by ``id``."""
+
+    id: str
+    #: The sender's name for it: untrusted display text.
+    name: str
+    #: "file" or "folder".
+    kind: str
+    bytes: int
+    sha256: str
+    #: How many files a folder holds; None for a file.
+    file_count: Optional[int]
+    expires_at: str
+
+    @staticmethod
+    def read(fields: Mapping[str, Any], camel: bool) -> Optional["FileOffer"]:
+        """An offer from ``get_updates`` (camelCase) or from saved state, or None when a field is
+        missing or malformed."""
+        file_count = fields.get("fileCount" if camel else "file_count")
+        expires_at = fields.get("expiresAt" if camel else "expires_at")
+        texts = [fields.get(key) for key in ("id", "name", "kind", "sha256")]
+        if not all(isinstance(value, str) for value in [*texts, expires_at]):
+            return None
+        oid, name, kind, sha256 = texts
+        if kind not in ("file", "folder") or not _SHA256.fullmatch(str(sha256)):
+            return None
+        if not _is_count(fields.get("bytes")) or not (file_count is None or _is_count(file_count)):
+            return None
+        return FileOffer(
+            id=str(oid),
+            name=str(name),
+            kind=str(kind),
+            bytes=int(fields["bytes"]),
+            sha256=str(sha256),
+            file_count=file_count,
+            expires_at=str(expires_at),
+        )
+
+
 @dataclass(frozen=True)
 class IncomingMessage:
     """One incoming message, as much as a notice shows."""
@@ -26,9 +73,18 @@ class IncomingMessage:
     where: str
     #: "planner (codex)", or the sender ID when the reply did not describe it.
     sender: str
+    #: The file or folder the message offers; None when it offers none.
+    transfer: Optional[FileOffer] = None
+    #: True when the plugin's queue kept only the start of the body.
+    cut: bool = False
 
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        saved = asdict(self)
+        if self.transfer is None:
+            del saved["transfer"]
+        if not self.cut:
+            del saved["cut"]
+        return saved
 
     @staticmethod
     def from_json(value: object) -> Optional["IncomingMessage"]:
@@ -48,7 +104,20 @@ class IncomingMessage:
             return None
         if not isinstance(value.get("is_urgent"), bool):
             return None
-        return IncomingMessage(**{key: value[key] for key in (*texts, "is_urgent")})
+        # Absent in a message saved before offers were kept, and in one that offers nothing.
+        saved = value.get("transfer")
+        transfer = None
+        if saved is not None:
+            transfer = FileOffer.read(saved, camel=False) if isinstance(saved, Mapping) else None
+            if transfer is None:
+                return None
+        # Absent for a whole body, and in a message saved before the queue marked cut bodies.
+        cut = value.get("cut", False)
+        if not isinstance(cut, bool):
+            return None
+        return IncomingMessage(
+            **{key: value[key] for key in (*texts, "is_urgent")}, transfer=transfer, cut=cut
+        )
 
 
 @dataclass(frozen=True)
@@ -222,6 +291,8 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
         if len(values) != len(_MESSAGE_FIELDS):
             return UpdatesFailure("unreadable", "TalkTo answered with an incomplete message.")
         mid, conversation_id, sender_id, created_at, body = values
+        # The offer is additive: one this plugin cannot read is left out, never failing the message.
+        offered = _fields(entry, "transfer")
         messages.append(
             IncomingMessage(
                 id=mid,
@@ -232,6 +303,7 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
                 is_urgent=_text(entry, "priority") == "urgent",
                 where=places.get(conversation_id, f"conversation {conversation_id}"),
                 sender=names.get(sender_id, f"participant {sender_id}"),
+                transfer=None if offered is None else FileOffer.read(offered, camel=True),
             )
         )
     interval = data.get("wakeIntervalSeconds")

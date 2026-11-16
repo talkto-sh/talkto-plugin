@@ -17,6 +17,23 @@ export interface IncomingMessage {
   readonly where: string;
   /** "planner (codex)", or the sender ID when the reply did not describe it. */
   readonly from: string;
+  /** The file or folder the message offers; absent when it offers none. */
+  readonly transfer?: FileOffer;
+  /** True when the plugin's queue kept only the start of the body; absent for a whole body. */
+  readonly cut?: boolean;
+}
+
+/** A file or folder a message offers. The receiver fetches it with fetch_transfer, by `id`. */
+export interface FileOffer {
+  readonly id: string;
+  /** The sender's name for it: untrusted display text. */
+  readonly name: string;
+  readonly kind: "file" | "folder";
+  readonly bytes: number;
+  readonly sha256: string;
+  /** How many files a folder holds; null for a file. */
+  readonly fileCount: number | null;
+  readonly expiresAt: string;
 }
 
 /** Who renamed a participant: itself (an agent operation for it) or a person, by name. */
@@ -92,6 +109,36 @@ export const textOf = (fields: Fields, key: string): string | null => {
 export const listOf = (fields: Fields, key: string): ReadonlyArray<unknown> => {
   const found = fields.get(key);
   return Array.isArray(found) ? found : [];
+};
+
+const sha256Pattern = /^[0-9a-f]{64}$/;
+const isCount = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && Number(value) >= 0;
+
+/**
+ * A file offer from its fields, as `get_updates` sends it and the plugin saves it, or null when a
+ * field is missing or malformed.
+ */
+export const offerOf = (fields: Fields): FileOffer | null => {
+  const id = textOf(fields, "id"),
+    name = textOf(fields, "name"),
+    kind = textOf(fields, "kind"),
+    sha256 = textOf(fields, "sha256"),
+    expiresAt = textOf(fields, "expiresAt");
+  const bytes = fields.get("bytes");
+  const fileCount = fields.get("fileCount") ?? null;
+  if (
+    id === null ||
+    name === null ||
+    sha256 === null ||
+    expiresAt === null ||
+    (kind !== "file" && kind !== "folder") ||
+    !sha256Pattern.test(sha256) ||
+    !isCount(bytes) ||
+    !(fileCount === null || isCount(fileCount))
+  )
+    return null;
+  return { id, name, kind, bytes, sha256, fileCount, expiresAt };
 };
 
 /** The reply envelope: structured content when the server declared it, else the first text block. */
@@ -229,7 +276,10 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
       body === null
     )
       return failure("unreadable", "TalkTo answered with an incomplete message.");
-    messages.push({
+    // The offer is additive: one this plugin cannot read is left out, never failing the message.
+    const offered = fieldsAt(item, "transfer");
+    const transfer = offered === null ? null : offerOf(offered);
+    const decoded: IncomingMessage = {
       id,
       conversationId,
       senderId,
@@ -238,7 +288,8 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
       isUrgent: textOf(item, "priority") === "urgent",
       where: places.get(conversationId) ?? `conversation ${conversationId}`,
       from: names.get(senderId) ?? `participant ${senderId}`,
-    });
+    };
+    messages.push(transfer === null ? decoded : { ...decoded, transfer });
   }
   const interval = data.get("wakeIntervalSeconds");
   const latest = textOf(data, "latestPluginVersion");

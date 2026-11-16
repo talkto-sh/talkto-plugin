@@ -53,6 +53,16 @@ const rename = (index, fields = {}) => ({
   renamedBy: { kind: "self" },
   ...fields,
 });
+const offer = (fields = {}) => ({
+  id: "99999999-9999-4999-8999-999999999999",
+  name: "rollcall — ünïcode.txt",
+  kind: "file",
+  bytes: 111,
+  sha256: `c9f88d90${"a".repeat(56)}`,
+  fileCount: null,
+  expiresAt: "2026-11-17T15:00:00.000Z",
+  ...fields,
+});
 const renamed = (messages, renames) => {
   const result = page(messages);
   result.data.renames = renames;
@@ -65,6 +75,13 @@ const envelopes = [
     "next",
   ),
   page([message(4, { body: "x".repeat(2500) }), message(5, { conversationId: unnamed })]),
+  // Long bodies: one at the limit, then a burst that spends the notice's body budget.
+  page([
+    message(30, { body: "y".repeat(8000) }),
+    ...Array.from({ length: 13 }, (_, index) =>
+      message(31 + index, { body: `z${index}`.repeat(4000 + index * 100) }),
+    ),
+  ]),
   page([
     message(6, { conversationId: "88888888-8888-4888-8888-888888888888", senderId: "nobody" }),
   ]),
@@ -94,6 +111,29 @@ const envelopes = [
   renamed(
     [],
     Array.from({ length: 13 }, (_, index) => rename(20 + index)),
+  ),
+  // File offers, and malformed ones a port must leave out the same way while keeping the message.
+  page([
+    message(13, { transfer: offer() }),
+    message(14, { transfer: offer({ kind: "folder", name: "screens", bytes: 1, fileCount: 1 }) }),
+    message(15, { transfer: offer({ kind: "folder", fileCount: 40, bytes: 9_000_000 }) }),
+    message(16, { transfer: offer({ fileCount: undefined }) }),
+    ...[
+      offer({ sha256: "C9F88D90" }),
+      offer({ kind: "archive" }),
+      offer({ bytes: -1 }),
+      offer({ bytes: true }),
+      offer({ fileCount: "3" }),
+      offer({ expiresAt: null }),
+      { id: "only-an-id" },
+      "not an offer",
+      null,
+    ].map((transfer, index) => message(17 + index, { transfer })),
+  ]),
+  page(
+    Array.from({ length: 14 }, (_, index) =>
+      message(200 + index, index % 2 === 0 ? { transfer: offer({ id: `t-${index}` }) } : {}),
+    ),
   ),
   renamed([message(10)], "not a list"),
   renamed([message(11)], []),

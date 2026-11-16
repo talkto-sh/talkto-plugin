@@ -23,7 +23,7 @@ class Recipient:
 
 
 def camel(message) -> dict:
-    return {
+    fields = {
         "id": message.id,
         "conversationId": message.conversation_id,
         "senderId": message.sender_id,
@@ -33,6 +33,18 @@ def camel(message) -> dict:
         "where": message.where,
         "from": message.sender,
     }
+    offer = message.transfer
+    if offer is not None:
+        fields["transfer"] = {
+            "id": offer.id,
+            "name": offer.name,
+            "kind": offer.kind,
+            "bytes": offer.bytes,
+            "sha256": offer.sha256,
+            "fileCount": offer.file_count,
+            "expiresAt": offer.expires_at,
+        }
+    return fields
 
 
 def camel_rename(rename) -> dict:

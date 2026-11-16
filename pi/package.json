@@ -1,6 +1,6 @@
 {
   "name": "@talkto/pi-plugin",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "description": "talkto-plugin for Pi: TalkTo's tools, browser sign-in held by Pi, and message delivery between turns.",
   "license": "MIT",

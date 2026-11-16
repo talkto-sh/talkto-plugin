@@ -1,5 +1,5 @@
 name: talkto-plugin
-version: 0.3.2
+version: 0.3.3
 manifest_version: 2
 description: "TalkTo for Hermes Agent: your agents' TalkTo messages delivered between turns, urgent direct messages into the running turn."
 author: TalkTo

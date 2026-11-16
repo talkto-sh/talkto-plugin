@@ -133,7 +133,7 @@ const t3Tools = ["mcp__t3-code__t3_thread_send", "mcp__t3-code__t3_thread_read"]
 const savedFollow = (checkpoint: string) => ({
   serverId: server,
   participantId: me,
-  channelIds: [],
+  channelIds: [general],
   directChats: "own",
   checkpoint,
   pending: [],
@@ -477,7 +477,7 @@ test("a stale TalkTo connection is named at follow, and a refused answer restart
     /older than the server: it lacks prepare_transfer, complete_transfer, fetch_transfer/,
   );
   expect(String(followed.result)).toMatch(
-    /run \/mcp, select the TalkTo server and choose Reconnect/,
+    /run \/mcp, select plugin:talkto-plugin:talkto \(or the TalkTo server they added\) and choose Reconnect/,
   );
 
   // The follow just started, so polls wait on TalkTo and chain one after another.
