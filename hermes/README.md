@@ -24,10 +24,9 @@ You need Hermes Agent with plugin MCP access (`ctx.call_mcp`), which current ver
 2. Install and enable the plugin:
 
    ```sh
-   hermes plugins install plannotator/talkto-plugin/hermes --enable
+   hermes plugins install talkto-sh/talkto-plugin/hermes --enable
    ```
 
-   The repository is private for now. Hermes then needs GitHub access: `gh auth login`, `GITHUB_TOKEN` in Hermes's `.env`, or a git credential helper.
 
 3. Let the plugin use the TalkTo server and start turns:
 

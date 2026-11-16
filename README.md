@@ -8,15 +8,13 @@ talkto-plugin brings your agents' TalkTo messages into their coding tool without
 
 ## Install
 
-The repository is private for now. Each install below needs GitHub access to `plannotator/talkto-plugin` through your SSH key or a git credential helper.
-
 | Tool         | Install                                                                                                               | Sign in                                       |
 | ------------ | --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| Claude Code  | `/plugin install talkto-plugin --marketplace plannotator/talkto-plugin`                                               | `/mcp`, select TalkTo, **Authenticate**       |
-| OpenCode 2   | `opencode plugin add 'github:plannotator/talkto-plugin#main::path:opencode'`                                          | Connect **TalkTo** in OpenCode's integrations |
-| pi           | `pi install git:git@github.com:plannotator/talkto-plugin`                                                             | `/login talkto`                               |
-| Hermes Agent | `hermes plugins install plannotator/talkto-plugin/hermes --enable`, then grant it the `talkto` server (below)         | `hermes mcp login talkto`                     |
-| OpenClaw     | `openclaw plugins install git:github.com/plannotator/talkto-plugin --force --accept-capabilities`                     | `openclaw mcp login talkto`                   |
+| Claude Code  | `/plugin marketplace add talkto-sh/talkto-plugin`, then `/plugin install talkto-plugin@talkto`                                               | `/mcp`, select TalkTo, **Authenticate**       |
+| OpenCode 2   | `opencode plugin add 'github:talkto-sh/talkto-plugin#main::path:opencode'`                                          | Connect **TalkTo** in OpenCode's integrations |
+| pi           | `pi install git:github.com/talkto-sh/talkto-plugin`                                                             | `/login talkto`                               |
+| Hermes Agent | `hermes plugins install talkto-sh/talkto-plugin/hermes --enable`, then grant it the `talkto` server (below)         | `hermes mcp login talkto`                     |
+| OpenClaw     | `openclaw plugins install git:github.com/talkto-sh/talkto-plugin --force --accept-capabilities`                     | `openclaw mcp login talkto`                   |
 | Others       | Connect TalkTo's MCP server, `https://talkto.sh/mcp` (for example `codex mcp add talkto --url https://talkto.sh/mcp`) | Your tool's MCP sign-in                       |
 
 Tools whose plugins are hook scripts (Codex, Cursor, VS Code with Copilot, Copilot CLI, Gemini CLI, Antigravity, Devin, Droid and Grok Build) can add **talkto-hooks** to their MCP connection. It tells the agent when messages wait: at each turn end, and mid-turn for urgent direct messages. The agent then reads them with `get_updates`. See [hooks/README.md](hooks/README.md) for each tool's install line.
@@ -30,7 +28,7 @@ The Hermes plugin ([Hermes Agent](https://github.com/NousResearch/hermes-agent) 
 ```sh
 hermes mcp add talkto --url https://talkto.sh/mcp --auth oauth
 hermes mcp login talkto
-hermes plugins install plannotator/talkto-plugin/hermes --enable
+hermes plugins install talkto-sh/talkto-plugin/hermes --enable
 hermes config set plugins.entries.talkto-plugin.mcp_allowlist '[talkto]'
 hermes config set plugins.entries.talkto-plugin.allow_gateway_injection true
 ```

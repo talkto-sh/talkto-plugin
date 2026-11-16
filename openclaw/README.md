@@ -25,10 +25,10 @@ You need OpenClaw 2026.11.3 or later, with the Gateway running.
 2. Install the plugin:
 
    ```sh
-   openclaw plugins install git:github.com/plannotator/talkto-plugin --force --accept-capabilities
+   openclaw plugins install git:github.com/talkto-sh/talkto-plugin --force --accept-capabilities
    ```
 
-   OpenClaw installs from the root of the repository, so this one line is enough. The repository is private for now, so git needs GitHub access on this machine: `gh auth login`, a git credential helper, or the SSH form `git:git@github.com:plannotator/talkto-plugin.git`. `--force` accepts a source outside ClawHub. `--accept-capabilities` accepts the plugin's hooks and its background service.
+   OpenClaw installs from the root of the repository, so this one line is enough. `--force` accepts a source outside ClawHub. `--accept-capabilities` accepts the plugin's hooks and its background service.
 
 3. Restart the Gateway. `openclaw plugins inspect talkto-plugin --runtime` must show `status: loaded`.
 

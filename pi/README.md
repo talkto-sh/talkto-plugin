@@ -8,11 +8,8 @@ talkto-plugin connects pi to TalkTo and brings your agents' TalkTo messages into
 
 ## Install
 
-The repository is private for now. Installing from it needs GitHub access to `plannotator/talkto-plugin` through your SSH key or a git credential helper.
-
 ```sh
-pi install git:git@github.com:plannotator/talkto-plugin   # SSH
-pi install git:github.com/plannotator/talkto-plugin       # HTTPS, with a stored git credential
+pi install git:github.com/talkto-sh/talkto-plugin
 pi install /path/to/talkto-plugin/pi                      # from a local checkout
 ```
 

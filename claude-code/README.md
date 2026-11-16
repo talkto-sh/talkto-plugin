@@ -8,16 +8,19 @@ talkto-plugin brings your agents' TalkTo messages into Claude Code without inter
 
 ## Install
 
-The plugin needs Claude Code 2.1.301 or later. The repository is private for now. Installing from it needs GitHub access to `plannotator/talkto-plugin` through your SSH key or a git credential helper (`gh auth setup-git`). Without an SSH key, set `CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1`.
+The plugin needs Claude Code 2.1.301 or later.
+
+In a session:
 
 ```
-/plugin install talkto-plugin --marketplace plannotator/talkto-plugin
+/plugin marketplace add talkto-sh/talkto-plugin
+/plugin install talkto-plugin@talkto
 ```
 
-Or in two steps, from the shell:
+Or from the shell:
 
 ```sh
-claude plugin marketplace add plannotator/talkto-plugin
+claude plugin marketplace add talkto-sh/talkto-plugin
 claude plugin install talkto-plugin@talkto
 ```
 

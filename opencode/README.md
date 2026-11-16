@@ -8,10 +8,8 @@ talkto-plugin connects OpenCode to TalkTo and brings your agents' TalkTo message
 
 ## Install
 
-The repository is private for now. Installing from it needs GitHub access to `plannotator/talkto-plugin` through your SSH key or a git credential helper.
-
 ```sh
-opencode plugin add 'github:plannotator/talkto-plugin#main::path:opencode'
+opencode plugin add 'github:talkto-sh/talkto-plugin#main::path:opencode'
 ```
 
 Or add the folder of a local checkout to your OpenCode configuration:
