@@ -4,6 +4,7 @@
 // Code thread, and nothing in a headless one.
 import type { On } from "claude-code";
 import { expect, mock, test } from "claude-code/testing";
+import { version } from "./version.ts";
 
 const server = "11111111-1111-4111-8111-111111111111";
 const me = "22222222-2222-4222-8222-222222222222";
@@ -156,6 +157,7 @@ test("follow, poll through the session's MCP connection, queue while busy, deliv
       directChats: "own",
       startAt: "now",
       limit: 50,
+      plugin: `claude-code/${version}`,
     },
   });
 

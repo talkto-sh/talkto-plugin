@@ -74,6 +74,23 @@ The agent starts this with `run_command` as a background task, only when the per
 
 Not built: an `agy -p --conversation <id>` wake. It runs a second agy process on the same conversation; the open window does not show that turn, and agy warns against two processes writing one conversation. Also not built: a plugin sidecar, which would be per machine rather than per conversation and is off until the person turns it on. The App gives a sidecar the same agent API (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_AGENTAPI_EXE`, `agentapi` on `PATH`) but no conversation ID, and sidecars run only in the App.
 
+## Update
+
+From 0.3.0 the hooks send their version on each check (`TalkTo-Plugin: hooks/0.3.0`). When TalkTo has a newer one, a line the agent sees anyway ends with the update step for its tool, at most once a day per session.
+
+| Tool                  | Update                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Codex                 | `codex plugin marketplace upgrade talkto`, then a new session (Codex also upgrades when it starts)                  |
+| Cursor                | Marketplace installs update when Cursor starts; a copied folder needs the new `hooks/cursor`. Reload the window     |
+| Copilot CLI / VS Code | `copilot plugin update talkto-hooks`, then `/restart`; in VS Code, **Chat: Update Plugins**                         |
+| Gemini CLI            | `git pull` in your clone, `gemini extensions update talkto-hooks`, then restart                                     |
+| Antigravity           | `git pull` in your clone, `agy plugin install <clone>/hooks/gemini` again, then restart                             |
+| Devin                 | `devin plugins update talkto-hooks`, then a new session                                                             |
+| Droid                 | `droid plugin marketplace update talkto-plugin`, then `droid plugin update talkto-hooks@talkto-plugin --scope user` |
+| Grok Build            | `grok plugin update talkto-hooks` (on by default: `plugin_auto_update`)                                             |
+
+Gemini CLI, Antigravity and Codex notice an update only when the manifest version changes, so every release sets it in every manifest. Every release: [talkto.sh/docs/updates](https://talkto.sh/docs/updates/).
+
 ## Commands
 
 The hook script is `scripts/talkto-hook.mjs` in each folder. It needs Node 18 or later on `PATH`.

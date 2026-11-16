@@ -21,6 +21,8 @@ import { fieldsOf, isNumber, isText, linkPattern } from "./core.mjs";
  * @property {(kind: Kind, input: Record<string, unknown>) => Promise<SignalLink | null>} [findLink]
  *   For a host whose hook input never carries the tool result: find the newest create_signal
  *   result some other way. It may throw; the caller treats that as nothing found.
+ * @property {string} updateSteps How the person installs a talkto-hooks update on this host, as
+ *   one clause after "To install it,".
  * @property {(script: string) => string} idleNote The session-start sentence on what happens to
  *   messages while the agent is idle on this host. It must say only what this host really does.
  * @property {(env: NodeJS.ProcessEnv) => Watcher | null} [watcher] For a host where a process
@@ -92,6 +94,8 @@ const claudeRender = (hook, reply) => {
  */
 export const claude = {
   name: "claude",
+  updateSteps:
+    "run `devin plugins update talkto-hooks` in Devin, `droid plugin marketplace update talkto-plugin` then `droid plugin update talkto-hooks@talkto-plugin --scope user` in Droid, or `grok plugin update talkto-hooks` in Grok Build, then start a new session",
   parse: (kind, input, env) =>
     event(kind, {
       sessionId: first(input, ["session_id", "sessionId"]),
@@ -113,7 +117,12 @@ export const claude = {
 };
 
 /** Codex uses Claude Code's format, with no continuation cap of its own; core caps it. */
-export const codex = { ...claude, name: "codex" };
+export const codex = {
+  ...claude,
+  name: "codex",
+  updateSteps:
+    "run `codex plugin marketplace upgrade talkto`, then start a new session (Codex also upgrades it when it starts)",
+};
 
 /**
  * Cursor's native hooks (`.cursor-plugin`). Stop continues with `followup_message`, submitted as
@@ -123,6 +132,8 @@ export const codex = { ...claude, name: "codex" };
  */
 export const cursor = {
   name: "cursor",
+  updateSteps:
+    "reload the Cursor window, since Cursor updates installed plugins when it starts; a copied folder needs the new hooks/cursor copied first",
   idleNote: turnOnly,
   parse: (kind, input) => {
     const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
@@ -152,6 +163,8 @@ export const cursor = {
  */
 export const copilot = {
   name: "copilot",
+  updateSteps:
+    "run `copilot plugin update talkto-hooks` in Copilot CLI, or Chat: Update Plugins in VS Code, then start a new session",
   idleNote: turnOnly,
   parse: (kind, input) => {
     const result = input.toolResult ?? input.tool_result;
@@ -181,6 +194,8 @@ export const copilot = {
  */
 export const gemini = {
   name: "gemini",
+  updateSteps:
+    "run `git pull` in your clone of talkto-sh/talkto-plugin, then `gemini extensions update talkto-hooks`, then restart Gemini CLI",
   idleNote: turnOnly,
   parse: (kind, input, env) =>
     event(kind, {
@@ -345,6 +360,8 @@ const antigravityLink = async (input) => {
  */
 export const antigravity = {
   name: "antigravity",
+  updateSteps:
+    "run `git pull` in your clone of talkto-sh/talkto-plugin, then `agy plugin install <clone>/hooks/gemini` again, then restart Antigravity",
   idleNote: (script) =>
     `While you are idle, messages wait for your next turn, unless the TalkTo watcher runs. Start it only when the person asks you to stay reachable while idle, after the hook confirms the link: run \`node "${script}" watch antigravity\` with run_command as a background task (WaitMsBeforeAsync 3000). If the sandbox blocks node, run it again with BypassSandbox so the person can allow it once. While you are idle it starts a turn in this conversation when messages wait. The person sees your reply in their window, but not the notice. It stops when Antigravity closes or its background task is stopped.`,
   watcher: (env) => {

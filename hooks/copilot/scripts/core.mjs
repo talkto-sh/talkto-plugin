@@ -81,6 +81,9 @@ const expiresPattern = /"expiresAt"\s*:\s*"(\d{4}-\d{2}-\d{2}T[^"]{1,40})"/;
  *   idle watcher last started a turn.
  * @property {boolean} turnActive A turn is running: a hook ran inside it and no Stop ended it.
  * @property {number} turnSeenAt When a hook last ran inside a turn.
+ * @property {string | null} latestVersion The newest version of this plugin, from the last check
+ *   that named it.
+ * @property {number | null} updateNoticeAt When a line last told the agent about that update.
  */
 
 /**
@@ -94,6 +97,17 @@ const expiresPattern = /"expiresAt"\s*:\s*"(\d{4}-\d{2}-\d{2}T[^"]{1,40})"/;
  *   from a server that predates it.
  * @property {number | null} wakeIntervalSeconds Start the agent for normal messages at most this
  *   often; null from a server that predates it, which keeps the old behavior.
+ * @property {string | null} latestPluginVersion The newest version of the plugin the check named in
+ *   its TalkTo-Plugin header; null from a server that predates it.
+ */
+
+/**
+ * This plugin as it names itself to TalkTo on each check (`TalkTo-Plugin: hooks/0.3.0`), and how
+ * the person updates it on this host.
+ * @typedef {object} Release
+ * @property {"hooks" | "openclaw"} name
+ * @property {string} version Three numbers, as in "0.3.0".
+ * @property {string} steps What the person runs to update, as one clause.
  */
 
 /**
@@ -141,12 +155,33 @@ const expiresPattern = /"expiresAt"\s*:\s*"(\d{4}-\d{2}-\d{2}T[^"]{1,40})"/;
  * @property {string} saveCommand How the agent saves a link by hand, if the host never shows it a tool result.
  * @property {boolean} quietStart Skip the setup line at session start when no link is saved.
  * @property {string} idleNote What happens to messages while the agent is idle, on this host.
+ * @property {Release} [release] This plugin, reported on each check; absent in older callers.
  */
 
 /** @param {number} count @param {string} one @param {string} many */
 const plural = (count, one, many) => (count === 1 ? one : many);
 /** @param {Counts} counts */
 const amount = (counts) => (counts.more ? `More than ${counts.pending}` : String(counts.pending));
+
+/** Every release, and how to update each agent. */
+export const updatesPage = "https://talkto.sh/docs/updates/";
+/** Least time between two lines about the same plugin update. */
+export const updateNoticeMs = 24 * 60 * 60_000;
+const versionPattern = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
+
+/**
+ * Whether version `latest` is newer than `current`; each is three numbers, as in "0.3.0".
+ * @param {string} latest @param {string} current
+ */
+export const isNewer = (latest, current) => {
+  const a = latest.split(".").map(Number);
+  const b = current.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (a[index] ?? 0) - (b[index] ?? 0);
+    if (difference !== 0) return difference > 0;
+  }
+  return false;
+};
 
 /** Every line the agent can see. None carries message content: the hook has none. */
 export const notices = {
@@ -180,6 +215,12 @@ export const notices = {
   /** The watcher could not start a turn; its exit (a finished background task) tells the agent instead. @param {string} notice */
   watchFailed: (notice) =>
     `${notice} (The TalkTo watcher could not start a turn through agy's agent API and has stopped. Start it again after you read, if the person still wants it.)`,
+  /**
+   * Added to a line the agent sees anyway, at most once a day, when TalkTo has a newer version.
+   * @param {Release} release @param {string} latest
+   */
+  update: (release, latest) =>
+    `Tell your person: a ${release.name === "hooks" ? "TalkTo hooks" : "TalkTo plugin"} update is available (${release.version} → ${latest}). To install it, ${release.steps}. What changed: ${updatesPage}`,
   watchDead: () =>
     "TalkTo watcher stopped: this conversation's signal link stopped working (expired or revoked). If you are still collaborating on TalkTo and the person still wants it, call create_signal again, then start the watcher again.",
 };
@@ -227,6 +268,8 @@ export const fresh = (url, signalId, expiresAt, at = 0) => ({
   lastWakeAt: 0,
   turnActive: at > 0,
   turnSeenAt: at,
+  latestVersion: null,
+  updateNoticeAt: null,
 });
 
 /** @param {unknown} value @returns {value is number} */
@@ -247,6 +290,7 @@ const countsFrom = (value) => {
   // Added later: a server that does not send them, or sends something odd, keeps the old rule.
   const cadence = fields.get("wakeCadence");
   const interval = fields.get("wakeIntervalSeconds");
+  const latest = fields.get("latestPluginVersion");
   return {
     pending,
     urgent,
@@ -258,6 +302,7 @@ const countsFrom = (value) => {
       isNumber(interval) && Number.isInteger(interval) && interval >= 0 && interval <= 86_400
         ? interval
         : null,
+    latestPluginVersion: isText(latest) && versionPattern.test(latest) ? latest : null,
   };
 };
 
@@ -294,7 +339,7 @@ export const checkRequest = (link) => {
  * Ask the link for counts after the saved cursor. Never throws: offline, slow or failing servers
  * become a quiet retry later. The OpenClaw plugin calls this too, with its own state.
  * @param {Pick<State, "url" | "cursor" | "expiresAt">} state
- * @param {Pick<Dependencies, "fetch" | "now"> & { settings: Pick<Settings, "backoffMs"> }} deps
+ * @param {Pick<Dependencies, "fetch" | "now" | "release"> & { settings: Pick<Settings, "backoffMs"> }} deps
  * @param {number} timeoutMs
  * @returns {Promise<Check>}
  */
@@ -307,13 +352,18 @@ export const check = async (state, deps, timeoutMs) => {
     if (request === null) return { kind: "dead" };
     const target = new URL(request.url);
     if (state.cursor !== null) target.searchParams.set("since", state.cursor);
+    /** @type {Record<string, string>} */
+    const headers = {
+      accept: "application/json",
+      authorization: `Bearer ${request.secret}`,
+      "user-agent": "talkto-hooks/0.2",
+    };
+    // Older servers ignore it; newer ones answer with latestPluginVersion.
+    if (deps.release !== undefined)
+      headers["talkto-plugin"] = `${deps.release.name}/${deps.release.version}`;
     const response = await deps.fetch(target.href, {
       signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        accept: "application/json",
-        authorization: `Bearer ${request.secret}`,
-        "user-agent": "talkto-hooks/0.2",
-      },
+      headers,
     });
     if (response.status === 404 || response.status === 410) return { kind: "dead" };
     if (response.status === 429) {
@@ -349,7 +399,39 @@ const observe = async (state, deps, timeoutMs, intervalMs) => {
   }
   state.expiresAt = result.counts.expiresAt;
   state.pending = result.counts.pending;
+  if (result.counts.latestPluginVersion !== null)
+    state.latestVersion = result.counts.latestPluginVersion;
   return result.counts;
+};
+
+/**
+ * The update line to add to a line the agent sees anyway, or null: TalkTo named a newer version
+ * of this plugin, and no line said so in the last day. Marks it said. The OpenClaw plugin uses it.
+ * @param {Pick<State, "latestVersion" | "updateNoticeAt">} state
+ * @param {Release | undefined} release @param {number} now
+ * @returns {string | null}
+ */
+export const updateLine = (state, release, now) => {
+  if (release === undefined || state.latestVersion === null) return null;
+  if (!isNewer(state.latestVersion, release.version)) return null;
+  if (state.updateNoticeAt !== null && now - state.updateNoticeAt < updateNoticeMs) return null;
+  state.updateNoticeAt = now;
+  return notices.update(release, state.latestVersion);
+};
+
+/**
+ * A reply with the update line added to whatever it says; a quiet reply stays quiet.
+ * @param {Reply} reply @param {State} state @param {Dependencies} deps
+ * @returns {Reply}
+ */
+const withUpdate = (reply, state, deps) => {
+  const said = reply.continueWith ?? reply.context;
+  if (said === undefined) return reply;
+  const line = updateLine(state, deps.release, deps.now());
+  if (line === null) return reply;
+  return reply.continueWith !== undefined
+    ? { ...reply, continueWith: `${reply.continueWith} ${line}` }
+    : { ...reply, context: `${said} ${line}` };
 };
 /** The agent is being told about these messages; the next check counts only newer ones. @param {State} state @param {Counts} counts */
 const announce = (state, counts) => {
@@ -462,6 +544,7 @@ export const handle = async (event, deps) => {
       break;
     }
   }
+  reply = withUpdate(reply, state, deps);
   await deps.save(state);
   return reply;
 };
@@ -516,8 +599,12 @@ export const watchStep = async (deps) => {
   state.turnActive = true;
   state.turnSeenAt = now;
   state.continuations = 0;
+  const line = updateLine(state, deps.release, now);
   await deps.save(state);
-  return { kind: "wake", notice: notices.waiting(counts) };
+  return {
+    kind: "wake",
+    notice: line === null ? notices.waiting(counts) : `${notices.waiting(counts)} ${line}`,
+  };
 };
 
 /** Where per-session state lives: never in the project, so it cannot be committed. */
@@ -564,6 +651,13 @@ const stateFrom = (value) => {
     lastWakeAt: count("lastWakeAt"),
     turnActive: fields.get("turnActive") === true,
     turnSeenAt: count("turnSeenAt"),
+    latestVersion: (() => {
+      const found = text("latestVersion");
+      return found !== null && versionPattern.test(found) ? found : null;
+    })(),
+    updateNoticeAt: isNumber(fields.get("updateNoticeAt"))
+      ? Number(fields.get("updateNoticeAt"))
+      : null,
   };
 };
 

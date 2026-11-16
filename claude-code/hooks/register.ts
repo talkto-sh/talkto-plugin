@@ -52,6 +52,7 @@ import {
   unfollowDescription,
   unfollowSchema,
 } from "./core/tools.ts";
+import { version } from "./version.ts";
 
 const command = "talkto-inbox";
 /** The manifest's key for the bundled TalkTo MCP server. */
@@ -256,6 +257,7 @@ const hostOf = (
     },
     status: (text) => $.ui.status(text),
     connectionHint: connectionHintOf(kind),
+    plugin: { name: "claude-code", version },
     lease,
   };
 };

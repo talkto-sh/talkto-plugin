@@ -22,6 +22,10 @@
  * - The person's wake cadence (`wakeIntervalSeconds` on each page, chosen on
  *   the TalkTo dashboard) spaces the turns the inbox starts for normal
  *   messages. Urgent messages and plugin notes ignore it.
+ * - The plugin names itself on every get_updates call (`plugin`, as in
+ *   "claude-code/0.3.0"). When a page says a newer version exists, the next
+ *   queued notice ends with one line on how to update, at most once a day. A
+ *   server that refuses the field is asked again without it.
  * - The follow, its checkpoint and the queue are saved in the plugin's store
  *   before anything is delivered, so a crash, restart or compaction neither
  *   loses nor repeats a message.
@@ -45,9 +49,13 @@ import {
 import {
   bodyLimit,
   followEnded,
+  isNewer,
   queuedNotice,
+  releaseText,
+  updateNotice,
   urgentFollowUp,
   urgentNotice,
+  type PluginRelease,
   type Recipient,
 } from "./notice.ts";
 
@@ -85,6 +93,8 @@ export interface Host {
   readonly status: (text: string | undefined) => void;
   /** What the agent should do when TalkTo cannot be reached, e.g. "Check /mcp." */
   readonly connectionHint: string;
+  /** This plugin and its version, reported to TalkTo on every get_updates call. */
+  readonly plugin: PluginRelease;
 }
 
 /** A message waiting in the queue; its body is already cut to what a notice shows. */
@@ -112,6 +122,8 @@ export interface Saved {
   readonly version: 1;
   readonly follows: ReadonlyArray<SavedFollow>;
   readonly notes: ReadonlyArray<string>;
+  /** When a notice last told the agent about a plugin update; absent before the first. */
+  readonly updateNoticeAt?: number;
 }
 
 /** The `follow` tool's input, decoded. */
@@ -135,6 +147,8 @@ export const waitSeconds = 20;
 export const engagedMillis = 10 * 60 * 1000;
 /** Least time between the starts of two chained waiting polls, so a poll that answers at once never spins. */
 export const rearmMillis = 1000;
+/** Least time between two notices that mention the same plugin update. */
+export const updateNoticeMillis = 24 * 60 * 60 * 1000;
 /** Longest wait between polls after repeated failures. */
 const backoffLimitMillis = 5 * 60 * 1000;
 /** Failures that mean the follow can never work again as it stands. */
@@ -171,10 +185,12 @@ const keep = (message: IncomingMessage): QueuedMessage =>
 
 const same = (follow: Recipient, other: Recipient) => follow.serverId === other.serverId;
 
-/** What one notice covered: the notes before it and the queued message IDs. */
+/** What one notice covered: the notes before it, the queued message IDs, and the update line. */
 interface Snapshot {
   readonly notes: number;
   readonly ids: ReadonlySet<string>;
+  /** When it was sent, if it carried the plugin update line. */
+  readonly updateAt: number | null;
 }
 
 /** Injected urgent messages of one turn, until a model request carries them. */
@@ -193,6 +209,12 @@ export class Inbox {
   private activeAt = 0;
   /** False once the server rejected waitSeconds (an older deployment); polls then return at once. */
   private canWait = true;
+  /** False once the server rejected the `plugin` field (a deployment before November 16, 2026). */
+  private canReport = true;
+  /** The newest version of this plugin, from the latest page that said. */
+  private latestVersion: string | null = null;
+  /** When a notice last carried the update line; null before the first. */
+  private updateNoticeAt: number | null = null;
   private chained = false;
   private submitting = false;
   private heldForInput = false;
@@ -226,6 +248,9 @@ export class Inbox {
       renames: [...(follow.renames ?? [])],
     }));
     this.notes = [...saved.notes];
+    this.updateNoticeAt = Number.isFinite(saved.updateNoticeAt)
+      ? Number(saved.updateNoticeAt)
+      : null;
     this.showStatus();
   }
 
@@ -235,15 +260,18 @@ export class Inbox {
       return `This session already follows ${followLimit} participants. Call unfollow for one first.`;
     let answer: ToolAnswer;
     try {
-      answer = await this.host.call("get_updates", {
-        serverId: input.serverId,
-        participantId: input.participantId,
-        mode: "start",
-        channelIds: input.channelIds,
-        directChats: input.directChats,
-        startAt: input.startAt,
-        limit: 50,
-      });
+      answer = await this.updates(
+        {
+          serverId: input.serverId,
+          participantId: input.participantId,
+          mode: "start",
+          channelIds: input.channelIds,
+          directChats: input.directChats,
+          startAt: input.startAt,
+          limit: 50,
+        },
+        0,
+      );
     } catch (cause) {
       return `Could not reach TalkTo (${String(cause)}). ${this.host.connectionHint} Then call follow again.`;
     }
@@ -251,6 +279,7 @@ export class Inbox {
     if (reply.kind === "failure")
       return `TalkTo refused the follow: ${reply.failure.code}: ${reply.failure.message}`;
     this.learnCadence(input.serverId, reply.page);
+    this.learnLatest(reply.page);
     const follow: Follow = {
       serverId: input.serverId,
       participantId: input.participantId,
@@ -310,6 +339,9 @@ export class Inbox {
               ];
         }),
       )
+      .concat(
+        this.updateAvailable() ? [updateNotice(this.host.plugin, this.latestVersion ?? "")] : [],
+      )
       .join("\n");
   }
 
@@ -360,9 +392,11 @@ export class Inbox {
    */
   async takeForPrompt(): Promise<string | null> {
     if (this.settings.delivery !== "next-prompt") return null;
-    const text = this.noticeText(true);
+    const now = await this.host.now();
+    const update = this.updateDue(now);
+    const text = this.noticeText(true, update);
     if (text === null) return null;
-    this.clearDelivered(this.snapshot());
+    this.clearDelivered(this.snapshot(update ? now : null));
     await this.persist();
     return text;
   }
@@ -419,21 +453,54 @@ export class Inbox {
     return this.follows.reduce((sum, follow) => sum + follow.pending.length, 0);
   }
 
-  /** One get_updates page; a server that does not know waitSeconds is asked again without it. */
-  private async page(follow: Follow, wait: number): Promise<ToolAnswer> {
-    const base = {
-      serverId: follow.serverId,
-      participantId: follow.participantId,
-      mode: "poll",
-      checkpoint: follow.checkpoint,
-      limit: 50,
-    };
-    if (wait === 0) return this.host.call("get_updates", base);
-    const answer = await this.host.call("get_updates", { ...base, waitSeconds: wait });
-    const reply = decodeUpdates(answer, follow.participantId);
-    if (reply.kind !== "failure" || reply.failure.code !== "invalid_input") return answer;
+  /** One get_updates page, waiting up to `wait` seconds on the server. */
+  private page(follow: Follow, wait: number): Promise<ToolAnswer> {
+    return this.updates(
+      {
+        serverId: follow.serverId,
+        participantId: follow.participantId,
+        mode: "poll",
+        checkpoint: follow.checkpoint,
+        limit: 50,
+      },
+      wait,
+    );
+  }
+
+  /**
+   * One get_updates call with this plugin's name and version, and `waitSeconds` when it may wait.
+   * An older server refuses fields it does not know (`invalid_input`): it is asked again without
+   * `plugin`, then without `waitSeconds`, and what it refused is not sent again this session.
+   */
+  private async updates(args: ToolArguments, wait: number): Promise<ToolAnswer> {
+    const call = (extra: ToolArguments) => this.host.call("get_updates", { ...args, ...extra });
+    const waiting: ToolArguments = wait > 0 ? { waitSeconds: wait } : {};
+    if (!this.canReport) return wait > 0 ? this.withoutWait(await call(waiting), call) : call({});
+    const reported = await call({ ...waiting, plugin: releaseText(this.host.plugin) });
+    if (!refused(reported)) return reported;
+    const unreported = await call(waiting);
+    if (!refused(unreported)) {
+      this.canReport = false;
+      return unreported;
+    }
+    if (wait === 0) return unreported;
+    const plain = await call({});
+    if (!refused(plain)) {
+      // A server without waitSeconds predates the plugin field too.
+      this.canWait = false;
+      this.canReport = false;
+    }
+    return plain;
+  }
+
+  /** A server that refuses waitSeconds (an older deployment) is asked again without it. */
+  private async withoutWait(
+    answer: ToolAnswer,
+    call: (extra: ToolArguments) => Promise<ToolAnswer>,
+  ): Promise<ToolAnswer> {
+    if (!refused(answer)) return answer;
     this.canWait = false;
-    return this.host.call("get_updates", base);
+    return call({});
   }
 
   /** Reads one follow's new messages into its queue; false on a failure worth retrying. */
@@ -462,6 +529,7 @@ export class Inbox {
       follow.renames = follow.renames.slice(-queueLimit);
       follow.checkpoint = reply.page.checkpoint;
       this.learnCadence(follow.serverId, reply.page);
+      this.learnLatest(reply.page);
       if (!reply.page.hasMore) break;
     }
     return true;
@@ -473,15 +541,18 @@ export class Inbox {
       // The server's history was restored: start again from now and say what may be missing.
       let restarted: ToolAnswer | null = null;
       try {
-        restarted = await this.host.call("get_updates", {
-          serverId: follow.serverId,
-          participantId: follow.participantId,
-          mode: "start",
-          channelIds: follow.channelIds,
-          directChats: follow.directChats,
-          startAt: "now",
-          limit: 1,
-        });
+        restarted = await this.updates(
+          {
+            serverId: follow.serverId,
+            participantId: follow.participantId,
+            mode: "start",
+            channelIds: follow.channelIds,
+            directChats: follow.directChats,
+            startAt: "now",
+            limit: 1,
+          },
+          0,
+        );
       } catch {
         return false;
       }
@@ -509,15 +580,16 @@ export class Inbox {
     const hasUrgent = this.follows.some((item) => item.pending.some((message) => message.isUrgent));
     // With next-prompt delivery only urgent messages wake an idle session.
     if (this.settings.delivery === "next-prompt" && !hasUrgent && this.notes.length === 0) return;
-    const text = this.noticeText(false);
-    if (text === null) return;
     const now = await this.host.now();
+    const update = this.updateDue(now);
+    const text = this.noticeText(false, update);
+    if (text === null) return;
     const held = hasUrgent || this.notes.length > 0 ? 0 : this.cadenceWait(now);
     if (held > 0) {
       this.retryAfter(held);
       return;
     }
-    const snapshot = this.snapshot();
+    const snapshot = this.snapshot(update ? now : null);
     this.submitting = true;
     try {
       if (await this.host.submit(text)) {
@@ -561,6 +633,24 @@ export class Inbox {
     }
   }
 
+  /** A page without the field (an older server, or a call without `plugin`) leaves what is known. */
+  private learnLatest(page: UpdatesPage): void {
+    if (page.latestPluginVersion !== null) this.latestVersion = page.latestPluginVersion;
+  }
+
+  /** Whether TalkTo said a newer version of this plugin exists. */
+  private updateAvailable(): boolean {
+    return this.latestVersion !== null && isNewer(this.latestVersion, this.host.plugin.version);
+  }
+
+  /** Whether the next notice should carry the update line: an update exists and a day has passed. */
+  private updateDue(now: number): boolean {
+    return (
+      this.updateAvailable() &&
+      (this.updateNoticeAt === null || now - this.updateNoticeAt >= updateNoticeMillis)
+    );
+  }
+
   /** A page without the field (an older server) leaves what is known; none known means none. */
   private learnCadence(serverId: string, page: UpdatesPage): void {
     if (page.wakeIntervalSeconds !== null)
@@ -592,7 +682,7 @@ export class Inbox {
    * The combined notice for everything queued, or null when nothing waits. Queued renames go with
    * any notice; on their own they make one only when `renamesAlone` (the person's prompt carries it).
    */
-  private noticeText(renamesAlone: boolean): string | null {
+  private noticeText(renamesAlone: boolean, update: boolean): string | null {
     const waking =
       this.notes.length > 0 ||
       this.follows.some((item) => item.pending.length > 0 || item.dropped > 0);
@@ -604,12 +694,14 @@ export class Inbox {
         .filter((item) => item.pending.length > 0 || item.dropped > 0 || item.renames.length > 0)
         .map((item) => queuedNotice(item, item.pending, item.dropped, item.renames)),
     ];
-    return parts.join("\n\n---\n\n");
+    const text = parts.join("\n\n---\n\n");
+    return update ? `${text}\n\n${updateNotice(this.host.plugin, this.latestVersion ?? "")}` : text;
   }
 
   /** What one notice covers, so messages and renames that arrive while it is submitted stay queued. */
-  private snapshot(): Snapshot {
+  private snapshot(updateAt: number | null): Snapshot {
     return {
+      updateAt,
       notes: this.notes.length,
       ids: new Set(
         this.follows.flatMap((item) => [
@@ -621,6 +713,7 @@ export class Inbox {
   }
 
   private clearDelivered(snapshot: Snapshot): void {
+    if (snapshot.updateAt !== null) this.updateNoticeAt = snapshot.updateAt;
     this.notes = this.notes.slice(snapshot.notes);
     for (const follow of this.follows) {
       follow.pending = follow.pending.filter((message) => !snapshot.ids.has(message.id));
@@ -630,7 +723,10 @@ export class Inbox {
   }
 
   private async persist(): Promise<void> {
-    await this.host.save({ version: 1, follows: this.follows, notes: this.notes });
+    const saved: Saved = { version: 1, follows: this.follows, notes: this.notes };
+    await this.host.save(
+      this.updateNoticeAt === null ? saved : { ...saved, updateNoticeAt: this.updateNoticeAt },
+    );
   }
 
   private showStatus(): void {
@@ -644,6 +740,12 @@ export class Inbox {
     );
   }
 }
+
+/** Whether TalkTo refused a call's input (`invalid_input`), as a server older than a field does. */
+const refused = (answer: ToolAnswer): boolean => {
+  const reply = decodeUpdates(answer, "");
+  return reply.kind === "failure" && reply.failure.code === "invalid_input";
+};
 
 const isMessage = (value: unknown): value is QueuedMessage => {
   if (!isObject(value)) return false;

@@ -9,6 +9,7 @@ import {
   followFrom,
   keyOf,
   settingsFrom,
+  release,
   settleMillis,
 } from "../signals.mjs";
 
@@ -51,6 +52,7 @@ const world = (settings = defaults, answers = []) => {
     steers: [],
     notices: [],
     requests: [],
+    plugins: [],
     steerAccepts: true,
     notifyAccepts: true,
     host: {
@@ -68,8 +70,9 @@ const world = (settings = defaults, answers = []) => {
       remove: async (key) => {
         w.stored.delete(key);
       },
-      fetch: async (target) => {
+      fetch: async (target, init) => {
         w.requests.push(target);
+        w.plugins.push(init.headers["talkto-plugin"]);
         const next = answers.shift() ?? { pending: 0, urgent: 0 };
         if (next instanceof Error) throw next;
         if (Number.isInteger(next))
@@ -435,4 +438,38 @@ test("no notice carries message text, names or the link", async () => {
   }
   assert.match(w.signals.describe(session), /1 waiting, 1 urgent/);
   assert.doesNotMatch(w.signals.describe(session), new RegExp(secret));
+});
+
+test("each check names the plugin; a newer version adds one line to a queued notice a day", async () => {
+  const w = world(defaults, [
+    { pending: 1, urgent: 0, cursor: message(1), latestPluginVersion: "99.0.0" },
+    { pending: 2, urgent: 0, cursor: message(2), latestPluginVersion: "99.0.0" },
+  ]);
+  await capture(w);
+  await w.signals.tick();
+  assert.equal(w.plugins[0], `openclaw/${release.version}`);
+  assert.equal(w.notices.length, 1);
+  assert.ok(
+    w.notices[0].text.endsWith(
+      `Tell your person: a TalkTo plugin update is available (${release.version} → 99.0.0). To install it, stop the Gateway, run \`openclaw plugins update talkto-plugin\`, then start the Gateway again. What changed: https://talkto.sh/docs/updates/`,
+    ),
+    w.notices[0].text,
+  );
+  assert.match(w.signals.describe(session), /TalkTo plugin update is available/);
+  await w.signals.runStarted(session, "run-1");
+  w.signals.runEnded(session, "run-1");
+  w.tick(engagedPollMillis);
+  await w.signals.tick();
+  assert.equal(w.notices.length, 2);
+  assert.doesNotMatch(w.notices[1].text, /plugin update/, "not twice in a day");
+});
+
+test("no update line when the plugin is current", async () => {
+  const w = world(defaults, [
+    { pending: 1, urgent: 0, cursor: message(1), latestPluginVersion: release.version },
+  ]);
+  await capture(w);
+  await w.signals.tick();
+  assert.doesNotMatch(w.notices[0].text, /plugin update/);
+  assert.doesNotMatch(w.signals.describe(session), /plugin update/);
 });

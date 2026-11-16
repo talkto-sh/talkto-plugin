@@ -48,7 +48,15 @@ export interface UpdatesPage {
    * from a server that does not send it, which keeps the old behavior.
    */
   readonly wakeIntervalSeconds: number | null;
+  /**
+   * The newest published version of this plugin, as in "0.3.0", when the call named the plugin
+   * and the server knows it. Null from a server that does not send it.
+   */
+  readonly latestPluginVersion: string | null;
 }
+
+/** A plugin version: three numbers, as in "0.3.0". */
+export const versionPattern = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
 
 /** A failed call: TalkTo's error code and message, or `transport` when the call itself failed. */
 export interface UpdatesFailure {
@@ -216,6 +224,7 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
     });
   }
   const interval = data.get("wakeIntervalSeconds");
+  const latest = textOf(data, "latestPluginVersion");
   return {
     kind: "page",
     page: {
@@ -227,6 +236,7 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
         Number.isSafeInteger(interval) && Number(interval) >= 0 && Number(interval) <= 86_400
           ? Number(interval)
           : null,
+      latestPluginVersion: latest !== null && versionPattern.test(latest) ? latest : null,
     },
   };
 };

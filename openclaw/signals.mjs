@@ -21,7 +21,17 @@
  * Identity: a follow names the participant the agent passed to create_signal. Nothing is
  * inferred from the MCP connection.
  */
-import { check, isText, linkFrom, linkPattern, mayWake } from "./core/core.mjs";
+import {
+  check,
+  isNewer,
+  isText,
+  linkFrom,
+  linkPattern,
+  mayWake,
+  notices as hookNotices,
+  updateNoticeMs,
+} from "./core/core.mjs";
+import { version } from "./version.mjs";
 
 /** @typedef {import("./core/core.mjs").Counts} Counts */
 
@@ -97,7 +107,17 @@ export const backoffMs = 60_000;
  * @property {number} retryAt
  */
 
-/** @typedef {{ runs: Set<string>, idleSince: number, activeAt: number, lastWakeAt: number }} Session */
+/**
+ * @typedef {{ runs: Set<string>, idleSince: number, activeAt: number, lastWakeAt: number, updateNoticeAt: number | null }} Session
+ */
+
+/** This plugin as it names itself to TalkTo on each check, and how the person updates it. */
+export const release = Object.freeze({
+  name: /** @type {const} */ ("openclaw"),
+  version,
+  steps:
+    "stop the Gateway, run `openclaw plugins update talkto-plugin`, then start the Gateway again",
+});
 
 /** @param {number} count @param {string} one @param {string} many */
 const plural = (count, one, many) => (count === 1 ? one : many);
@@ -187,6 +207,8 @@ export class Signals {
   /** @type {Map<string, Session>} */
   #sessions = new Map();
   #ticking = false;
+  /** The newest version of this plugin, from the last check that named it. @type {string | null} */
+  #latestVersion = null;
   /** @type {Host} */
   #host;
   /** @type {Settings} */
@@ -217,7 +239,7 @@ export class Signals {
   #session(sessionKey) {
     let session = this.#sessions.get(sessionKey);
     if (session === undefined) {
-      session = { runs: new Set(), idleSince: 0, activeAt: 0, lastWakeAt: 0 };
+      session = { runs: new Set(), idleSince: 0, activeAt: 0, lastWakeAt: 0, updateNoticeAt: null };
       this.#sessions.set(sessionKey, session);
     }
     return session;
@@ -386,7 +408,7 @@ export class Signals {
     entry.lastCheckAt = now;
     const result = await check(
       follow,
-      { fetch: this.#host.fetch, now: this.#host.now, settings: { backoffMs } },
+      { fetch: this.#host.fetch, now: this.#host.now, settings: { backoffMs }, release },
       checkTimeoutMs,
     );
     if (this.#entries.get(key) !== entry) return;
@@ -401,6 +423,7 @@ export class Signals {
         await this.#host.save(key, follow);
       }
       entry.latest = counts.pending > 0 ? { ...counts, observedAt: now } : null;
+      if (counts.latestPluginVersion !== null) this.#latestVersion = counts.latestPluginVersion;
     }
   }
 
@@ -447,12 +470,28 @@ export class Signals {
     const wake = (this.#settings.delivery === "idle" && allowed) || inject;
     const notified = entry.notified;
     if (notified !== null && notified.cursor === latest.cursor && (notified.woke || !wake)) return;
+    const update = this.#updateLine(session, now);
+    const text = notices.queued(follow, latest);
     const told = await this.#try(() =>
-      this.#host.notify(target, notices.queued(follow, latest), wake),
+      this.#host.notify(target, update === null ? text : `${text} ${update}`, wake),
     );
     if (!told) return;
     entry.notified = { cursor: latest.cursor, woke: wake };
     if (wake) session.lastWakeAt = now;
+    if (update !== null) session.updateNoticeAt = now;
+  }
+
+  /**
+   * The update line for a queued notice in this session, or null: TalkTo named a newer version of
+   * this plugin and no notice in the session said so in the last day.
+   * @param {Session} session @param {number} now
+   */
+  #updateLine(session, now) {
+    const latest = this.#latestVersion;
+    if (latest === null || !isNewer(latest, release.version)) return null;
+    if (session.updateNoticeAt !== null && now - session.updateNoticeAt < updateNoticeMs)
+      return null;
+    return hookNotices.update(release, latest);
   }
 
   /** A plain description for the person's /talkto-inbox command. */
@@ -476,6 +515,11 @@ export class Signals {
         this.#settings.delivery === "idle"
           ? ["New messages start a turn once the session is idle."]
           : ["New messages arrive with your next prompt; urgent ones still start a turn."],
+      )
+      .concat(
+        this.#latestVersion !== null && isNewer(this.#latestVersion, release.version)
+          ? [hookNotices.update(release, this.#latestVersion)]
+          : [],
       )
       .join("\n");
   }

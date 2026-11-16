@@ -28,8 +28,9 @@ import {
 } from "./core/tools.ts";
 import type { Context, Event, Plugin, Tool } from "./opencode.ts";
 import { integrationID, method, type SignInDeps } from "./signin.ts";
+import { version } from "./version.ts";
 
-export const version = "0.1.0";
+export { version };
 const keyPrefix = "session:";
 
 export interface Deps extends SignInDeps {
@@ -126,6 +127,7 @@ export const plugin = (deps: Deps): Plugin => ({
       after: later,
       status: () => undefined,
       connectionHint: "Ask the person to connect TalkTo in OpenCode (sign in with the browser).",
+      plugin: { name: "opencode", version },
     });
 
     /** The session's delivery, restored from storage the first time it is needed. */

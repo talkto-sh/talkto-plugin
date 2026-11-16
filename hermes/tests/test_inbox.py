@@ -63,6 +63,7 @@ class InboxTest(unittest.TestCase):
                     "channelIds": [GENERAL],
                     "directChats": "own",
                     "startAt": "now",
+                    "plugin": f"hermes/{plugin.version.VERSION}",
                     "limit": 50,
                 },
             ),
@@ -251,12 +252,79 @@ class InboxTest(unittest.TestCase):
         host = FakeHost()
         inbox = followed(host)
         inbox.on_turn_start("t1", "x")
+        # Such a server predates the plugin field too: it refuses the call with it, then without it.
+        host.answers.append(refusal("invalid_input", "plugin is not allowed"))
         host.answers.append(refusal("invalid_input", "waitSeconds is not allowed"))
         inbox.tick()
+        self.assertEqual(host.calls[-3][1].get("plugin"), f"hermes/{plugin.version.VERSION}")
         self.assertEqual(host.calls[-2][1].get("waitSeconds"), 20)
+        self.assertNotIn("plugin", host.calls[-2][1])
         self.assertNotIn("waitSeconds", host.calls[-1][1], "asked again without the wait")
         inbox.tick()
         self.assertNotIn("waitSeconds", host.calls[-1][1], "and never waits again")
+        self.assertNotIn("plugin", host.calls[-1][1], "nor names the plugin")
+
+    def test_a_server_that_refuses_only_the_plugin_field_keeps_waiting(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        inbox.on_turn_start("t1", "x")
+        host.answers.append(refusal("invalid_input", "plugin is not allowed"))
+        host.answers.append(envelope([message()]))
+        inbox.tick()
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20)
+        self.assertNotIn("plugin", host.calls[-1][1])
+        self.assertEqual(pending(host), 1, "the follow survives")
+        inbox.tick()
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20, "later polls still wait")
+        self.assertNotIn("plugin", host.calls[-1][1], "and leave the field out")
+
+    def test_a_newer_plugin_version_adds_one_update_line_at_most_once_a_day(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+
+        def latest(messages: list[dict], version: str) -> dict:
+            answer = envelope(messages)
+            answer["data"]["latestPluginVersion"] = version
+            return answer
+
+        newer = "99.0.0"
+        host.answers.append(latest([message()], newer))
+        inbox.tick()
+        host.clock.advance(inbox_module.SETTLE_MILLIS)
+        self.assertEqual(len(host.submitted), 1)
+        line = (
+            f"Tell your person: a TalkTo plugin update is available ({plugin.version.VERSION} → {newer}). "
+            "To install it, run `hermes plugins update talkto-plugin`, then start a new session. Tip: run "
+            "`hermes plugins auto-update on`, and future updates install by themselves. What changed: "
+            "https://talkto.sh/docs/updates/"
+        )
+        self.assertTrue(host.submitted[0].endswith("\n\n" + line), host.submitted[0])
+        self.assertIn(line, inbox.describe())
+        inbox.on_turn_start("t2", host.submitted[0])
+        self.assertIsInstance(host.stored.get("updateNoticeAt"), (int, float))
+        inbox.on_turn_complete("t2")
+
+        # Within a day the next notice has no update line, even after a restart.
+        again = plugin.inbox.Inbox(host, inbox_module.Settings())
+        again.restore()
+        host.answers.append(latest([message()], newer))
+        again.tick()
+        host.clock.advance(inbox_module.SETTLE_MILLIS)
+        self.assertEqual(len(host.submitted), 2)
+        self.assertNotIn("plugin update", host.submitted[1])
+
+    def test_no_update_line_when_the_plugin_is_current_or_the_server_names_no_version(self) -> None:
+        for version in (plugin.version.VERSION, "0.0.1", None, "soon"):
+            host = FakeHost()
+            inbox = followed(host)
+            answer = envelope([message()])
+            if version is not None:
+                answer["data"]["latestPluginVersion"] = version
+            host.answers.append(answer)
+            inbox.tick()
+            host.clock.advance(inbox_module.SETTLE_MILLIS)
+            self.assertEqual(len(host.submitted), 1)
+            self.assertNotIn("plugin update", host.submitted[0], version)
 
     def test_an_idle_session_stops_waiting_after_ten_minutes(self) -> None:
         host = FakeHost()

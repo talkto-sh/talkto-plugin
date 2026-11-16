@@ -32,8 +32,9 @@ import {
 } from "./core/tools.ts";
 import { provider, providerName } from "./login.ts";
 import type { Context, Message, Pi, ToolResult } from "./pi.ts";
+import { version } from "./version.ts";
 
-export const version = "0.1.0";
+export { version };
 const statusKey = "talkto";
 const command = "talkto-inbox";
 /** How long a sent notice may take to appear as a user message before it counts as not delivered. */
@@ -173,6 +174,7 @@ export const extension =
       after: later,
       status: (text) => ctx?.ui.setStatus(statusKey, text),
       connectionHint: "Ask the person to run /login talkto in pi.",
+      plugin: { name: "pi", version },
     });
 
     /**

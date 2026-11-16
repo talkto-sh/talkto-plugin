@@ -90,6 +90,7 @@ const fakeHost = () => {
     after: (ms, run) => host.timers.push({ at: host.time + ms, run }),
     status: (text) => host.statuses.push(text),
     connectionHint: "Check the connection.",
+    plugin: { name: "claude-code", version: "0.3.0" },
     /** Moves time on and runs the timers that came due. */
     advance: async (ms) => {
       host.time += ms;
@@ -129,6 +130,7 @@ test("follow starts the participant's own feed and saves it before anything is d
       directChats: "own",
       startAt: "now",
       limit: 50,
+      plugin: "claude-code/0.3.0",
     },
   });
   assert.ok(isSaved(host.stored));
@@ -567,15 +569,126 @@ test("a server that does not know waitSeconds is asked again without it, and the
   const host = fakeHost();
   const inbox = await followed(host);
   inbox.onTurnStart("t1");
-  host.answers.push(failure("invalid_input", "unknown waitSeconds"), reply([message()]));
+  // Such a server predates the plugin field too: it refuses the call with it, then without it.
+  host.answers.push(
+    failure("invalid_input", "unknown plugin"),
+    failure("invalid_input", "unknown waitSeconds"),
+    reply([message()]),
+  );
   await inbox.tick();
-  const [refused, retried] = polls(host).slice(-2);
+  const [refused, unreported, retried] = polls(host).slice(-3);
   assert.equal(refused.args.waitSeconds, waitSeconds);
+  assert.equal(refused.args.plugin, "claude-code/0.3.0");
+  assert.equal(unreported.args.waitSeconds, waitSeconds);
+  assert.equal("plugin" in unreported.args, false);
   assert.equal("waitSeconds" in retried.args, false);
+  assert.equal("plugin" in retried.args, false);
   assert.equal(host.stored.follows.length, 1);
   assert.equal(host.stored.follows[0].pending.length, 1);
   await inbox.tick();
   assert.equal("waitSeconds" in polls(host).at(-1).args, false, "later polls do not wait");
+  assert.equal("plugin" in polls(host).at(-1).args, false, "nor name the plugin");
+});
+
+test("a server that refuses only the plugin field is asked again without it and keeps waiting", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  inbox.onTurnStart("t1");
+  host.answers.push(failure("invalid_input", "unknown plugin"), reply([message()]));
+  await inbox.tick();
+  const [refused, retried] = polls(host).slice(-2);
+  assert.equal(refused.args.plugin, "claude-code/0.3.0");
+  assert.equal(retried.args.waitSeconds, waitSeconds);
+  assert.equal("plugin" in retried.args, false);
+  assert.equal(host.stored.follows[0].pending.length, 1, "the follow survives");
+  await inbox.tick();
+  assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds, "later polls still wait");
+  assert.equal("plugin" in polls(host).at(-1).args, false, "and leave the field out");
+});
+
+test("a real invalid_input still ends the follow, with the plugin field kept for next time", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  // Refused with and without the plugin field, and without waiting: the input itself is wrong.
+  for (let index = 0; index < 3; index += 1)
+    host.answers.push(failure("invalid_input", "bad checkpoint"));
+  await inbox.tick();
+  assert.equal(host.stored.follows.length, 0);
+  assert.match(host.submitted.at(-1), /stopped delivering messages/);
+  assert.equal(polls(host)[0].args.plugin, "claude-code/0.3.0");
+});
+
+/** A page whose server knows this plugin and names its newest version. */
+const withLatest = (messages, latestPluginVersion) => {
+  const answer = reply(messages);
+  answer.structuredContent.data.latestPluginVersion = latestPluginVersion;
+  return answer;
+};
+const day = 24 * 60 * 60 * 1000;
+
+test("a newer plugin version adds one update line to the next notice, at most once a day", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(withLatest([message()], "0.4.0"));
+  await inbox.tick();
+  await host.advance(settleMillis);
+  assert.equal(host.submitted.length, 1);
+  const first = host.submitted[0];
+  assert.match(first, /1 new message for your participant/);
+  assert.ok(
+    first.endsWith(
+      "\n\nTell your person: a TalkTo plugin update is available (0.3.0 → 0.4.0). To install it, run `claude plugin marketplace update talkto`, then `claude plugin update talkto-plugin@talkto`, then /reload-plugins. Tip: turn on auto-update in /plugin → Marketplaces → talkto, and future updates install by themselves. What changed: https://talkto.sh/docs/updates/",
+    ),
+    first,
+  );
+  assert.ok(Number.isFinite(host.stored.updateNoticeAt), "the time it was said is saved");
+  assert.match(inbox.describe(), /TalkTo plugin update is available \(0\.3\.0 → 0\.4\.0\)/);
+
+  // Within a day: the next notice has no update line, even after a restart.
+  const restarted = new Inbox(host, settings);
+  await restarted.restore();
+  host.answers.push(withLatest([message()], "0.4.0"));
+  await restarted.tick();
+  host.time += settleMillis;
+  await restarted.deliver();
+  assert.equal(host.submitted.length, 2);
+  assert.doesNotMatch(host.submitted[1], /plugin update/);
+
+  // A day later it says so again.
+  host.time += day;
+  host.answers.push(withLatest([message()], "0.4.0"));
+  await restarted.tick();
+  host.time += settleMillis;
+  await restarted.deliver();
+  assert.equal(host.submitted.length, 3);
+  assert.match(host.submitted[2], /plugin update is available \(0\.3\.0 → 0\.4\.0\)/);
+});
+
+test("no update line when the plugin is current, newer, or the server names no version", async () => {
+  for (const latest of ["0.3.0", "0.2.9", undefined, "soon"]) {
+    const host = fakeHost();
+    const inbox = await followed(host);
+    host.answers.push(latest === undefined ? reply([message()]) : withLatest([message()], latest));
+    await inbox.tick();
+    await host.advance(settleMillis);
+    assert.equal(host.submitted.length, 1);
+    assert.doesNotMatch(host.submitted[0], /plugin update/, String(latest));
+    assert.doesNotMatch(inbox.describe(), /plugin update/, String(latest));
+  }
+});
+
+test("the update line never goes into a running turn, and never makes a notice on its own", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(withLatest([], "0.4.0"));
+  await inbox.tick();
+  await host.advance(settleMillis);
+  assert.equal(host.submitted.length, 0, "an update alone starts no turn");
+  inbox.onTurnStart("t1");
+  host.answers.push(withLatest([message({ conversationId: direct, priority: "urgent" })], "0.4.0"));
+  await inbox.tick();
+  assert.equal(host.injected.length, 1);
+  assert.doesNotMatch(host.injected[0], /plugin update/);
 });
 
 /** A page carrying participant renames, as a server with renaming sends it. */

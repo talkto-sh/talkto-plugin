@@ -169,3 +169,47 @@ def follow_ended(recipient: Recipient, reason: str) -> str:
         f"{recipient.participant_id} on server {recipient.server_id}: {reason} "
         "Call the follow tool again once you can read messages there."
     )
+
+
+#: Every release, and how to update each agent.
+UPDATES_PAGE = "https://talkto.sh/docs/updates/"
+
+#: How a person installs an update of each plugin, and turns on automatic updates where the host
+#: has them. Hermes uses only its own entry; the others keep the text identical to the core's.
+_UPDATE_STEPS = {
+    "claude-code": (
+        "run `claude plugin marketplace update talkto`, then `claude plugin update talkto-plugin@talkto`, "
+        "then /reload-plugins. Tip: turn on auto-update in /plugin → Marketplaces → talkto, and future "
+        "updates install by themselves"
+    ),
+    "opencode": "run `opencode plugin update`, then restart OpenCode",
+    "pi": "run `pi update git:github.com/talkto-sh/talkto-plugin`, then /reload",
+    "hermes": (
+        "run `hermes plugins update talkto-plugin`, then start a new session. Tip: run "
+        "`hermes plugins auto-update on`, and future updates install by themselves"
+    ),
+}
+
+
+def release_text(name: str, version: str) -> str:
+    """The text TalkTo plugins send as ``plugin`` on get_updates."""
+    return f"{name}/{version}"
+
+
+def is_newer(latest: str, current: str) -> bool:
+    """Whether version ``latest`` is newer than ``current``; each is three numbers, as in "0.3.0"."""
+    a = [int(part) for part in latest.split(".")]
+    b = [int(part) for part in current.split(".")]
+    for index in range(3):
+        difference = (a[index] if index < len(a) else 0) - (b[index] if index < len(b) else 0)
+        if difference != 0:
+            return difference > 0
+    return False
+
+
+def update_notice(name: str, version: str, latest: str) -> str:
+    """One line added to a notice, at most once a day, when TalkTo has a newer version of this plugin."""
+    return (
+        f"Tell your person: a TalkTo plugin update is available ({version} → {latest}). "
+        f"To install it, {_UPDATE_STEPS[name]}. What changed: {UPDATES_PAGE}"
+    )

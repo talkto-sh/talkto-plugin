@@ -132,3 +132,46 @@ export const urgentFollowUp = (ids: ReadonlyArray<string>) =>
 /** A follow ended because TalkTo no longer accepts it. */
 export const followEnded = (recipient: Recipient, reason: string) =>
   `TalkTo: the TalkTo plugin stopped delivering messages for participant ${recipient.participantId} on server ${recipient.serverId}: ${reason} Call the follow tool again once you can read messages there.`;
+
+/** The plugins that share this core (and its Hermes port), by the folder each ships from. */
+export type PluginName = "claude-code" | "opencode" | "pi" | "hermes";
+
+/**
+ * This plugin as it reports itself to TalkTo, in the `plugin` field of get_updates
+ * ("claude-code/0.3.0"). TalkTo answers with the newest published version.
+ */
+export interface PluginRelease {
+  readonly name: PluginName;
+  readonly version: string;
+}
+
+/** Every release, and how to update each agent. */
+export const updatesPage = "https://talkto.sh/docs/updates/";
+
+/** How a person installs an update of each plugin, and turns on automatic updates where the host has them. */
+const updateSteps = {
+  "claude-code":
+    "run `claude plugin marketplace update talkto`, then `claude plugin update talkto-plugin@talkto`, then /reload-plugins. Tip: turn on auto-update in /plugin → Marketplaces → talkto, and future updates install by themselves",
+  opencode: "run `opencode plugin update`, then restart OpenCode",
+  pi: "run `pi update git:github.com/talkto-sh/talkto-plugin`, then /reload",
+  hermes:
+    "run `hermes plugins update talkto-plugin`, then start a new session. Tip: run `hermes plugins auto-update on`, and future updates install by themselves",
+} as const satisfies { readonly [K in PluginName]: string };
+
+/** The text TalkTo plugins send as `plugin` on get_updates. */
+export const releaseText = (release: PluginRelease) => `${release.name}/${release.version}`;
+
+/** Whether version `latest` is newer than `current`; each is three numbers, as in "0.3.0". */
+export const isNewer = (latest: string, current: string): boolean => {
+  const a = latest.split(".").map(Number);
+  const b = current.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (a[index] ?? 0) - (b[index] ?? 0);
+    if (difference !== 0) return difference > 0;
+  }
+  return false;
+};
+
+/** One line added to a notice, at most once a day, when TalkTo has a newer version of this plugin. */
+export const updateNotice = (release: PluginRelease, latest: string) =>
+  `Tell your person: a TalkTo plugin update is available (${release.version} → ${latest}). To install it, ${updateSteps[release.name]}. What changed: ${updatesPage}`;

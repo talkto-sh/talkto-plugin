@@ -29,6 +29,7 @@ const world = (answers = []) => {
   let clock = 1_000_000;
   const requests = [];
   const authorizations = [];
+  const plugins = [];
   const deps = {
     load: async () => (state === null ? null : structuredClone(state)),
     save: async (value) => {
@@ -40,6 +41,7 @@ const world = (answers = []) => {
     fetch: async (target, init) => {
       requests.push(target);
       authorizations.push(init.headers.authorization);
+      plugins.push(init.headers["talkto-plugin"]);
       const next = answers.shift() ?? { pending: 0, urgent: 0 };
       if (next instanceof Error) throw next;
       if (Number.isInteger(next))
@@ -59,6 +61,7 @@ const world = (answers = []) => {
     deps,
     requests,
     authorizations,
+    plugins,
     get state() {
       return state;
     },
@@ -502,4 +505,61 @@ test("a hook that writes while the watcher checks wins; the watcher looks again 
   assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: defaults.watchIntervalMs });
   assert.equal(w.state.turnActive, true);
   assert.equal(w.state.cursor, null);
+});
+
+const release = { name: "hooks", version: "0.3.0", steps: "run `update-it`" };
+const updateText =
+  "Tell your person: a TalkTo hooks update is available (0.3.0 → 0.4.0). To install it, run `update-it`. What changed: https://talkto.sh/docs/updates/";
+
+test("each check names the plugin in TalkTo-Plugin; callers without a release send no header", async () => {
+  const w = world([
+    { pending: 0, urgent: 0 },
+    { pending: 0, urgent: 0 },
+  ]);
+  linked(w);
+  await handle(hook("stop"), w.deps);
+  assert.equal(w.plugins[0], undefined, "an older caller sends nothing new");
+  w.deps.release = release;
+  w.tick(defaults.promptIntervalMs);
+  await handle(hook("stop"), w.deps);
+  assert.equal(w.plugins[1], "hooks/0.3.0");
+});
+
+test("a newer version adds one line to what the agent is told anyway, at most once a day", async () => {
+  const w = world([
+    { pending: 0, urgent: 0, latestPluginVersion: "0.4.0" },
+    { pending: 2, urgent: 0, latestPluginVersion: "0.4.0" },
+    { pending: 1, urgent: 0, latestPluginVersion: "0.4.0" },
+    { pending: 1, urgent: 0, latestPluginVersion: "0.4.0" },
+  ]);
+  w.deps.release = release;
+  linked(w);
+  assert.deepEqual(await handle(hook("stop"), w.deps), {}, "a quiet turn end stays quiet");
+  assert.equal(w.state.latestVersion, "0.4.0");
+  w.tick(1);
+  const told = await handle(hook("stop"), w.deps);
+  assert.equal(
+    told.continueWith,
+    `${notices.waiting({ pending: 2, urgent: 0, more: false })} ${updateText}`,
+  );
+  w.tick(1);
+  const again = await handle(hook("stop", { stopActive: true }), w.deps);
+  assert.equal(
+    again.continueWith,
+    notices.waiting({ pending: 1, urgent: 0, more: false }),
+    "not twice in a day",
+  );
+  w.tick(24 * 60 * 60_000);
+  const nextDay = await handle(hook("promptSubmit"), w.deps);
+  assert.ok(nextDay.context?.endsWith(updateText), nextDay.context);
+});
+
+test("no update line when the plugin is current or newer, or the server names an odd version", async () => {
+  for (const latestPluginVersion of ["0.3.0", "0.2.9", "0.4", "soon", null]) {
+    const w = world([{ pending: 1, urgent: 0, latestPluginVersion }]);
+    w.deps.release = release;
+    linked(w);
+    const reply = await handle(hook("stop"), w.deps);
+    assert.equal(reply.continueWith, notices.waiting({ pending: 1, urgent: 0, more: false }));
+  }
 });

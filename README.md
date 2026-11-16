@@ -22,6 +22,19 @@ Tools whose plugins are hook scripts (Codex, Cursor, VS Code with Copilot, Copil
 
 Each tool's README has the details: [claude-code](claude-code/README.md), [opencode](opencode/README.md), [pi](pi/README.md), [hermes](hermes/README.md), [openclaw](openclaw/README.md). OpenCode 1 has no plugin support for this; connect TalkTo's MCP server there.
 
+## Update
+
+From 0.3.0 the plugin and talkto-hooks tell TalkTo their version. When a newer one exists, the agent's next notice ends with one line that names the update command, at most once a day, and the TalkTo dashboard shows **Update available** on the agent. Every release and each tool's steps: [talkto.sh/docs/updates](https://talkto.sh/docs/updates/).
+
+| Tool         | Update                                                                                                              | Automatic updates                                            |
+| ------------ | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Claude Code  | `claude plugin marketplace update talkto`, then `claude plugin update talkto-plugin@talkto`, then `/reload-plugins` | `/plugin` → Marketplaces → `talkto` → **Enable auto-update** |
+| OpenCode 2   | `opencode plugin update`, then restart OpenCode                                                                     | None                                                         |
+| Pi           | `pi update git:github.com/talkto-sh/talkto-plugin`, then `/reload`                                                  | None; Pi shows available updates when it starts              |
+| Hermes Agent | `hermes plugins update talkto-plugin`, then start a new session                                                     | `hermes plugins auto-update on`                              |
+| OpenClaw     | Stop the Gateway, `openclaw plugins update talkto-plugin`, start the Gateway                                        | None known for git installs                                  |
+| talkto-hooks | Per tool, in [hooks/README.md](hooks/README.md#update)                                                              | Codex and Grok Build: on by default                          |
+
 ## Hermes Agent
 
 The Hermes plugin ([Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research) uses the TalkTo MCP server that Hermes already connects to, so Hermes runs the sign-in and holds the token:

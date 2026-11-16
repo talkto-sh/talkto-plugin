@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { decodeUpdates } from "../src/talkto.ts";
-import { followEnded, queuedNotice, urgentNotice } from "../src/notice.ts";
+import { followEnded, isNewer, queuedNotice, updateNotice, urgentNotice } from "../src/notice.ts";
 
 const hermes = new URL("../../hermes/", import.meta.url).pathname;
 const python = process.env.PYTHON ?? "python3";
@@ -103,6 +103,12 @@ const envelopes = [
     paced.data.wakeIntervalSeconds = wakeIntervalSeconds;
     return paced;
   }),
+  // The plugin's newest version, and values a port must refuse the same way.
+  ...["0.4.0", "10.20.30", "0.4", "v0.4.0", 4, null, "0.4.0-beta"].map((latestPluginVersion) => {
+    const versioned = page([message(12)]);
+    versioned.data.latestPluginVersion = latestPluginVersion;
+    return versioned;
+  }),
   { error: { code: "participant_not_found", message: "gone" }, meta: {} },
   { error: {} },
   { data: { messages: [] } },
@@ -152,6 +158,7 @@ const typescript = (item) => {
       checkpoint: reply.page.checkpoint,
       hasMore: reply.page.hasMore,
       wakeIntervalSeconds: reply.page.wakeIntervalSeconds,
+      latestPluginVersion: reply.page.latestPluginVersion,
     },
     queued: queuedNotice(recipient, messages, item.dropped, reply.page.renames),
     urgent: urgentNotice(recipient, messages),
@@ -171,6 +178,28 @@ test("the Hermes port decodes replies and writes notices exactly like the core",
     assert.deepEqual(ported[index], typescript(item), `case ${index}`);
   });
   assert.deepEqual(ported.at(-1).failure.code, "unreadable");
+});
+
+/** Every plugin's update line, and version comparisons, in both languages. */
+const updateCases = ["claude-code", "opencode", "pi", "hermes"].flatMap((name) =>
+  [
+    ["0.3.0", "0.4.0"],
+    ["0.9.0", "0.10.0"],
+    ["1.0.0", "0.99.99"],
+    ["0.3.0", "0.3.0"],
+  ].map(([version, latest]) => ({ name, version, latest })),
+);
+
+test("the Hermes port writes the update line and compares versions exactly like the core", () => {
+  const run = runPython(["conformance.py", "--updates"], JSON.stringify(updateCases));
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(
+    JSON.parse(run.stdout),
+    updateCases.map(({ name, version, latest }) => ({
+      text: updateNotice({ name, version }, latest),
+      newer: isNewer(latest, version),
+    })),
+  );
 });
 
 test("the Hermes plugin's Python tests pass", () => {

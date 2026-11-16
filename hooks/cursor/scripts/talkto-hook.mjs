@@ -26,6 +26,13 @@ import {
 } from "./core.mjs";
 import { hosts } from "./hosts.mjs";
 
+/**
+ * talkto-hooks' version, sent to TalkTo on each check. The release script
+ * (tools/plugin-release.mjs in the TalkTo repository) sets it with the manifests; a test keeps
+ * them equal.
+ */
+export const version = "0.3.0";
+
 /** @type {Record<string, import("./core.mjs").HookEvent["kind"]>} */
 const kinds = {
   "session-start": "sessionStart",
@@ -118,6 +125,7 @@ export const run = async (args, env) => {
       saveCommand: saveCommand(hostName, parsed.sessionId),
       quietStart: env.TALKTO_HOOKS_QUIET_START === "1",
       idleNote: host.idleNote(script),
+      release: { name: "hooks", version, steps: host.updateSteps },
     },
   );
   return host.render(parsed, reply);
@@ -189,6 +197,7 @@ export const watch = async (args, env, say) => {
     saveCommand: saveCommand(hostName, watcher.sessionId),
     quietStart: true,
     idleNote: host.idleNote(script),
+    release: /** @type {const} */ ({ name: "hooks", version, steps: host.updateSteps }),
   };
   say(notices.watching());
   try {

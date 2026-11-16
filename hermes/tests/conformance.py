@@ -63,6 +63,7 @@ def run(case: dict) -> dict:
             "checkpoint": reply.checkpoint,
             "hasMore": reply.has_more,
             "wakeIntervalSeconds": reply.wake_interval_seconds,
+            "latestPluginVersion": reply.latest_plugin_version,
         },
         "queued": notice.queued_notice(recipient, messages, case["dropped"], reply.renames),
         "urgent": notice.urgent_notice(recipient, messages),
@@ -70,4 +71,15 @@ def run(case: dict) -> dict:
     }
 
 
-json.dump([run(case) for case in json.load(sys.stdin)], sys.stdout, ensure_ascii=False)
+def update(case: dict) -> dict:
+    return {
+        "text": notice.update_notice(case["name"], case["version"], case["latest"]),
+        "newer": notice.is_newer(case["latest"], case["version"]),
+    }
+
+
+cases = json.load(sys.stdin)
+if "--updates" in sys.argv:
+    json.dump([update(case) for case in cases], sys.stdout, ensure_ascii=False)
+else:
+    json.dump([run(case) for case in cases], sys.stdout, ensure_ascii=False)

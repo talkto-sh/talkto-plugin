@@ -98,6 +98,9 @@ class UpdatesPage:
     wake_interval_seconds: Optional[int] = None
     #: Renames since the checkpoint; empty from a server that does not send them.
     renames: tuple[ParticipantRename, ...] = ()
+    #: The newest published version of this plugin, as in "0.3.0", when the call named the plugin
+    #: and the server knows it. None from a server that does not send it.
+    latest_plugin_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,8 @@ def _list(fields: Mapping[str, Any], key: str) -> list[Any]:
 
 
 _AGENT_TYPE = re.compile(r" \(.*\)$")
+#: A plugin version: three numbers, as in "0.3.0".
+VERSION_PATTERN = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")
 _MESSAGE_FIELDS = ("id", "conversationId", "senderId", "createdAt", "body")
 
 
@@ -230,6 +235,7 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
             )
         )
     interval = data.get("wakeIntervalSeconds")
+    latest = _text(data, "latestPluginVersion")
     return UpdatesPage(
         messages=tuple(messages),
         checkpoint=checkpoint,
@@ -242,4 +248,7 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
             else None
         ),
         renames=_renames(data),
+        latest_plugin_version=(
+            latest if latest is not None and VERSION_PATTERN.fullmatch(latest) else None
+        ),
     )

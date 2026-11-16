@@ -33,7 +33,16 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Sequence, Union
 
-from .notice import BODY_LIMIT, follow_ended, queued_notice, urgent_notice
+from .notice import (
+    BODY_LIMIT,
+    follow_ended,
+    is_newer,
+    queued_notice,
+    release_text,
+    update_notice,
+    urgent_notice,
+)
+from .version import VERSION
 from .talkto import (
     IncomingMessage,
     ParticipantRename,
@@ -67,6 +76,10 @@ REARM_MILLIS = 1000
 CONFIRM_MILLIS = 30_000
 #: Longest wait between polls after repeated failures.
 _BACKOFF_LIMIT_MILLIS = 5 * 60 * 1000
+#: Least time between two notices that mention the same plugin update.
+UPDATE_NOTICE_MILLIS = 24 * 60 * 60 * 1000
+#: This plugin, as it names itself to TalkTo on every get_updates call.
+PLUGIN_NAME = "hermes"
 #: Failures that mean the follow can never work again as it stands.
 _PERMANENT = frozenset(
     {
@@ -257,6 +270,8 @@ class _Snapshot:
 
     notes: int
     ids: frozenset[str]
+    #: When it was sent, if it carried the plugin update line.
+    update_at: Optional[float] = None
 
 
 @dataclass
@@ -295,6 +310,12 @@ class Inbox:
         self._active_at = 0.0
         #: False once the server rejected waitSeconds (an older deployment).
         self._can_wait = True
+        #: False once the server rejected the ``plugin`` field (before November 16, 2026).
+        self._can_report = True
+        #: The newest version of this plugin, from the latest page that said.
+        self._latest_version: Optional[str] = None
+        #: When a notice last carried the update line; None before the first.
+        self._update_notice_at: Optional[float] = None
         self._chained = False
         self._submitting = False
         self._submitted: Optional[_Submitted] = None
@@ -315,11 +336,13 @@ class Inbox:
 
     def restore(self) -> None:
         """Restores what this session followed and queued before a reload or restart."""
-        decoded = read_saved(self._host.load())
+        stored = self._host.load()
+        decoded = read_saved(stored)
         if decoded is None:
             return
         with self._lock:
             self._follows, self._notes = decoded
+            self._update_notice_at = _update_notice_at(stored)
         if self._follows:
             self._host.after(0, self.tick)
 
@@ -351,7 +374,7 @@ class Inbox:
             ):
                 return f"This session already follows {FOLLOW_LIMIT} participants. Call unfollow for one first."
         try:
-            answer = self._read(
+            answer = self._updates(
                 {
                     "serverId": given.server_id,
                     "participantId": given.participant_id,
@@ -359,7 +382,8 @@ class Inbox:
                     "channelIds": list(given.channel_ids),
                     "directChats": given.direct_chats,
                     "startAt": given.start_at,
-                }
+                },
+                0,
             )
         except TransportError as cause:
             return f"Could not reach TalkTo ({cause}). {self._host.connection_hint} Then call follow again."
@@ -380,6 +404,7 @@ class Inbox:
                 item for item in self._follows if item.server_id != given.server_id
             ] + [follow]
             self._learn_cadence(given.server_id, reply)
+            self._learn_latest(reply)
             self._active_at = self._host.now()
             self._persist()
         self._host.after(0, self.tick)
@@ -434,6 +459,8 @@ class Inbox:
                 lines.append("Queued messages arrive as a turn of their own when the session is idle.")
             else:
                 lines.append("Queued messages arrive with your next prompt.")
+            if self._update_available():
+                lines.append(update_notice(PLUGIN_NAME, VERSION, self._latest_version or ""))
             return "\n".join(lines)
 
     # -- turn events from Hermes's hooks -----------------------------------
@@ -598,21 +625,45 @@ class Inbox:
             current.pop("waitSeconds", None)
 
     def _page(self, follow: Follow, wait: int) -> Answer:
-        base = {
-            "serverId": follow.server_id,
-            "participantId": follow.participant_id,
-            "mode": "poll",
-            "checkpoint": follow.checkpoint,
-        }
+        return self._updates(
+            {
+                "serverId": follow.server_id,
+                "participantId": follow.participant_id,
+                "mode": "poll",
+                "checkpoint": follow.checkpoint,
+            },
+            wait,
+        )
+
+    def _updates(self, args: Mapping[str, Any], wait: int) -> Answer:
+        """One get_updates call with this plugin's name and version, and ``waitSeconds`` when it may
+        wait. An older server refuses fields it does not know (``invalid_input``): it is asked again
+        without ``plugin``, then without ``waitSeconds``, and what it refused is not sent again."""
+        waiting: dict[str, Any] = {"waitSeconds": wait} if wait > 0 else {}
+        if not self._can_report:
+            answer = self._read({**args, **waiting})
+            if wait == 0 or not _refused(answer):
+                return answer
+            with self._lock:
+                self._can_wait = False
+            return self._read(args)
+        reported = self._read({**args, **waiting, "plugin": release_text(PLUGIN_NAME, VERSION)})
+        if not _refused(reported):
+            return reported
+        unreported = self._read({**args, **waiting})
+        if not _refused(unreported):
+            with self._lock:
+                self._can_report = False
+            return unreported
         if wait == 0:
-            return self._read(base)
-        answer = self._read({**base, "waitSeconds": wait})
-        reply = decode_updates(answer.envelope, follow.participant_id)
-        if not isinstance(reply, UpdatesFailure) or reply.code != "invalid_input":
-            return answer
-        with self._lock:
-            self._can_wait = False
-        return self._read(base)
+            return unreported
+        plain = self._read(args)
+        if not _refused(plain):
+            # A server without waitSeconds predates the plugin field too.
+            with self._lock:
+                self._can_wait = False
+                self._can_report = False
+        return plain
 
     def _poll(self, follow: Follow, wait: int) -> bool:
         """Reads one follow's new messages into its queue; False on a failure worth retrying."""
@@ -647,6 +698,22 @@ class Inbox:
         follow.renames = follow.renames[-QUEUE_LIMIT:]
         follow.checkpoint = page.checkpoint
         self._learn_cadence(follow.server_id, page)
+        self._learn_latest(page)
+
+    def _learn_latest(self, page: UpdatesPage) -> None:
+        # A page without the field (an older server, or a call without ``plugin``) leaves what is known.
+        if page.latest_plugin_version is not None:
+            self._latest_version = page.latest_plugin_version
+
+    def _update_available(self) -> bool:
+        """Whether TalkTo said a newer version of this plugin exists."""
+        return self._latest_version is not None and is_newer(self._latest_version, VERSION)
+
+    def _update_due(self, now: float) -> bool:
+        """Whether the next notice should carry the update line: an update exists and a day passed."""
+        return self._update_available() and (
+            self._update_notice_at is None or now - self._update_notice_at >= UPDATE_NOTICE_MILLIS
+        )
 
     def _learn_cadence(self, server_id: str, page: UpdatesPage) -> None:
         # A page without the field (an older server) leaves what is known; none known means none.
@@ -668,8 +735,7 @@ class Inbox:
         if failure.code == "invalid_cursor":
             # The server's history was restored: start again from now and say what may be missing.
             try:
-                restarted = self._host.call(
-                    "get_updates",
+                restarted = self._updates(
                     {
                         "serverId": follow.server_id,
                         "participantId": follow.participant_id,
@@ -677,8 +743,8 @@ class Inbox:
                         "channelIds": list(follow.channel_ids),
                         "directChats": follow.direct_chats,
                         "startAt": "now",
-                        "limit": 1,
                     },
+                    0,
                 )
             except TransportError:
                 return False
@@ -721,7 +787,8 @@ class Inbox:
             # With next-prompt delivery only urgent messages wake an idle session.
             if self._settings.delivery == "next-prompt" and not has_urgent and not self._notes:
                 return
-            text = self._notice_text(frozenset(), renames_alone=False)
+            update = self._update_due(now)
+            text = self._notice_text(frozenset(), renames_alone=False, update=update)
             if text is None:
                 return
             held = 0.0 if has_urgent or self._notes else self._cadence_wait(now)
@@ -731,7 +798,7 @@ class Inbox:
                     self._cadence_timer = True
                     self._host.after(held, self._cadence_due)
                 return
-            snapshot = self._snapshot()
+            snapshot = self._snapshot(now if update else None)
             self._submitting = True
         accepted: Optional[bool]
         try:
@@ -754,15 +821,19 @@ class Inbox:
 
     def _take_for_prompt(self) -> Optional[str]:
         held = self._submitted.snapshot.ids if self._submitted is not None else frozenset()
-        text = self._notice_text(held, renames_alone=True)
+        now = self._host.now()
+        update = self._update_due(now)
+        text = self._notice_text(held, renames_alone=True, update=update)
         if text is None:
             return None
-        snapshot = self._snapshot()
-        self._clear_delivered(_Snapshot(snapshot.notes, snapshot.ids - held))
+        snapshot = self._snapshot(now if update else None)
+        self._clear_delivered(_Snapshot(snapshot.notes, snapshot.ids - held, snapshot.update_at))
         self._persist()
         return text
 
-    def _notice_text(self, without: frozenset[str], renames_alone: bool) -> Optional[str]:
+    def _notice_text(
+        self, without: frozenset[str], renames_alone: bool, update: bool = False
+    ) -> Optional[str]:
         """The combined notice for everything queued except ``without``, or None. Queued renames go
         with any notice; on their own they make one only when ``renames_alone`` (the person's
         prompt carries it)."""
@@ -776,10 +847,16 @@ class Inbox:
                 parts.append(queued_notice(follow, messages, follow.dropped, renames))
         if not waking and not (renames_alone and parts):
             return None
-        return "\n\n---\n\n".join(parts) if parts else None
+        if not parts:
+            return None
+        text = "\n\n---\n\n".join(parts)
+        if update:
+            text += "\n\n" + update_notice(PLUGIN_NAME, VERSION, self._latest_version or "")
+        return text
 
-    def _snapshot(self) -> _Snapshot:
+    def _snapshot(self, update_at: Optional[float] = None) -> _Snapshot:
         return _Snapshot(
+            update_at=update_at,
             notes=len(self._notes),
             ids=frozenset(
                 [m.id for follow in self._follows for m in follow.pending]
@@ -788,6 +865,8 @@ class Inbox:
         )
 
     def _clear_delivered(self, snapshot: _Snapshot) -> None:
+        if snapshot.update_at is not None:
+            self._update_notice_at = snapshot.update_at
         self._notes = self._notes[snapshot.notes :]
         for follow in self._follows:
             follow.pending = [m for m in follow.pending if m.id not in snapshot.ids]
@@ -809,13 +888,30 @@ class Inbox:
         follow.pending = [m for m in entry.messages if m.id not in known] + follow.pending
 
     def _persist(self) -> None:
-        self._host.save(
-            {
-                "version": 1,
-                "follows": [follow.to_json() for follow in self._follows],
-                "notes": list(self._notes),
-            }
-        )
+        saved: dict[str, Any] = {
+            "version": 1,
+            "follows": [follow.to_json() for follow in self._follows],
+            "notes": list(self._notes),
+        }
+        if self._update_notice_at is not None:
+            saved["updateNoticeAt"] = self._update_notice_at
+        self._host.save(saved)
+
+
+def _refused(answer: Answer) -> bool:
+    """Whether TalkTo refused a call's input (``invalid_input``), as a server older than a field does."""
+    reply = decode_updates(answer.envelope, "")
+    return isinstance(reply, UpdatesFailure) and reply.code == "invalid_input"
+
+
+def _update_notice_at(stored: object) -> Optional[float]:
+    """When a saved session last told the agent about a plugin update, or None."""
+    if not isinstance(stored, Mapping):
+        return None
+    value = stored.get("updateNoticeAt")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _parallel(runs: Sequence[Callable[[], bool]]) -> list[bool]:
