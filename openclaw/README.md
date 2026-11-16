@@ -6,7 +6,7 @@ talkto-plugin brings your agents' TalkTo messages into [OpenClaw](https://opencl
 - An **urgent** direct message goes into the agent's running turn. The model reads it at its next step. Senders mark a message urgent with `priority: "urgent"`. This works only in direct chats.
 - The agent still reads and replies with TalkTo's own MCP tools (`get_updates`, `send_message`).
 
-The plugin holds no credential. OpenClaw's MCP client keeps the TalkTo sign-in. The agent calls TalkTo's `create_signal` once through that client, and the plugin saves the link from the result. The link tells only how many messages wait. It cannot read or send messages.
+The plugin holds no credential. OpenClaw's MCP client keeps the TalkTo sign-in. The agent calls TalkTo's `create_signal` once through that client, and the plugin saves the link from the result. The link tells only how many messages wait. It cannot read or send messages. It does not count participant renames, so the plugin never announces one; the agent sees them in the `renames` field the next time it calls `get_updates`.
 
 ## Install
 
@@ -28,7 +28,7 @@ You need OpenClaw 2026.11.3 or later, with the Gateway running.
    openclaw plugins install git:github.com/talkto-sh/talkto-plugin --force --accept-capabilities
    ```
 
-   OpenClaw installs from the root of the repository, so this one line is enough. `--force` accepts a source outside ClawHub. `--accept-capabilities` accepts the plugin's hooks and its background service.
+   OpenClaw installs from the root of the repository, so this one line is enough. The SSH form `git:git@github.com:talkto-sh/talkto-plugin.git` also works. `--force` accepts a source outside ClawHub. `--accept-capabilities` accepts the plugin's hooks and its background service.
 
 3. Restart the Gateway. `openclaw plugins inspect talkto-plugin --runtime` must show `status: loaded`.
 

@@ -13,6 +13,7 @@ import {
   linkFrom,
   notices,
   stateKey,
+  watchStep,
 } from "../src/core.mjs";
 
 const server = "7c1e9a52-3b0f-4c55-9d7e-0d2f3c4b5a61";
@@ -52,6 +53,7 @@ const world = (answers = []) => {
     settings: defaults,
     saveCommand: "node hook save",
     quietStart: false,
+    idleNote: "IDLE NOTE.",
   };
   return {
     deps,
@@ -162,7 +164,10 @@ test("without a link the session start says how to join, once; nothing else spea
   const w = world();
   const start = await handle(hook("sessionStart"), w.deps);
   assert.match(start.context, /create_signal/);
-  assert.match(start.context, /node hook save/);
+  assert.match(
+    start.context,
+    /IDLE NOTE\. If the hook does not confirm the link, save it with: node hook save$/,
+  );
   for (const kind of ["promptSubmit", "afterTool", "stop"])
     assert.deepEqual(await handle(hook(kind), w.deps), {});
   assert.deepEqual(await handle(hook("sessionStart"), { ...w.deps, quietStart: true }), {});
@@ -251,6 +256,55 @@ test("after a tool only urgent messages speak, at most once per interval; normal
   assert.equal(w.requests.length, 3);
 });
 
+test("the person's wake cadence spaces turn-end continuations; urgent ones always continue", async () => {
+  const every5 = { wakeCadence: "every_5_minutes", wakeIntervalSeconds: 300 };
+  const w = world([
+    { pending: 1, urgent: 0, cursor: message(1), ...every5 },
+    { pending: 1, urgent: 0, cursor: message(2), ...every5 },
+    { pending: 1, urgent: 0, cursor: message(2), ...every5 },
+    { pending: 1, urgent: 1, cursor: message(3), ...every5 },
+    { pending: 1, urgent: 0, cursor: message(4), ...every5 },
+    { pending: 1, urgent: 0, cursor: message(4), ...every5 },
+  ]);
+  linked(w);
+  // The first batch after a quiet period continues at once.
+  assert.ok((await handle(hook("stop"), w.deps)).continueWith);
+  assert.equal(w.state.cursor, message(1));
+  // A minute later the next batch is held: the turn ends, and the cursor stays where it was.
+  w.tick(60_000);
+  assert.deepEqual(await handle(hook("stop"), w.deps), {});
+  assert.equal(w.state.cursor, message(1));
+  assert.equal(w.state.continuations, 0);
+  // The person's next prompt still hears about it.
+  w.tick(defaults.promptIntervalMs);
+  assert.match((await handle(hook("promptSubmit"), w.deps)).context, /1 new message arrived/);
+  assert.equal(w.state.cursor, message(2));
+  // An urgent message continues inside the gap.
+  w.tick(10_000);
+  assert.match((await handle(hook("stop"), w.deps)).continueWith, /1 urgent/);
+  // Once the gap has passed since that wake, a normal batch continues again.
+  assert.deepEqual(await handle(hook("stop"), w.deps), {});
+  w.tick(300_000);
+  assert.ok((await handle(hook("stop"), w.deps)).continueWith);
+});
+
+test("right away, and a server without a cadence, continue for every batch as before", async () => {
+  for (const extra of [{ wakeCadence: "right_away", wakeIntervalSeconds: 0 }, {}]) {
+    const w = world(
+      Array.from({ length: 3 }, (_, n) => ({
+        pending: 1,
+        urgent: 0,
+        cursor: message(n),
+        ...extra,
+      })),
+    );
+    linked(w);
+    assert.ok((await handle(hook("stop"), w.deps)).continueWith);
+    assert.ok((await handle(hook("stop", { stopActive: true }), w.deps)).continueWith);
+    assert.ok((await handle(hook("stop", { stopActive: true }), w.deps)).continueWith);
+  }
+});
+
 test("an idle session hears about waiting messages with the next prompt", async () => {
   const w = world([{ pending: 3, urgent: 0, cursor: message(3), more: true }]);
   linked(w);
@@ -317,4 +371,135 @@ test("state files are private, outside the project, keyed per session, and hold 
   assert.equal((await store.load()).url, url);
   await store.forget();
   assert.equal(await store.load(), null);
+});
+
+test("hooks record whether a turn runs: a prompt or tool step starts it, Stop ends it unless it continues", async () => {
+  const w = world([
+    { pending: 0, urgent: 0 },
+    { pending: 0, urgent: 0 },
+    { pending: 1, urgent: 0, cursor: message(1) },
+  ]);
+  linked(w);
+  assert.equal(w.state.turnActive, false);
+  await handle(hook("afterTool"), w.deps);
+  assert.equal(w.state.turnActive, true);
+  await handle(hook("stop"), w.deps);
+  assert.equal(w.state.turnActive, false);
+  await handle(hook("promptSubmit"), w.deps);
+  assert.equal(w.state.turnActive, true);
+  w.tick(1_000);
+  assert.ok((await handle(hook("stop"), w.deps)).continueWith);
+  assert.equal(w.state.turnActive, true, "a continued turn still runs");
+  // An aborted or failed turn says nothing, but it is over.
+  assert.deepEqual(await handle(hook("stop", { skip: true }), w.deps), {});
+  assert.equal(w.state.turnActive, false);
+  // A link saved from a tool result is saved inside a running turn.
+  w.state = null;
+  const saved = { data: { url, expiresAt: later, signalId: signal } };
+  await handle(hook("afterTool", { toolName: "create_signal", toolResponse: saved }), w.deps);
+  assert.equal(w.state.turnActive, true);
+});
+
+/** A linked world whose last turn ended, as after a Stop. */
+const idleWorld = (answers) => {
+  const w = world(answers);
+  linked(w);
+  w.state = { ...w.state, turnActive: false, turnSeenAt: 1 };
+  return w;
+};
+
+test("the watcher starts a turn while idle, announces each batch once, and stays quiet inside a turn", async () => {
+  const w = idleWorld([
+    { pending: 2, urgent: 0, cursor: message(2) },
+    { pending: 0, urgent: 0, cursor: message(2) },
+  ]);
+  const wake = await watchStep(w.deps);
+  assert.deepEqual(wake, { kind: "wake", notice: notices.waiting({ pending: 2, urgent: 0 }) });
+  // The batch and the turn are claimed before the turn starts.
+  assert.equal(w.state.cursor, message(2));
+  assert.equal(w.state.turnActive, true);
+  assert.equal(w.state.lastWakeAt, 1_000_000);
+  // While that turn runs the watcher never checks: the hooks speak inside a turn.
+  w.tick(60_000);
+  assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: defaults.watchIntervalMs });
+  assert.equal(w.requests.length, 1);
+  // After the turn's Stop, it checks again with the moved cursor.
+  w.state = { ...w.state, turnActive: false, turnSeenAt: w.deps.now() };
+  assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: defaults.watchIntervalMs });
+  assert.match(w.requests[1], new RegExp(`since=${message(2)}`));
+  // Checks are spaced by the watch interval, which the hooks' checks also count toward.
+  assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: defaults.watchIntervalMs });
+  assert.equal(w.requests.length, 2);
+});
+
+test("the watcher holds normal messages for the person's wake cadence; urgent ones start a turn at once", async () => {
+  const every5 = { wakeCadence: "every_5_minutes", wakeIntervalSeconds: 300 };
+  const w = idleWorld([
+    { pending: 1, urgent: 0, cursor: message(1), ...every5 },
+    { pending: 1, urgent: 0, cursor: message(2), ...every5 },
+    { pending: 2, urgent: 1, cursor: message(3), ...every5 },
+  ]);
+  w.state = { ...w.state, lastWakeAt: w.deps.now() - 290_000 };
+  // Ten seconds of the gap remain: wait them out, and keep the cursor.
+  assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: 10_000 });
+  assert.equal(w.state.cursor, null);
+  w.tick(defaults.watchIntervalMs);
+  assert.equal((await watchStep(w.deps)).kind, "wake");
+  // Right after that wake, an urgent message skips the gap.
+  w.state = { ...w.state, turnActive: false };
+  w.tick(defaults.watchIntervalMs);
+  assert.deepEqual(await watchStep(w.deps), {
+    kind: "wake",
+    notice: notices.waiting({ pending: 2, urgent: 1 }),
+  });
+});
+
+test("a Stop that held a batch for the cadence leaves it to the watcher, which wakes once the gap passes", async () => {
+  const every1 = { wakeCadence: "every_minute", wakeIntervalSeconds: 60 };
+  const w = world([
+    { pending: 1, urgent: 0, cursor: message(1), ...every1 },
+    { pending: 1, urgent: 0, cursor: message(2), ...every1 },
+    { pending: 1, urgent: 0, cursor: message(2), ...every1 },
+  ]);
+  linked(w);
+  assert.ok((await handle(hook("stop"), w.deps)).continueWith);
+  w.tick(20_000);
+  assert.deepEqual(await handle(hook("stop", { stopActive: true }), w.deps), {});
+  assert.equal(w.state.turnActive, false);
+  w.tick(40_000);
+  assert.equal((await watchStep(w.deps)).kind, "wake");
+  assert.equal(w.state.cursor, message(2));
+});
+
+test("the watcher stops when there is no link or the link dies, and treats a stale turn as over", async () => {
+  const none = world();
+  assert.deepEqual(await watchStep(none.deps), { kind: "end", notice: notices.watchNoLink() });
+  const dying = idleWorld([404]);
+  assert.deepEqual(await watchStep(dying.deps), { kind: "end", notice: notices.watchDead() });
+  assert.equal(dying.state.deadNoticed, true);
+  assert.deepEqual(await watchStep(dying.deps), { kind: "end", notice: notices.watchDead() });
+  // A turn whose Stop never came (a crash) blocks the watcher only for a while.
+  const stuck = world([{ pending: 1, urgent: 0, cursor: message(1) }]);
+  linked(stuck);
+  stuck.state = { ...stuck.state, turnActive: true, turnSeenAt: stuck.deps.now() };
+  assert.equal((await watchStep(stuck.deps)).kind, "wait");
+  stuck.tick(defaults.turnStaleMs);
+  assert.equal((await watchStep(stuck.deps)).kind, "wake");
+  // Offline: quiet, and it keeps watching.
+  const offline = idleWorld([new Error("offline")]);
+  assert.deepEqual(await watchStep(offline.deps), { kind: "wait", ms: defaults.watchIntervalMs });
+});
+
+test("a hook that writes while the watcher checks wins; the watcher looks again later", async () => {
+  const w = idleWorld([{ pending: 1, urgent: 1, cursor: message(1) }]);
+  const fetch = w.deps.fetch;
+  // A PreInvocation hook starts a turn while the watcher's check is in flight.
+  w.deps.fetch = async (...args) => {
+    const response = await fetch(...args);
+    w.state = { ...w.state, turnActive: true, turnSeenAt: w.deps.now() + 1 };
+    return response;
+  };
+  assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: defaults.watchIntervalMs });
+  assert.equal(w.state.turnActive, true);
+  assert.equal(w.state.cursor, null);
 });

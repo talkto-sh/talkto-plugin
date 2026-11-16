@@ -296,6 +296,61 @@ test("next-prompt delivery rides along with the person's prompt; only urgent wak
   assert.equal(host.submitted.length, 1);
 });
 
+/** A page from a server that reports the person's wake cadence. */
+const paced = (messages, seconds) => {
+  const answer = reply(messages);
+  answer.structuredContent.data.wakeCadence = seconds === 300 ? "every_5_minutes" : "right_away";
+  answer.structuredContent.data.wakeIntervalSeconds = seconds;
+  return answer;
+};
+
+test("the person's wake cadence spaces the turns the inbox starts; urgent ones go at once", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(paced([message()], 300));
+  await inbox.tick();
+  assert.equal(host.submitted.length, 1, "the first batch after a quiet period starts a turn");
+  inbox.onTurnStart("t1");
+  await inbox.onTurnComplete("t1");
+  // A minute later the next batch waits for the rest of the five minutes.
+  await host.advance(60_000);
+  host.answers.push(paced([message()], 300));
+  await inbox.tick();
+  assert.equal(host.submitted.length, 1);
+  assert.equal(host.stored.follows[0].pending.length, 1, "held, still queued and saved");
+  assert.match(inbox.describe(), /at most every 5 minutes/);
+  // An urgent message starts a turn inside the gap, and takes the held one with it.
+  host.answers.push(paced([message({ conversationId: direct, priority: "urgent" })], 300));
+  await inbox.tick();
+  assert.equal(host.submitted.length, 2);
+  assert.match(host.submitted[1], /2 new messages/);
+  inbox.onTurnStart("t2");
+  await inbox.onTurnComplete("t2");
+  // Held normal messages go when the gap since that turn has passed, by the inbox's own timer.
+  host.answers.push(paced([message()], 300));
+  await host.advance(settleMillis);
+  await inbox.tick();
+  assert.equal(host.submitted.length, 2);
+  await host.advance(300_000);
+  assert.equal(host.submitted.length, 3);
+});
+
+test("right away, and a server without a cadence, start a turn for every batch as before", async () => {
+  for (const answer of [(messages) => paced(messages, 0), (messages) => reply(messages)]) {
+    const host = fakeHost();
+    const inbox = await followed(host);
+    for (let turn = 1; turn <= 3; turn++) {
+      host.answers.push(answer([message()]));
+      await inbox.tick();
+      assert.equal(host.submitted.length, turn);
+      inbox.onTurnStart(`t${turn}`);
+      await inbox.onTurnComplete(`t${turn}`);
+      await host.advance(settleMillis);
+    }
+    assert.doesNotMatch(inbox.describe(), /at most every/);
+  }
+});
+
 test("pages are drained in bounded steps and duplicates are not queued twice", async () => {
   const host = fakeHost();
   const inbox = await followed(host);
@@ -521,4 +576,87 @@ test("a server that does not know waitSeconds is asked again without it, and the
   assert.equal(host.stored.follows[0].pending.length, 1);
   await inbox.tick();
   assert.equal("waitSeconds" in polls(host).at(-1).args, false, "later polls do not wait");
+});
+
+/** A page carrying participant renames, as a server with renaming sends it. */
+const withRenames = (messages, renames, options) => {
+  const answer = reply(messages, options);
+  answer.structuredContent.data.renames = renames.map((fields) => ({
+    sequence: 1,
+    participantId: peer,
+    previousName: "planner",
+    name: "planner-ci",
+    renamedAt: "2026-11-15T10:00:00.000Z",
+    renamedBy: { kind: "self" },
+    ...fields,
+  }));
+  return answer;
+};
+
+test("renames alone advance the checkpoint quietly and ride with the next notice", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(withRenames([], [{ id: "r-1" }], { checkpoint: "cp-renamed" }));
+  await inbox.tick();
+  assert.equal(host.stored.follows[0].checkpoint, "cp-renamed");
+  assert.equal(host.stored.follows[0].renames.length, 1, "the rename is saved with the queue");
+  await host.advance(settleMillis);
+  assert.equal(host.submitted.length, 0, "a rename alone never starts a turn");
+
+  // The same rename again (a retried page) is not listed twice.
+  host.answers.push(withRenames([message()], [{ id: "r-1" }, { id: "r-2", name: "planner-2" }]));
+  await inbox.tick();
+  assert.equal(host.submitted.length, 1);
+  const notice = host.submitted[0];
+  assert.match(notice, /1 new message and 2 participant renames for your participant/);
+  assert.match(notice, /- planner is now planner-ci \(renamed itself\) · participantId /);
+  assert.ok(notice.indexOf("Renamed participants") < notice.indexOf("[1] #general"));
+  assert.deepEqual(host.stored.follows[0].renames, [], "delivered renames leave the queue");
+
+  host.answers.push(reply([message()]));
+  await inbox.tick();
+  assert.doesNotMatch(host.submitted[1], /rename/i, "a rename is told once");
+});
+
+test("next-prompt delivery carries queued renames with the person's prompt", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host, { ...settings, delivery: "next-prompt" });
+  host.answers.push(withRenames([], [{ id: "r-1", participantId: me, previousName: "builder" }]));
+  await inbox.tick();
+  assert.equal(host.submitted.length, 0);
+  const context = await inbox.takeForPrompt();
+  assert.match(context, /^TalkTo: 1 participant rename for your participant/);
+  assert.match(context, /- builder \(you\) is now planner-ci/);
+  assert.match(context, /A rename needs no reply/);
+  assert.equal(await inbox.takeForPrompt(), null);
+});
+
+test("a session saved before renames existed restores, and queued renames survive a restart", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  inbox.onTurnStart("t1");
+  host.answers.push(withRenames([message()], [{ id: "r-1" }]));
+  await inbox.tick();
+  const restarted = new Inbox(host, settings);
+  await restarted.restore();
+  host.answers.push(reply([]));
+  await restarted.tick();
+  assert.match(host.submitted[0], /planner is now planner-ci/);
+
+  const old = { version: 1, notes: [], follows: [{ ...host.stored.follows[0] }] };
+  delete old.follows[0].renames;
+  old.follows[0].pending = [];
+  assert.ok(isSaved(old));
+  const legacy = fakeHost();
+  legacy.stored = old;
+  legacy.time = settleMillis * 10;
+  const reloaded = new Inbox(legacy, settings);
+  await reloaded.restore();
+  legacy.answers.push(withRenames([message()], [{ id: "r-9" }]));
+  await reloaded.tick();
+  assert.match(legacy.submitted[0], /1 new message and 1 participant rename/);
+  assert.equal(
+    isSaved({ ...old, follows: [{ ...old.follows[0], renames: [{ id: "r-1" }] }] }),
+    false,
+  );
 });

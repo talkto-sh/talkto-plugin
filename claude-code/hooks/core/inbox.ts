@@ -16,6 +16,12 @@
  * - Urgent messages go INTO a running turn (`Host.inject`), read at the
  *   turn's next model request. If the host reports that the turn ended
  *   before reading it, a short follow-up turn points at it.
+ * - Participant renames on the page (`renames`) wait with the queue and are
+ *   listed at the top of the next notice. They never start a turn on their
+ *   own; with `next-prompt` delivery they ride along with the person's prompt.
+ * - The person's wake cadence (`wakeIntervalSeconds` on each page, chosen on
+ *   the TalkTo dashboard) spaces the turns the inbox starts for normal
+ *   messages. Urgent messages and plugin notes ignore it.
  * - The follow, its checkpoint and the queue are saved in the plugin's store
  *   before anything is delivered, so a crash, restart or compaction neither
  *   loses nor repeats a message.
@@ -31,8 +37,10 @@ import {
   textOf,
   type Fields,
   type IncomingMessage,
+  type ParticipantRename,
   type ToolAnswer,
   type UpdatesFailure,
+  type UpdatesPage,
 } from "./talkto.ts";
 import {
   bodyLimit,
@@ -90,12 +98,19 @@ export interface Follow extends Recipient {
   pending: QueuedMessage[];
   /** Messages that arrived while the queue was full; counted, not kept. */
   dropped: number;
+  /** Renames since the last notice, at most `queueLimit`; they go with the next one. */
+  renames: ParticipantRename[];
+}
+
+/** A follow as stored; one saved before renames were queued has no `renames`. */
+export interface SavedFollow extends Omit<Follow, "renames"> {
+  readonly renames?: ReadonlyArray<ParticipantRename>;
 }
 
 /** What the store keeps for one session. */
 export interface Saved {
   readonly version: 1;
-  readonly follows: ReadonlyArray<Follow>;
+  readonly follows: ReadonlyArray<SavedFollow>;
   readonly notes: ReadonlyArray<string>;
 }
 
@@ -130,6 +145,23 @@ const permanent = new Set([
   "wrong_conversation_kind",
   "invalid_input",
 ]);
+
+/** How the agent hears about messages under these settings: the follow answer's promise. */
+export const deliveryRules = (settings: Settings): string => {
+  const normal =
+    settings.delivery === "idle"
+      ? "New messages wait in a queue and arrive as one notice after you finish a turn"
+      : "New messages wait in a queue and arrive with the person's next prompt";
+  const urgent =
+    settings.urgent === "inject"
+      ? settings.delivery === "idle"
+        ? "urgent direct messages arrive inside your running turn"
+        : "urgent direct messages arrive inside your running turn, or start a turn when you are idle"
+      : settings.delivery === "idle"
+        ? "urgent direct messages wait with the others"
+        : "urgent direct messages arrive as a notice of their own once your turn ends";
+  return `${normal}; ${urgent}.`;
+};
 
 const keep = (message: IncomingMessage): QueuedMessage =>
   message.body.length <= bodyLimit + 1
@@ -169,6 +201,11 @@ export class Inbox {
   private failures = 0;
   private resumeAt = 0;
   private injected: Injected[] = [];
+  /** When this inbox last started a turn of its own; the cadence counts from it. */
+  private lastWakeAt = Number.NEGATIVE_INFINITY;
+  /** Each follow's cadence from its newest page, by server; unknown until the first poll. */
+  private readonly cadence = new Map<string, number>();
+  private cadenceTimer = false;
   /** Messages the agent read itself in the running turn, with get_updates or read_messages. */
   private readInTurn = new Set<string>();
   private readonly host: Host;
@@ -186,6 +223,7 @@ export class Inbox {
     this.follows = saved.follows.map((follow) => ({
       ...follow,
       pending: [...follow.pending],
+      renames: [...(follow.renames ?? [])],
     }));
     this.notes = [...saved.notes];
     this.showStatus();
@@ -212,6 +250,7 @@ export class Inbox {
     const reply = decodeUpdates(answer, input.participantId);
     if (reply.kind === "failure")
       return `TalkTo refused the follow: ${reply.failure.code}: ${reply.failure.message}`;
+    this.learnCadence(input.serverId, reply.page);
     const follow: Follow = {
       serverId: input.serverId,
       participantId: input.participantId,
@@ -220,6 +259,7 @@ export class Inbox {
       checkpoint: reply.page.checkpoint,
       pending: reply.page.messages.map(keep),
       dropped: 0,
+      renames: [...reply.page.renames],
     };
     this.follows = [...this.follows.filter((item) => !same(item, input)), follow];
     this.activeAt = await this.host.now();
@@ -228,10 +268,10 @@ export class Inbox {
     const waiting = follow.pending.length;
     return [
       `Following participant ${input.participantId} on server ${input.serverId} (${input.channelIds.length} channels, direct chats: ${input.directChats}).`,
-      "New messages wait in a queue and arrive as one notice after you finish a turn; urgent direct messages arrive inside your running turn.",
+      deliveryRules(this.settings),
       "Do not poll get_updates, create watches, or schedule checks for this participant while the plugin follows it.",
       waiting > 0 || reply.page.hasMore
-        ? `${waiting}${reply.page.hasMore ? "+" : ""} earlier messages were found; they arrive after this turn.`
+        ? `${waiting}${reply.page.hasMore ? "+" : ""} earlier messages were found; they arrive ${this.settings.delivery === "idle" ? "after this turn" : "with the person's next prompt"}.`
         : "Nothing is waiting yet.",
     ].join(" ");
   }
@@ -259,6 +299,16 @@ export class Inbox {
         this.settings.delivery === "idle"
           ? ["Queued messages arrive as a turn of their own when the session is idle."]
           : ["Queued messages arrive with your next prompt."],
+      )
+      .concat(
+        this.follows.flatMap((item) => {
+          const ms = this.cadence.get(item.serverId) ?? 0;
+          return ms === 0
+            ? []
+            : [
+                `On server ${item.serverId}, TalkTo starts a turn for new messages at most every ${ms >= 120_000 ? `${ms / 60_000} minutes` : `${ms / 1000} seconds`} (the wake setting on the TalkTo dashboard); urgent ones come at once.`,
+              ];
+        }),
       )
       .join("\n");
   }
@@ -310,7 +360,7 @@ export class Inbox {
    */
   async takeForPrompt(): Promise<string | null> {
     if (this.settings.delivery !== "next-prompt") return null;
-    const text = this.noticeText();
+    const text = this.noticeText(true);
     if (text === null) return null;
     this.clearDelivered(this.snapshot());
     await this.persist();
@@ -406,7 +456,12 @@ export class Inbox {
         follow.pending = follow.pending.slice(over);
         follow.dropped += over;
       }
+      const renamed = new Set(follow.renames.map((rename) => rename.id));
+      for (const rename of reply.page.renames)
+        if (!renamed.has(rename.id)) follow.renames.push(rename);
+      follow.renames = follow.renames.slice(-queueLimit);
       follow.checkpoint = reply.page.checkpoint;
+      this.learnCadence(follow.serverId, reply.page);
       if (!reply.page.hasMore) break;
     }
     return true;
@@ -454,12 +509,19 @@ export class Inbox {
     const hasUrgent = this.follows.some((item) => item.pending.some((message) => message.isUrgent));
     // With next-prompt delivery only urgent messages wake an idle session.
     if (this.settings.delivery === "next-prompt" && !hasUrgent && this.notes.length === 0) return;
-    const text = this.noticeText();
+    const text = this.noticeText(false);
     if (text === null) return;
+    const now = await this.host.now();
+    const held = hasUrgent || this.notes.length > 0 ? 0 : this.cadenceWait(now);
+    if (held > 0) {
+      this.retryAfter(held);
+      return;
+    }
     const snapshot = this.snapshot();
     this.submitting = true;
     try {
       if (await this.host.submit(text)) {
+        this.lastWakeAt = now;
         this.clearDelivered(snapshot);
         await this.persist();
       } else this.heldForInput = true;
@@ -499,22 +561,62 @@ export class Inbox {
     }
   }
 
-  /** The combined notice for everything queued, or null when nothing waits. */
-  private noticeText(): string | null {
+  /** A page without the field (an older server) leaves what is known; none known means none. */
+  private learnCadence(serverId: string, page: UpdatesPage): void {
+    if (page.wakeIntervalSeconds !== null)
+      this.cadence.set(serverId, page.wakeIntervalSeconds * 1000);
+  }
+
+  /**
+   * How long the person's cadence still holds the next turn back: zero once any follow with
+   * queued messages may wake, else the shortest wait among them.
+   */
+  private cadenceWait(now: number): number {
+    const waits = this.follows
+      .filter((item) => item.pending.length > 0 || item.dropped > 0)
+      .map((item) => Math.max(0, this.lastWakeAt + (this.cadence.get(item.serverId) ?? 0) - now));
+    return waits.length === 0 ? 0 : Math.min(...waits);
+  }
+
+  /** Tries delivery again when the cadence allows; one timer at a time. */
+  private retryAfter(ms: number): void {
+    if (this.cadenceTimer) return;
+    this.cadenceTimer = true;
+    this.host.after(ms, async () => {
+      this.cadenceTimer = false;
+      await this.deliver();
+    });
+  }
+
+  /**
+   * The combined notice for everything queued, or null when nothing waits. Queued renames go with
+   * any notice; on their own they make one only when `renamesAlone` (the person's prompt carries it).
+   */
+  private noticeText(renamesAlone: boolean): string | null {
+    const waking =
+      this.notes.length > 0 ||
+      this.follows.some((item) => item.pending.length > 0 || item.dropped > 0);
+    if (!waking && !(renamesAlone && this.follows.some((item) => item.renames.length > 0)))
+      return null;
     const parts = [
       ...this.notes,
       ...this.follows
-        .filter((item) => item.pending.length > 0 || item.dropped > 0)
-        .map((item) => queuedNotice(item, item.pending, item.dropped)),
+        .filter((item) => item.pending.length > 0 || item.dropped > 0 || item.renames.length > 0)
+        .map((item) => queuedNotice(item, item.pending, item.dropped, item.renames)),
     ];
-    return parts.length === 0 ? null : parts.join("\n\n---\n\n");
+    return parts.join("\n\n---\n\n");
   }
 
-  /** What one notice covers, so messages that arrive while it is submitted stay queued. */
+  /** What one notice covers, so messages and renames that arrive while it is submitted stay queued. */
   private snapshot(): Snapshot {
     return {
       notes: this.notes.length,
-      ids: new Set(this.follows.flatMap((item) => item.pending.map((message) => message.id))),
+      ids: new Set(
+        this.follows.flatMap((item) => [
+          ...item.pending.map((message) => message.id),
+          ...item.renames.map((rename) => rename.id),
+        ]),
+      ),
     };
   }
 
@@ -522,6 +624,7 @@ export class Inbox {
     this.notes = this.notes.slice(snapshot.notes);
     for (const follow of this.follows) {
       follow.pending = follow.pending.filter((message) => !snapshot.ids.has(message.id));
+      follow.renames = follow.renames.filter((rename) => !snapshot.ids.has(rename.id));
       follow.dropped = 0;
     }
   }
@@ -553,11 +656,26 @@ const isMessage = (value: unknown): value is QueuedMessage => {
   );
 };
 
-const isFollow = (value: unknown): value is Follow => {
+const isRename = (value: unknown): value is ParticipantRename => {
+  if (!isObject(value)) return false;
+  const fields: Fields = new Map(Object.entries(value));
+  const by = fields.get("by");
+  const actor: Fields | null = isObject(by) ? new Map(Object.entries(by)) : null;
+  return (
+    ["id", "participantId", "previousName", "name"].every((key) => textOf(fields, key) !== null) &&
+    (by === null ||
+      (actor !== null &&
+        (textOf(actor, "kind") === "self" ||
+          (textOf(actor, "kind") === "person" && textOf(actor, "name") !== null))))
+  );
+};
+
+const isFollow = (value: unknown): value is SavedFollow => {
   if (!isObject(value)) return false;
   const fields: Fields = new Map(Object.entries(value));
   const directChats = textOf(fields, "directChats");
   const dropped = fields.get("dropped");
+  const renames = fields.get("renames");
   return (
     textOf(fields, "serverId") !== null &&
     textOf(fields, "participantId") !== null &&
@@ -567,7 +685,9 @@ const isFollow = (value: unknown): value is Follow => {
     listOf(fields, "channelIds").every(isText) &&
     Array.isArray(fields.get("channelIds")) &&
     Array.isArray(fields.get("pending")) &&
-    listOf(fields, "pending").every(isMessage)
+    listOf(fields, "pending").every(isMessage) &&
+    // Absent in a session saved before renames were queued.
+    (renames === undefined || (Array.isArray(renames) && renames.every(isRename)))
   );
 };
 

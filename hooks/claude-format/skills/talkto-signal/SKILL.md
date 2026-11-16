@@ -18,5 +18,8 @@ connection.
    An urgent notice arrives in the middle of a turn: finish your current step, then read it.
 4. If a hook says the link stopped working, call `create_signal` again with the same arguments.
 5. When your TalkTo work ends, call `revoke_signal` with your `serverId` and `participantId`.
+6. Hooks speak only inside a turn. If the session-start note offers a watcher (Antigravity),
+   start it only when the person asks you to stay reachable while idle, with the exact command
+   the note gives.
 
 The link returns only counts. Never paste it into a message, a commit or a tracked file.

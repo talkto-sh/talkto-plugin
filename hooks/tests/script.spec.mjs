@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { calls, cutResult, result, signalResult, transcript, user } from "./agy-transcript.mjs";
+import { fileStore, fresh, stateKey } from "../src/core.mjs";
 
 const script = fileURLToPath(new URL("../src/talkto-hook.mjs", import.meta.url));
 const server = "7c1e9a52-3b0f-4c55-9d7e-0d2f3c4b5a61";
@@ -302,4 +303,142 @@ test("save, status and forget work by hand for hosts that never show the hook a 
   assert.equal(JSON.parse(stop.out).decision, "block");
   await hook(env, ["forget", "claude", "--session", "g1"]);
   assert.match((await hook(env, ["status", "claude", "--session", "g1"])).out, /no signal link/);
+});
+
+/** A stand-in for agy's agent API: records each call, then answers as agy 1.5.9 did, or fails. */
+const fakeAgentApi = async (t) => {
+  const folder = await mkdtemp(join(tmpdir(), "talkto-hook-agentapi-"));
+  t.after(() => rm(folder, { recursive: true, force: true }));
+  const exe = join(folder, "agy");
+  const log = join(folder, "calls.jsonl");
+  await writeFile(
+    exe,
+    [
+      `#!${process.execPath}`,
+      'const { appendFileSync } = require("node:fs");',
+      "appendFileSync(process.env.FAKE_AGENTAPI_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');",
+      "if (process.env.FAKE_AGENTAPI_FAIL === '1') console.log(JSON.stringify({ error: 'ANTIGRAVITY_LS_ADDRESS is not set' }));",
+      "else console.log(JSON.stringify({ response: { sendMessage: { recipientId: process.argv[4], content: process.argv[5] } } }));",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return {
+    exe,
+    log,
+    calls: async () =>
+      (await readFile(log, "utf8").catch(() => ""))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line)),
+  };
+};
+
+/** Start the watcher like an agent's background command; collect its output until it exits. */
+const startWatcher = (env) => {
+  const child = spawn(process.execPath, [script, "watch", "antigravity"], {
+    env: { PATH: process.env.PATH, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", (chunk) => (out += chunk));
+  const exited = new Promise((resolve) => child.on("close", (code) => resolve(code)));
+  return { child, exited, output: () => out.trim() };
+};
+/** @param {() => Promise<boolean>} check */
+const eventually = async (check, ms = 5_000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (await check()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+};
+
+test("Antigravity watcher: starts a turn through agy's agent API while idle, once per batch, one per conversation", async (t) => {
+  const s = await stub(t);
+  const api = await fakeAgentApi(t);
+  const state = await mkdtemp(join(tmpdir(), "talkto-hook-state-"));
+  t.after(() => rm(state, { recursive: true, force: true }));
+  const conversation = "94935fe4-0000-4000-8000-000000000002";
+  const agy = {
+    TALKTO_HOOKS_STATE_DIR: state,
+    ANTIGRAVITY_CONVERSATION_ID: conversation,
+    ANTIGRAVITY_LS_ADDRESS: "localhost:1",
+    ANTIGRAVITY_AGENTAPI_EXE: api.exe,
+    FAKE_AGENTAPI_LOG: api.log,
+  };
+  // Outside an agy command, or before the link is saved, it stops at once and says why.
+  const outside = startWatcher({ TALKTO_HOOKS_STATE_DIR: state });
+  assert.equal(await outside.exited, 0);
+  assert.match(outside.output(), /runs only inside an Antigravity agent's command/);
+  const early = startWatcher(agy);
+  assert.equal(await early.exited, 0);
+  assert.match(early.output(), /no signal link is saved/);
+
+  // The link is saved and the turn that saved it has ended.
+  const key = stateKey("antigravity", conversation, null);
+  await fileStore(state, key).save({
+    ...fresh(s.url, signal, "2030-01-01T00:00:00.000Z"),
+    turnSeenAt: 1,
+  });
+  s.answers.push({ pending: 2, urgent: 0, cursor: message });
+  const first = startWatcher(agy);
+  t.after(() => first.child.kill("SIGKILL"));
+  assert.ok(await eventually(async () => (await api.calls()).length === 1));
+  assert.deepEqual(await api.calls(), [
+    [
+      "agentapi",
+      "send-message",
+      conversation,
+      "TalkTo: 2 new messages. Call get_updates to read them, then carry on.",
+    ],
+  ]);
+  assert.match(first.output(), /^TalkTo watcher running for this conversation\./);
+  // The batch is claimed: the hooks will not announce it again.
+  const saved = JSON.parse(await readFile(join(state, `${key}.json`), "utf8"));
+  assert.equal(saved.cursor, message);
+  assert.equal(saved.turnActive, true);
+  assert.equal(s.authorizations.at(-1), `Bearer ${secret}`);
+
+  // A second watcher for the same conversation stops at once.
+  const second = startWatcher(agy);
+  assert.equal(await second.exited, 0);
+  assert.match(second.output(), /already running/);
+  // Killing the task (as /tasks or a stopped background task does) ends it and frees the conversation.
+  first.child.kill("SIGTERM");
+  assert.equal(await first.exited, 0);
+  assert.deepEqual(
+    (await readdir(state)).filter((name) => name.endsWith(".watch")),
+    [],
+  );
+});
+
+test("Antigravity watcher: when agy refuses the message, the watcher exits with the notice instead", async (t) => {
+  const s = await stub(t);
+  const api = await fakeAgentApi(t);
+  const state = await mkdtemp(join(tmpdir(), "talkto-hook-state-"));
+  t.after(() => rm(state, { recursive: true, force: true }));
+  const conversation = "94935fe4-0000-4000-8000-000000000003";
+  const key = stateKey("antigravity", conversation, null);
+  await fileStore(state, key).save({
+    ...fresh(s.url, signal, "2030-01-01T00:00:00.000Z"),
+    turnSeenAt: 1,
+  });
+  s.answers.push({ pending: 1, urgent: 1, cursor: message });
+  const watcher = startWatcher({
+    TALKTO_HOOKS_STATE_DIR: state,
+    ANTIGRAVITY_CONVERSATION_ID: conversation,
+    ANTIGRAVITY_LS_ADDRESS: "localhost:1",
+    ANTIGRAVITY_AGENTAPI_EXE: api.exe,
+    FAKE_AGENTAPI_LOG: api.log,
+    FAKE_AGENTAPI_FAIL: "1",
+  });
+  assert.equal(await watcher.exited, 0);
+  // A finished background task reaches the agent too, so the notice still arrives.
+  assert.match(
+    watcher.output(),
+    /TalkTo: 1 new message, 1 urgent\. Call get_updates to read it, then carry on\. \(The TalkTo watcher could not start a turn/,
+  );
+  assert.deepEqual(await readdir(state), [`${key}.json`]);
 });

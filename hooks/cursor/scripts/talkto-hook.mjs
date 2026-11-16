@@ -5,7 +5,12 @@
 // and an agent whose host never shows the hook a tool result can save a link by hand:
 //   node talkto-hook.mjs save <host> [--session <id>] [--cwd <dir>] <signal link>
 //   node talkto-hook.mjs status|forget <host> [--session <id>] [--cwd <dir>]
+// On Antigravity the agent can also start the idle watcher as a background task, which starts a
+// turn while the agent is idle (only when the person asks for it):
+//   node talkto-hook.mjs watch antigravity
 // It always exits 0 and prints nothing on any failure: a hook must never break the agent's turn.
+import { open, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   fieldsOf,
@@ -17,6 +22,7 @@ import {
   settingsFrom,
   stateDirectory,
   stateKey,
+  watchStep,
 } from "./core.mjs";
 import { hosts } from "./hosts.mjs";
 
@@ -89,7 +95,8 @@ export const run = async (args, env) => {
     const found = link === undefined ? null : linkPattern.exec(link);
     if (found === null || found[1] === undefined || found[0] !== link)
       return "TalkTo: that is not a signal link from create_signal.";
-    await store.save(fresh(found[0], found[1], null));
+    // The agent saves by hand inside a turn.
+    await store.save(fresh(found[0], found[1], null, Date.now()));
     return notices.saved();
   }
   const kind = kinds[command];
@@ -110,12 +117,106 @@ export const run = async (args, env) => {
       settings: settingsFrom(env),
       saveCommand: saveCommand(hostName, parsed.sessionId),
       quietStart: env.TALKTO_HOOKS_QUIET_START === "1",
+      idleNote: host.idleNote(script),
     },
   );
   return host.render(parsed, reply);
 };
 
-if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1])
+/** @param {number} ms */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/** @param {number} pid */
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * One watcher per session: a lock file next to the state file holds the running watcher's PID.
+ * @param {string} path @returns {Promise<boolean>} Whether this process now holds it.
+ */
+const lock = async (path) => {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const file = await open(path, "wx", 0o600);
+      await file.writeFile(String(process.pid));
+      await file.close();
+      return true;
+    } catch {
+      const holder = Number(await readFile(path, "utf8").catch(() => ""));
+      if (Number.isInteger(holder) && holder > 0 && alive(holder)) return false;
+      await rm(path, { force: true });
+    }
+  }
+  return false;
+};
+
+/**
+ * The idle watcher: runs until the session ends, the link dies or it is killed. Every line it
+ * prints is for the agent, which reads its task's output; it prints at start and at the end only.
+ * @param {ReadonlyArray<string>} args @param {NodeJS.ProcessEnv} env
+ * @param {(line: string) => void} say
+ */
+export const watch = async (args, env, say) => {
+  const hostName = args[1];
+  const host = hostName === undefined ? undefined : hosts[hostName];
+  const watcher = host?.watcher?.(env) ?? null;
+  if (host === undefined || hostName === undefined || watcher === null)
+    return say(notices.watchUnsupported());
+  const directory = stateDirectory(env);
+  const key = stateKey(hostName, option(args, "--session") ?? watcher.sessionId, null);
+  const store = fileStore(directory, key);
+  if ((await store.load()) === null) return say(notices.watchNoLink());
+  const lockPath = join(directory, `${key}.watch`);
+  if (!(await lock(lockPath))) return say(notices.watchTwice());
+  const release = () => rm(lockPath, { force: true }).catch(() => {});
+  let stopped = false;
+  for (const signal of /** @type {const} */ (["SIGTERM", "SIGINT", "SIGHUP"]))
+    process.on(signal, () => {
+      stopped = true;
+      release().finally(() => process.exit(0));
+    });
+  const parent = process.ppid;
+  const deps = {
+    ...store,
+    fetch: (/** @type {string} */ url, /** @type {RequestInit} */ init) => fetch(url, init),
+    now: () => Date.now(),
+    settings: settingsFrom(env),
+    saveCommand: saveCommand(hostName, watcher.sessionId),
+    quietStart: true,
+    idleNote: host.idleNote(script),
+  };
+  say(notices.watching());
+  try {
+    // The host ends its background tasks when it exits; an orphaned watcher stops by itself.
+    while (!stopped && process.ppid === parent) {
+      const step = await watchStep(deps);
+      if (step.kind === "end") {
+        if (step.notice !== null) say(step.notice);
+        return;
+      }
+      if (step.kind === "wake" && !(await watcher.deliver(step.notice))) {
+        // Exiting is the fallback: a finished background task reaches the agent too.
+        say(notices.watchFailed(step.notice));
+        return;
+      }
+      if (step.kind === "wait") await sleep(step.ms);
+    }
+  } finally {
+    await release();
+  }
+};
+
+const main = process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+if (main && process.argv[2] === "watch")
+  watch(process.argv.slice(2), process.env, (line) => process.stdout.write(`${line}\n`))
+    .catch(() => {})
+    .finally(() => process.exit(0));
+else if (main)
   run(process.argv.slice(2), process.env)
     .then((output) => {
       if (output !== "") process.stdout.write(`${output}\n`);

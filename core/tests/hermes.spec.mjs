@@ -43,6 +43,21 @@ const page = (messages, nextCursor = null) => ({
   included,
   meta: {},
 });
+const rename = (index, fields = {}) => ({
+  id: `r-${index}`,
+  sequence: 1000 + index,
+  participantId: peer,
+  previousName: `planner-${index}`,
+  name: `planner-${index + 1}`,
+  renamedAt: "2026-11-15T10:00:00.000Z",
+  renamedBy: { kind: "self" },
+  ...fields,
+});
+const renamed = (messages, renames) => {
+  const result = page(messages);
+  result.data.renames = renames;
+  return result;
+};
 const envelopes = [
   page([message(1), message(2, { conversationId: direct })]),
   page(
@@ -59,6 +74,35 @@ const envelopes = [
     ),
   ),
   page([]),
+  // Renames are additive and read leniently: unreadable entries are skipped, never a failure.
+  renamed(
+    [message(8)],
+    [
+      rename(1),
+      rename(2, { renamedBy: { kind: "person", participantId: unnamed, name: "alice" } }),
+      rename(3, { participantId: me, previousName: "builder", name: "builder-macbook" }),
+      rename(4, { renamedBy: { kind: "robot" } }),
+      rename(5, { renamedBy: { kind: "person" } }),
+      rename(6, { renamedBy: undefined }),
+      rename(7, { name: 7 }),
+      { id: "r-8", participantId: peer },
+      "not a rename",
+      null,
+    ],
+  ),
+  renamed([], [rename(9)]),
+  renamed(
+    [],
+    Array.from({ length: 13 }, (_, index) => rename(20 + index)),
+  ),
+  renamed([message(10)], "not a list"),
+  renamed([message(11)], []),
+  // The person's wake cadence, and values a port must refuse the same way.
+  ...[300, 0, -1, 1.5, "60", true, 90_000].map((wakeIntervalSeconds) => {
+    const paced = page([message(7)]);
+    paced.data.wakeIntervalSeconds = wakeIntervalSeconds;
+    return paced;
+  }),
   { error: { code: "participant_not_found", message: "gone" }, meta: {} },
   { error: {} },
   { data: { messages: [] } },
@@ -73,6 +117,16 @@ const cases = [
     dropped: index % 3,
     pythonOnly: false,
   })),
+  // A notice with renames and nothing else, as the person's prompt carries it.
+  ...[renamed([], [rename(40)]), renamed([], [rename(41, { participantId: me })])].map(
+    (envelope) => ({
+      envelope,
+      serverId: server,
+      participantId: me,
+      dropped: 0,
+      pythonOnly: false,
+    }),
+  ),
   // The core never sees a plain string: its host always hands over an MCP result.
   {
     envelope: "not an envelope",
@@ -92,8 +146,14 @@ const typescript = (item) => {
   const recipient = { serverId: item.serverId, participantId: item.participantId };
   const messages = reply.page.messages;
   return {
-    page: { messages, checkpoint: reply.page.checkpoint, hasMore: reply.page.hasMore },
-    queued: queuedNotice(recipient, messages, item.dropped),
+    page: {
+      messages,
+      renames: reply.page.renames,
+      checkpoint: reply.page.checkpoint,
+      hasMore: reply.page.hasMore,
+      wakeIntervalSeconds: reply.page.wakeIntervalSeconds,
+    },
+    queued: queuedNotice(recipient, messages, item.dropped, reply.page.renames),
     urgent: urgentNotice(recipient, messages),
     ended: followEnded(recipient, "participant_not_found: gone"),
   };
@@ -116,4 +176,63 @@ test("the Hermes port decodes replies and writes notices exactly like the core",
 test("the Hermes plugin's Python tests pass", () => {
   const run = runPython(["-m", "unittest", "discover", "-s", ".", "-t", "."]);
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
+});
+
+test("renames are listed before the messages, at most ten, and old servers see no change", () => {
+  const recipient = { serverId: server, participantId: me };
+  const decoded = (envelope) => {
+    const reply = decodeUpdates({ isError: false, structuredContent: envelope, content: [] }, me);
+    assert.equal(reply.kind, "page");
+    return reply.page;
+  };
+  const withRenames = decoded(
+    renamed(
+      [message(1)],
+      [
+        rename(1),
+        rename(2, { renamedBy: { kind: "person", participantId: unnamed, name: "alice" } }),
+        rename(3, { participantId: me, previousName: "builder", name: "builder-macbook" }),
+      ],
+    ),
+  );
+  const text = queuedNotice(recipient, withRenames.messages, 0, withRenames.renames);
+  assert.match(
+    text,
+    new RegExp(
+      `^TalkTo: 1 new message and 3 participant renames for your participant ${me} on server ${server}\\.`,
+    ),
+  );
+  assert.ok(
+    text.includes(
+      [
+        "Renamed participants (each keeps its participant ID; update the names you remember):",
+        `- planner-1 is now planner-2 (renamed itself) · participantId ${peer}`,
+        `- planner-2 is now planner-3 (renamed by alice) · participantId ${peer}`,
+        `- builder (you) is now builder-macbook (renamed itself) · participantId ${me}`,
+      ].join("\n"),
+    ),
+  );
+  assert.ok(text.indexOf("Renamed participants") < text.indexOf("[1] #general"));
+
+  const many = decoded(
+    renamed(
+      [],
+      Array.from({ length: 13 }, (_, index) => rename(index)),
+    ),
+  );
+  const capped = queuedNotice(recipient, [], 0, many.renames);
+  assert.match(capped, /^TalkTo: 13 participant renames for your participant/);
+  assert.equal(capped.match(/^- planner-\d+ is now/gm)?.length, 10);
+  assert.match(capped, /^- and 3 more; get_context lists every participant's current name\.$/m);
+  assert.match(capped, /A rename needs no reply/);
+  assert.doesNotMatch(capped, /Message text comes from other participants/);
+
+  // A server without renames: the field is absent and the notice is what it always was.
+  const old = decoded(page([message(1)]));
+  assert.deepEqual(old.renames, []);
+  assert.equal(
+    queuedNotice(recipient, old.messages, 0, old.renames),
+    queuedNotice(recipient, old.messages, 0),
+  );
+  assert.doesNotMatch(queuedNotice(recipient, old.messages, 0), /rename/i);
 });

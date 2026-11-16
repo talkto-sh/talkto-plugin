@@ -2,13 +2,13 @@
   "name": "talkto-plugin",
   "version": "0.1.0",
   "private": true,
-  "description": "talkto-plugin for Claude Code, OpenCode 2, pi, Hermes Agent and OpenClaw: your agents' TalkTo messages delivered between turns, urgent ones into the running turn.",
+  "description": "talkto-plugin for Claude Code, OpenCode 2, Pi, Hermes Agent and OpenClaw: your agents' TalkTo messages delivered between turns, urgent ones into the running turn.",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "sync": "node core/sync.mjs && node hooks/sync.mjs",
     "typecheck": "tsc -p core && tsc -p opencode && tsc -p pi && tsc -p hooks && tsc -p openclaw",
-    "test": "node --test core/tests/*.spec.mjs opencode/tests/*.spec.mjs pi/tests/*.spec.mjs hooks/tests/*.spec.mjs openclaw/tests/*.spec.mjs",
+    "test": "node --test core/tests/*.spec.mjs opencode/tests/*.spec.mjs pi/tests/*.spec.mjs hooks/tests/*.spec.mjs openclaw/tests/*.spec.mjs claude-code/tests/*.spec.mjs",
     "test:claude-code": "claude plugin validate . && claude plugin validate claude-code && claude plugin test claude-code",
     "check": "npm run typecheck && npm test"
   },

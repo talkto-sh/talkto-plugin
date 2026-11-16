@@ -2,6 +2,7 @@
 // Thin per-host adapters: parse a host's hook input into a HookEvent, and render a Reply as that
 // host's documented output. Sources are listed in the README, per host.
 
+import { execFile } from "node:child_process";
 import { open } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { fieldsOf, isNumber, isText, linkPattern } from "./core.mjs";
@@ -20,7 +21,23 @@ import { fieldsOf, isNumber, isText, linkPattern } from "./core.mjs";
  * @property {(kind: Kind, input: Record<string, unknown>) => Promise<SignalLink | null>} [findLink]
  *   For a host whose hook input never carries the tool result: find the newest create_signal
  *   result some other way. It may throw; the caller treats that as nothing found.
+ * @property {(script: string) => string} idleNote The session-start sentence on what happens to
+ *   messages while the agent is idle on this host. It must say only what this host really does.
+ * @property {(env: NodeJS.ProcessEnv) => Watcher | null} [watcher] For a host where a process
+ *   beside the session can start a turn in it: how, from the environment the host gives the
+ *   agent's commands. Null when that environment is missing.
  */
+
+/**
+ * @typedef {object} Watcher
+ * @property {string} sessionId The session the watcher serves, as the hooks key it.
+ * @property {(notice: string) => Promise<boolean>} deliver Start a turn with the notice; false
+ *   when the host refused or could not be reached.
+ */
+
+/** Hosts whose hooks only run inside a turn: nothing can start one while the agent is idle. */
+const turnOnly = () =>
+  "While you are idle, nothing here can start a turn: messages that arrive then wait until your next turn.";
 
 /** @param {unknown} value @returns {string | null} */
 const text = (value) => (isText(value) && value.length > 0 ? value : null);
@@ -92,6 +109,7 @@ export const claude = {
         input.reason !== "",
     }),
   render: claudeRender,
+  idleNote: turnOnly,
 };
 
 /** Codex uses Claude Code's format, with no continuation cap of its own; core caps it. */
@@ -105,6 +123,7 @@ export const codex = { ...claude, name: "codex" };
  */
 export const cursor = {
   name: "cursor",
+  idleNote: turnOnly,
   parse: (kind, input) => {
     const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
     return event(kind, {
@@ -133,6 +152,7 @@ export const cursor = {
  */
 export const copilot = {
   name: "copilot",
+  idleNote: turnOnly,
   parse: (kind, input) => {
     const result = input.toolResult ?? input.tool_result;
     const stopReason = input.stopReason ?? input.stop_reason;
@@ -161,6 +181,7 @@ export const copilot = {
  */
 export const gemini = {
   name: "gemini",
+  idleNote: turnOnly,
   parse: (kind, input, env) =>
     event(kind, {
       sessionId: first(input, ["session_id"]) ?? text(env.GEMINI_SESSION_ID),
@@ -324,6 +345,36 @@ const antigravityLink = async (input) => {
  */
 export const antigravity = {
   name: "antigravity",
+  idleNote: (script) =>
+    `While you are idle, messages wait for your next turn, unless the TalkTo watcher runs. Start it only when the person asks you to stay reachable while idle, after the hook confirms the link: run \`node "${script}" watch antigravity\` with run_command as a background task (WaitMsBeforeAsync 3000). If the sandbox blocks node, run it again with BypassSandbox so the person can allow it once. While you are idle it starts a turn in this conversation when messages wait. The person sees your reply in their window, but not the notice. It stops when Antigravity closes or its background task is stopped.`,
+  watcher: (env) => {
+    const conversation = text(env.ANTIGRAVITY_CONVERSATION_ID);
+    if (conversation === null || text(env.ANTIGRAVITY_LS_ADDRESS) === null) return null;
+    // agy names itself in ANTIGRAVITY_AGENTAPI_EXE; Antigravity's sidecars get `agentapi` on PATH.
+    const exe = text(env.ANTIGRAVITY_AGENTAPI_EXE);
+    const file = exe ?? "agentapi";
+    const prefix = exe === null ? [] : ["agentapi"];
+    return {
+      sessionId: conversation,
+      deliver: (notice) =>
+        new Promise((resolve) => {
+          execFile(
+            file,
+            [...prefix, "send-message", conversation, notice],
+            { env, timeout: 15_000, encoding: "utf8", maxBuffer: 64 * 1024 },
+            (error, stdout) => {
+              if (error !== null) return resolve(false);
+              try {
+                const reply = fieldsOf(JSON.parse(stdout));
+                resolve(reply !== null && reply.has("response") && !reply.has("error"));
+              } catch {
+                resolve(false);
+              }
+            },
+          );
+        }),
+    };
+  },
   parse: (kind, input) => {
     const paths = Array.isArray(input.workspacePaths) ? input.workspacePaths : [];
     const toolName = text(fieldsOf(input.toolCall)?.get("name"));

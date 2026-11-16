@@ -52,10 +52,52 @@ class IncomingMessage:
 
 
 @dataclass(frozen=True)
+class ParticipantRename:
+    """One participant's name change. The participant keeps its ID; only its name changed."""
+
+    id: str
+    participant_id: str
+    previous_name: str
+    name: str
+    #: "self" (an agent operation for that participant), "person", or None when the server
+    #: named nobody this plugin understands.
+    by_kind: Optional[str]
+    #: The person's name when ``by_kind`` is "person", else None.
+    by_name: Optional[str]
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_json(value: object) -> Optional["ParticipantRename"]:
+        """A rename this plugin saved, or None when the value is not one."""
+        if not isinstance(value, Mapping):
+            return None
+        texts = ("id", "participant_id", "previous_name", "name")
+        if not all(isinstance(value.get(key), str) for key in texts):
+            return None
+        by_kind, by_name = value.get("by_kind"), value.get("by_name")
+        if not (
+            (by_kind is None and by_name is None)
+            or (by_kind == "self" and by_name is None)
+            or (by_kind == "person" and isinstance(by_name, str))
+        ):
+            return None
+        return ParticipantRename(
+            **{key: value[key] for key in texts}, by_kind=by_kind, by_name=by_name
+        )
+
+
+@dataclass(frozen=True)
 class UpdatesPage:
     messages: tuple[IncomingMessage, ...]
     checkpoint: str
     has_more: bool
+    #: The person's wake cadence: start an idle turn for normal messages at most this often.
+    #: None from a server that does not send it, which keeps the old behavior.
+    wake_interval_seconds: Optional[int] = None
+    #: Renames since the checkpoint; empty from a server that does not send them.
+    renames: tuple[ParticipantRename, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +128,39 @@ def _list(fields: Mapping[str, Any], key: str) -> list[Any]:
 
 _AGENT_TYPE = re.compile(r" \(.*\)$")
 _MESSAGE_FIELDS = ("id", "conversationId", "senderId", "createdAt", "body")
+
+
+def _renames(data: Mapping[str, Any]) -> tuple[ParticipantRename, ...]:
+    """The page's renames, read leniently: the field is additive, so an entry this plugin cannot
+    read is skipped rather than failing the page and its messages."""
+    renames: list[ParticipantRename] = []
+    for entry in _list(data, "renames"):
+        if not isinstance(entry, Mapping):
+            continue
+        rid, participant_id = _text(entry, "id"), _text(entry, "participantId")
+        previous_name, name = _text(entry, "previousName"), _text(entry, "name")
+        if rid is None or participant_id is None or previous_name is None or name is None:
+            continue
+        actor = _fields(entry, "renamedBy")
+        kind = None if actor is None else _text(actor, "kind")
+        person = None if actor is None else _text(actor, "name")
+        by_kind: Optional[str] = None
+        by_name: Optional[str] = None
+        if kind == "self":
+            by_kind = "self"
+        elif kind == "person" and person is not None:
+            by_kind, by_name = "person", person
+        renames.append(
+            ParticipantRename(
+                id=rid,
+                participant_id=participant_id,
+                previous_name=previous_name,
+                name=name,
+                by_kind=by_kind,
+                by_name=by_name,
+            )
+        )
+    return tuple(renames)
 
 
 def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
@@ -154,8 +229,17 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
                 sender=names.get(sender_id, f"participant {sender_id}"),
             )
         )
+    interval = data.get("wakeIntervalSeconds")
     return UpdatesPage(
         messages=tuple(messages),
         checkpoint=checkpoint,
         has_more=_text(data, "nextCursor") is not None,
+        wake_interval_seconds=(
+            interval
+            if isinstance(interval, int)
+            and not isinstance(interval, bool)
+            and 0 <= interval <= 86_400
+            else None
+        ),
+        renames=_renames(data),
     )

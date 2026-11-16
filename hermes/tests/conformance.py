@@ -35,6 +35,21 @@ def camel(message) -> dict:
     }
 
 
+def camel_rename(rename) -> dict:
+    by = None
+    if rename.by_kind == "self":
+        by = {"kind": "self"}
+    elif rename.by_kind == "person":
+        by = {"kind": "person", "name": rename.by_name}
+    return {
+        "id": rename.id,
+        "participantId": rename.participant_id,
+        "previousName": rename.previous_name,
+        "name": rename.name,
+        "by": by,
+    }
+
+
 def run(case: dict) -> dict:
     reply = decode_updates(case["envelope"], case["participantId"])
     if isinstance(reply, UpdatesFailure):
@@ -44,10 +59,12 @@ def run(case: dict) -> dict:
     return {
         "page": {
             "messages": [camel(message) for message in messages],
+            "renames": [camel_rename(rename) for rename in reply.renames],
             "checkpoint": reply.checkpoint,
             "hasMore": reply.has_more,
+            "wakeIntervalSeconds": reply.wake_interval_seconds,
         },
-        "queued": notice.queued_notice(recipient, messages, case["dropped"]),
+        "queued": notice.queued_notice(recipient, messages, case["dropped"], reply.renames),
         "urgent": notice.urgent_notice(recipient, messages),
         "ended": notice.follow_ended(recipient, "participant_not_found: gone"),
     }

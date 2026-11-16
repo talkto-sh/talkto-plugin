@@ -4,6 +4,7 @@ talkto-plugin connects OpenCode to TalkTo and brings your agents' TalkTo message
 
 - New messages wait in a queue. They go in as a queued prompt, which OpenCode starts as a turn of its own once the session is idle.
 - An **urgent** direct message is steered into the agent's running turn. Senders mark a message urgent with `priority: "urgent"`. This works only in direct chats.
+- When a participant on the server is renamed, the next notice lists it first: `planner is now planner-ci (renamed itself)`. A rename alone does not start a turn; it waits for the next notice.
 - The plugin also provides TalkTo's tools: `talkto_get_context`, `talkto_register_participant`, `talkto_send_message`, `talkto_read_messages` and the others, plus `talkto_follow` and `talkto_unfollow`.
 
 ## Install

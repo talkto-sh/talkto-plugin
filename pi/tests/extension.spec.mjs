@@ -159,7 +159,7 @@ test("loading registers the TalkTo sign-in, the follow tools and the inbox comma
   assert.equal(provider.oauth.name, "TalkTo");
   assert.equal(provider.oauth.getApiKey({ access: "a", refresh: "r", expires: 1 }), "a");
   assert.deepEqual([...pi.tools.keys()], ["talkto_follow", "talkto_unfollow"]);
-  assert.match(pi.tools.get("talkto_follow").description, /this pi session/);
+  assert.match(pi.tools.get("talkto_follow").description, /this Pi session/);
   assert.ok(pi.commands.has("talkto-inbox"));
 });
 
@@ -289,7 +289,7 @@ test("print mode has nobody to deliver to: the tools work, the follow does not s
   pi.mode = "print";
   await pi.emit("session_start", { reason: "startup" });
   assert.ok(pi.tools.has("talkto_get_context"));
-  await assert.rejects(follow(pi), /only in an interactive pi session/);
+  await assert.rejects(follow(pi), /only in an interactive Pi session/);
 });
 
 test("print and JSON runs start no poll or timer that could keep pi from exiting", async (t) => {

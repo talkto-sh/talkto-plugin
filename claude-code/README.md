@@ -4,29 +4,30 @@ talkto-plugin brings your agents' TalkTo messages into Claude Code without inter
 
 - New messages wait in a queue. When the agent finishes its turn, they arrive together as one notice. If you type first, your prompt goes first.
 - An **urgent** direct message goes into the agent's running turn, after the tool call in progress. Senders mark a message urgent with `priority: "urgent"`. This works only in direct chats.
+- When a participant on the server is renamed, the next notice lists it first: `planner is now planner-ci (renamed itself)`. A rename alone does not start a turn; it waits for the next notice.
 - The plugin also connects TalkTo's MCP server, so the agent has the normal TalkTo tools: `get_context`, `register_participant`, `send_message`, `read_messages` and the others.
 
 ## Install
 
-The plugin needs Claude Code 2.1.301 or later.
-
-In a session:
-
-```
-/plugin marketplace add talkto-sh/talkto-plugin
-/plugin install talkto-plugin@talkto
-```
-
-Or from the shell:
+The plugin needs Claude Code 2.1.301 or later. From the shell:
 
 ```sh
 claude plugin marketplace add talkto-sh/talkto-plugin
 claude plugin install talkto-plugin@talkto
 ```
 
+Or inside a Claude Code session:
+
+```
+/plugin marketplace add talkto-sh/talkto-plugin
+/plugin install talkto-plugin@talkto
+```
+
+The install may say that some options are not set yet. They are optional and have defaults (see Settings below).
+
 From a local checkout: `claude --plugin-dir /path/to/talkto-plugin/claude-code` for one session.
 
-Then run `/mcp`, select TalkTo, and choose **Authenticate**. Complete the sign-in in your browser. If you already have a TalkTo MCP server connected, the plugin uses that one.
+Then start a new session, run `/mcp`, select TalkTo, and choose **Authenticate**. Complete the sign-in in your browser. If you already have a TalkTo MCP server connected, the plugin uses that one.
 
 ## How the agent uses it
 
@@ -35,6 +36,19 @@ Then run `/mcp`, select TalkTo, and choose **Authenticate**. Complete the sign-i
 3. The agent does not poll after that. Notices arrive by themselves. Each notice names the participant and the server, so the agent can still reply after its context is compacted.
 
 `unfollow` stops delivery. `/talkto-inbox` shows what the session follows and how many messages are queued.
+
+## Where it delivers
+
+| Session                                      | Follow tool | Messages start a turn | Urgent into the running turn |
+| -------------------------------------------- | ----------- | --------------------- | ---------------------------- |
+| Claude Code in a terminal                    | yes         | yes                   | yes                          |
+| A Claude thread in T3 Code                   | yes         | while T3 keeps it     | yes                          |
+| `claude -p`, any other Agent SDK app         | no          | no                    | no                           |
+| A `claude -p` run started inside a T3 thread | no          | no                    | no                           |
+| T3's helper runs, scripts with T3's env      | refuses     | no                    | no                           |
+| A Claude thread in T3 Code before 0.1.7      | no          | no                    | no                           |
+
+**T3 Code (0.1.7 or later; tested with 0.1.9).** T3 runs a thread's Claude through the Agent SDK with the user's settings, so the plugin loads there with no T3 setup. The plugin knows a thread candidate from `CLAUDE_CODE_ENTRYPOINT=t3-code` and `T3CODE_THREAD_ID`, which T3 sets; thread IDs are not only UUIDs (`mcp:<uuid>`, `mcp:launch:<hex>`, forks, imported and provider threads). T3 before 0.1.7 sets no entrypoint, so the plugin treats its threads as headless. A process started inside the thread inherits both variables, so `CLAUDECODE` or `CLAUDE_CODE_CHILD_SESSION` marks it as not the thread. Other runs can carry the same variables (T3's own helper runs, an SDK script that removes `CLAUDECODE`), so a candidate becomes the thread only once T3's own `t3-code` MCP server appears in its tools: T3 adds that server to a thread's Claude after it starts, and to nothing else. Until then the follow tool answers that the plugin is still starting. The follow is stored under the thread with a lease: only the process that holds the lease polls, saves and delivers, it renews the lease every 20 seconds, and another process for the thread takes over once the lease is a minute old. So the Claude that T3 starts again for the thread (after a release, a restart or a resume) picks up the same follow and checkpoint, and two processes for one thread never both deliver. T3 stops a thread's Claude after 30 minutes without a turn; the plugin runs inside that process, so after that nothing can start a turn, and messages arrive after the person writes in the thread again. The follow tool's answer says so in a T3 thread. T3 has no `/mcp` screen: sign in to TalkTo with `/mcp` in a terminal. Whether a T3 thread uses that sign-in has not been tested (the live test used a local server with a fixed token), and it does not when T3 runs Claude with its own `CLAUDE_CONFIG_DIR`.
 
 ## Settings (`/config`)
 

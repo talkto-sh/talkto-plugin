@@ -235,11 +235,11 @@ export const extension =
     pi.registerTool({
       name: "talkto_follow",
       label: "TalkTo follow",
-      description: followDescription("this pi session"),
+      description: followDescription("this Pi session"),
       parameters: followSchema,
       execute: async (_id, params) => {
         if (inbox === null)
-          throw new Error("TalkTo delivers messages only in an interactive pi session.");
+          throw new Error("TalkTo delivers messages only in an interactive Pi session.");
         const read = readFollowInput(new Map(Object.entries(params)));
         return result(read.ok ? await inbox.follow(read.input) : read.problem);
       },
@@ -251,7 +251,7 @@ export const extension =
       parameters: unfollowSchema,
       execute: async (_id, params) => {
         if (inbox === null)
-          throw new Error("TalkTo delivers messages only in an interactive pi session.");
+          throw new Error("TalkTo delivers messages only in an interactive Pi session.");
         return result(await inbox.unfollow(String(params["serverId"] ?? "")));
       },
     });

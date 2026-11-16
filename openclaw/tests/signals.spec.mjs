@@ -260,6 +260,61 @@ test("next-prompt delivery queues without a wake, except for urgent messages", a
   assert.equal(w.notices[1].wake, true);
 });
 
+test("the person's wake cadence spaces wakes: inside the gap the notice waits for a prompt", async () => {
+  const every5 = { wakeCadence: "every_5_minutes", wakeIntervalSeconds: 300 };
+  const w = world(defaults, [{ pending: 1, urgent: 0, cursor: message(1), ...every5 }]);
+  await capture(w);
+  await w.signals.tick();
+  assert.equal(w.notices.at(-1).wake, true, "the first batch after a quiet period wakes");
+  await w.signals.runStarted(session, "run-1");
+  w.signals.runEnded(session, "run-1");
+  // A minute later a new batch goes in for the next prompt, without starting a turn.
+  w.tick(60_000);
+  w.answers.push({ pending: 1, urgent: 0, cursor: message(2), ...every5 });
+  await w.signals.tick();
+  assert.equal(w.notices.length, 2);
+  assert.equal(w.notices[1].wake, false);
+  // The same counts are not repeated while the gap lasts.
+  w.tick(engagedPollMillis);
+  w.answers.push({ pending: 1, urgent: 0, cursor: message(2), ...every5 });
+  await w.signals.tick();
+  assert.equal(w.notices.length, 2);
+  // An urgent message wakes inside the gap.
+  w.tick(engagedPollMillis);
+  w.answers.push({ pending: 2, urgent: 1, cursor: message(3), ...every5 });
+  await w.signals.tick();
+  assert.equal(w.notices.at(-1).wake, true);
+  await w.signals.runStarted(session, "run-2");
+  w.signals.runEnded(session, "run-2");
+  // Held normal counts get their wake once the gap since the last wake has passed.
+  w.tick(60_000);
+  w.answers.push({ pending: 1, urgent: 0, cursor: message(4), ...every5 });
+  await w.signals.tick();
+  assert.equal(w.notices.at(-1).wake, false);
+  w.tick(300_000);
+  w.answers.push({ pending: 1, urgent: 0, cursor: message(4), ...every5 });
+  await w.signals.tick();
+  assert.equal(w.notices.at(-1).wake, true);
+  assert.equal(w.notices.at(-1).target.contextKey, w.notices.at(-2).target.contextKey);
+});
+
+test("right away, and a server without a cadence, wake for every batch as before", async () => {
+  for (const extra of [{ wakeCadence: "right_away", wakeIntervalSeconds: 0 }, {}]) {
+    const w = world(defaults, [{ pending: 1, urgent: 0, cursor: message(1), ...extra }]);
+    await capture(w);
+    await w.signals.tick();
+    await w.signals.runStarted(session, "run-1");
+    w.signals.runEnded(session, "run-1");
+    w.tick(settleMillis + engagedPollMillis);
+    w.answers.push({ pending: 1, urgent: 0, cursor: message(2), ...extra });
+    await w.signals.tick();
+    assert.deepEqual(
+      w.notices.map((notice) => notice.wake),
+      [true, true],
+    );
+  }
+});
+
 test("a get_updates read after the counts settles them, from any session", async () => {
   const w = world(defaults, [{ pending: 2, urgent: 0, cursor: message(2) }]);
   await capture(w);

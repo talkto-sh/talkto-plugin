@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from support import DIRECT, GENERAL, ME, SERVER, FakeHost, envelope, load, message, refusal
+from support import DIRECT, GENERAL, ME, PEER, SERVER, FakeHost, envelope, load, message, refusal
 
 plugin = load()
 inbox_module = plugin.inbox
@@ -28,6 +28,24 @@ def followed(host: FakeHost, settings=None) -> "Inbox":
 
 def pending(host: FakeHost) -> int:
     return len(host.stored["follows"][0]["pending"])
+
+
+def renamed(messages: list[dict], renames: list[dict], checkpoint: str = "") -> dict:
+    """A page carrying participant renames, as a server with renaming sends it."""
+    page = envelope(messages, checkpoint=checkpoint)
+    page["data"]["renames"] = [
+        {
+            "sequence": 1,
+            "participantId": PEER,
+            "previousName": "planner",
+            "name": "planner-ci",
+            "renamedAt": "2026-11-15T10:00:00.000Z",
+            "renamedBy": {"kind": "self"},
+            **fields,
+        }
+        for fields in renames
+    ]
+    return page
 
 
 class InboxTest(unittest.TestCase):
@@ -135,6 +153,52 @@ class InboxTest(unittest.TestCase):
         host.answers.append(envelope([message(conversationId=DIRECT, priority="urgent")]))
         inbox.tick()
         self.assertEqual(len(host.submitted), 1)
+
+    def test_the_persons_wake_cadence_spaces_the_turns_it_starts(self) -> None:
+        def paced(messages, seconds=300):
+            answer = envelope(messages)
+            answer["data"]["wakeCadence"] = "every_5_minutes"
+            answer["data"]["wakeIntervalSeconds"] = seconds
+            return answer
+
+        host = FakeHost()
+        inbox = followed(host)
+        host.answers.append(paced([message()]))
+        inbox.tick()
+        self.assertEqual(len(host.submitted), 1, "the first batch after a quiet period starts a turn")
+        inbox.on_turn_start("t1", host.submitted[0])
+        inbox.on_turn_complete("t1")
+        host.clock.advance(60_000)
+        host.answers.append(paced([message()]))
+        inbox.tick()
+        self.assertEqual(len(host.submitted), 1, "a minute later the next batch waits")
+        self.assertEqual(pending(host), 1)
+        host.answers.append(paced([message(conversationId=DIRECT, priority="urgent")]))
+        inbox.tick()
+        self.assertEqual(len(host.submitted), 2, "urgent starts a turn inside the gap")
+        inbox.on_turn_start("t2", host.submitted[1])
+        inbox.on_turn_complete("t2")
+        host.answers.append(paced([message()]))
+        host.clock.advance(SETTLE)
+        inbox.tick()
+        self.assertEqual(len(host.submitted), 2)
+        host.clock.advance(300_000)
+        self.assertEqual(len(host.submitted), 3, "the held batch goes once the gap has passed")
+
+    def test_right_away_and_older_servers_start_a_turn_for_every_batch(self) -> None:
+        for interval in (0, None):
+            host = FakeHost()
+            inbox = followed(host)
+            for turn in range(1, 4):
+                answer = envelope([message()])
+                if interval is not None:
+                    answer["data"]["wakeIntervalSeconds"] = interval
+                host.answers.append(answer)
+                inbox.tick()
+                self.assertEqual(len(host.submitted), turn)
+                inbox.on_turn_start(f"t{turn}", host.submitted[-1])
+                inbox.on_turn_complete(f"t{turn}")
+                host.clock.advance(SETTLE)
 
     def test_next_prompt_delivery_adds_the_queue_to_the_persons_prompt(self) -> None:
         host = FakeHost()
@@ -260,6 +324,52 @@ class InboxTest(unittest.TestCase):
         self.assertEqual(again.follows(), 1)
         host.clock.advance(SETTLE)
         self.assertIn("kept", host.submitted[-1])
+
+    def test_renames_alone_stay_quiet_and_ride_with_the_next_notice(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        host.answers.append(renamed([], [{"id": "r-1"}], checkpoint="cp-renamed"))
+        inbox.tick()
+        self.assertEqual(host.stored["follows"][0]["checkpoint"], "cp-renamed")
+        self.assertEqual(len(host.stored["follows"][0]["renames"]), 1, "saved with the queue")
+        host.clock.advance(SETTLE)
+        self.assertEqual(host.submitted, [], "a rename alone never starts a turn")
+
+        host.answers.append(renamed([message()], [{"id": "r-1"}, {"id": "r-2", "name": "planner-2"}]))
+        inbox.tick()
+        self.assertEqual(len(host.submitted), 1)
+        notice = host.submitted[0]
+        self.assertIn("1 new message and 2 participant renames for your participant", notice)
+        self.assertIn("- planner is now planner-ci (renamed itself) · participantId ", notice)
+        self.assertLess(notice.index("Renamed participants"), notice.index("[1] #general"))
+        self.assertIsNone(inbox.on_turn_start("t1", notice))
+        self.assertEqual(host.stored["follows"][0]["renames"], [], "delivered renames leave the queue")
+
+    def test_next_prompt_delivery_carries_queued_renames(self) -> None:
+        host = FakeHost()
+        inbox = followed(host, Settings(delivery="next-prompt"))
+        host.answers.append(renamed([], [{"id": "r-1", "participantId": ME, "previousName": "builder"}]))
+        inbox.tick()
+        self.assertEqual(host.submitted, [])
+        extra = inbox.on_turn_start("t1", "what next?")
+        assert extra is not None
+        self.assertTrue(extra.startswith("TalkTo: 1 participant rename for your participant"))
+        self.assertIn("- builder (you) is now planner-ci", extra)
+        self.assertIn("A rename needs no reply", extra)
+
+    def test_a_session_saved_before_renames_existed_restores(self) -> None:
+        host = FakeHost()
+        followed(host)
+        saved = host.stored
+        del saved["follows"][0]["renames"]
+        self.assertIsNotNone(inbox_module.read_saved(saved))
+        legacy = FakeHost()
+        legacy.stored = saved
+        again = Inbox(legacy, Settings())
+        again.restore()
+        self.assertEqual(again.follows(), 1)
+        broken = {**saved, "follows": [{**saved["follows"][0], "renames": [{"id": "r-1"}]}]}
+        self.assertIsNone(inbox_module.read_saved(broken))
 
     def test_follow_input_and_limits(self) -> None:
         read = inbox_module.read_follow_input

@@ -34,7 +34,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Sequence, Union
 
 from .notice import BODY_LIMIT, follow_ended, queued_notice, urgent_notice
-from .talkto import IncomingMessage, UpdatesFailure, UpdatesPage, decode_updates
+from .talkto import (
+    IncomingMessage,
+    ParticipantRename,
+    UpdatesFailure,
+    UpdatesPage,
+    decode_updates,
+)
 
 Delivery = Literal["idle", "next-prompt"]
 UrgentHandling = Literal["inject", "queue"]
@@ -141,6 +147,8 @@ class Follow:
     pending: list[IncomingMessage] = field(default_factory=list)
     #: Messages that arrived while the queue was full; counted, not kept.
     dropped: int = 0
+    #: Renames since the last notice, at most ``QUEUE_LIMIT``; they go with the next one.
+    renames: list[ParticipantRename] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -151,6 +159,7 @@ class Follow:
             "checkpoint": self.checkpoint,
             "pending": [message.to_json() for message in self.pending],
             "dropped": self.dropped,
+            "renames": [rename.to_json() for rename in self.renames],
         }
 
     @staticmethod
@@ -172,6 +181,14 @@ class Follow:
         kept = [message for message in messages if message is not None]
         if len(kept) != len(messages):
             return None
+        # Absent in a session saved before renames were queued.
+        saved_renames = value.get("renames", [])
+        if not isinstance(saved_renames, list):
+            return None
+        renames = [ParticipantRename.from_json(item) for item in saved_renames]
+        known = [rename for rename in renames if rename is not None]
+        if len(known) != len(renames):
+            return None
         server_id, participant_id, checkpoint = (str(text) for text in texts)
         return Follow(
             server_id=server_id,
@@ -181,6 +198,7 @@ class Follow:
             checkpoint=checkpoint,
             pending=kept,
             dropped=dropped,
+            renames=known,
         )
 
 
@@ -287,6 +305,11 @@ class Inbox:
         self._injected: list[_Injected] = []
         #: True once Hermes ended the session: nothing polls or delivers any more.
         self._closed = False
+        #: When this inbox last started a turn of its own; the person's wake cadence counts from it.
+        self._last_wake_at = float("-inf")
+        #: Each follow's cadence in milliseconds from its newest page, by server.
+        self._cadence: dict[str, float] = {}
+        self._cadence_timer = False
 
     # -- what the plugin and the agent use --------------------------------
 
@@ -350,11 +373,13 @@ class Inbox:
             direct_chats=given.direct_chats,
             checkpoint=reply.checkpoint,
             pending=[_keep(message) for message in reply.messages],
+            renames=list(reply.renames),
         )
         with self._lock:
             self._follows = [
                 item for item in self._follows if item.server_id != given.server_id
             ] + [follow]
+            self._learn_cadence(given.server_id, reply)
             self._active_at = self._host.now()
             self._persist()
         self._host.after(0, self.tick)
@@ -617,7 +642,26 @@ class Inbox:
         if over > 0:
             follow.pending = follow.pending[over:]
             follow.dropped += over
+        renamed = {rename.id for rename in follow.renames}
+        follow.renames.extend(rename for rename in page.renames if rename.id not in renamed)
+        follow.renames = follow.renames[-QUEUE_LIMIT:]
         follow.checkpoint = page.checkpoint
+        self._learn_cadence(follow.server_id, page)
+
+    def _learn_cadence(self, server_id: str, page: UpdatesPage) -> None:
+        # A page without the field (an older server) leaves what is known; none known means none.
+        if page.wake_interval_seconds is not None:
+            self._cadence[server_id] = page.wake_interval_seconds * 1000
+
+    def _cadence_wait(self, now: float) -> float:
+        """How long the person's cadence still holds the next turn back: zero once any follow with
+        queued messages may wake, else the shortest wait among them."""
+        waits = [
+            max(0.0, self._last_wake_at + self._cadence.get(item.server_id, 0) - now)
+            for item in self._follows
+            if item.pending or item.dropped
+        ]
+        return min(waits) if waits else 0.0
 
     def _failed(self, follow: Follow, failure: UpdatesFailure) -> bool:
         """Ends a follow TalkTo will never accept again; anything else is retried."""
@@ -677,8 +721,15 @@ class Inbox:
             # With next-prompt delivery only urgent messages wake an idle session.
             if self._settings.delivery == "next-prompt" and not has_urgent and not self._notes:
                 return
-            text = self._notice_text(frozenset())
+            text = self._notice_text(frozenset(), renames_alone=False)
             if text is None:
+                return
+            held = 0.0 if has_urgent or self._notes else self._cadence_wait(now)
+            if held > 0:
+                # Urgent messages and plugin notes ignore the cadence; the rest wait for it.
+                if not self._cadence_timer:
+                    self._cadence_timer = True
+                    self._host.after(held, self._cadence_due)
                 return
             snapshot = self._snapshot()
             self._submitting = True
@@ -690,14 +741,20 @@ class Inbox:
         with self._lock:
             self._submitting = False
             if accepted is True:
+                self._last_wake_at = now
                 self._submitted = _Submitted(text, snapshot, self._host.now() + CONFIRM_MILLIS)
                 self._host.after(CONFIRM_MILLIS, self.deliver)
             elif accepted is False:
                 self._held_for_input = True
 
+    def _cadence_due(self) -> None:
+        with self._lock:
+            self._cadence_timer = False
+        self.deliver()
+
     def _take_for_prompt(self) -> Optional[str]:
         held = self._submitted.snapshot.ids if self._submitted is not None else frozenset()
-        text = self._notice_text(held)
+        text = self._notice_text(held, renames_alone=True)
         if text is None:
             return None
         snapshot = self._snapshot()
@@ -705,24 +762,36 @@ class Inbox:
         self._persist()
         return text
 
-    def _notice_text(self, without: frozenset[str]) -> Optional[str]:
+    def _notice_text(self, without: frozenset[str], renames_alone: bool) -> Optional[str]:
+        """The combined notice for everything queued except ``without``, or None. Queued renames go
+        with any notice; on their own they make one only when ``renames_alone`` (the person's
+        prompt carries it)."""
         parts = list(self._notes)
+        waking = bool(parts)
         for follow in self._follows:
             messages = [m for m in follow.pending if m.id not in without]
-            if messages or follow.dropped > 0:
-                parts.append(queued_notice(follow, messages, follow.dropped))
+            renames = [r for r in follow.renames if r.id not in without]
+            waking = waking or bool(messages) or follow.dropped > 0
+            if messages or follow.dropped > 0 or renames:
+                parts.append(queued_notice(follow, messages, follow.dropped, renames))
+        if not waking and not (renames_alone and parts):
+            return None
         return "\n\n---\n\n".join(parts) if parts else None
 
     def _snapshot(self) -> _Snapshot:
         return _Snapshot(
             notes=len(self._notes),
-            ids=frozenset(m.id for follow in self._follows for m in follow.pending),
+            ids=frozenset(
+                [m.id for follow in self._follows for m in follow.pending]
+                + [r.id for follow in self._follows for r in follow.renames]
+            ),
         )
 
     def _clear_delivered(self, snapshot: _Snapshot) -> None:
         self._notes = self._notes[snapshot.notes :]
         for follow in self._follows:
             follow.pending = [m for m in follow.pending if m.id not in snapshot.ids]
+            follow.renames = [r for r in follow.renames if r.id not in snapshot.ids]
             follow.dropped = 0
 
     def _requeue(self, entry: _Injected) -> None:

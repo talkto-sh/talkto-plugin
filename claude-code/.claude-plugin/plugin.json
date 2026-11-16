@@ -1,6 +1,6 @@
 {
   "name": "talkto-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Delivers TalkTo messages into your Claude Code session: queued until the agent is between turns, urgent ones into the running turn. Connects TalkTo's MCP server.",
   "author": {
     "name": "TalkTo"

@@ -244,3 +244,34 @@ test("Antigravity transcript: only the url field of create_signal's own result c
   const cut = transcript(calls(["create_signal"]), cutResult(signalA));
   assert.deepEqual(transcriptLink(cut), { link: null, truncated: true });
 });
+
+test("each host's session-start note says exactly what happens while the agent is idle", () => {
+  // Hosts whose hooks run only inside a turn: nothing starts an idle one.
+  for (const host of [hosts.claude, hosts.codex, hosts.cursor, hosts.copilot, hosts.gemini])
+    assert.equal(
+      host.idleNote("/p/talkto-hook.mjs"),
+      "While you are idle, nothing here can start a turn: messages that arrive then wait until your next turn.",
+      host.name,
+    );
+  // Antigravity: the watcher, only on the person's request.
+  assert.equal(
+    hosts.antigravity.idleNote("/p/talkto-hook.mjs"),
+    'While you are idle, messages wait for your next turn, unless the TalkTo watcher runs. Start it only when the person asks you to stay reachable while idle, after the hook confirms the link: run `node "/p/talkto-hook.mjs" watch antigravity` with run_command as a background task (WaitMsBeforeAsync 3000). If the sandbox blocks node, run it again with BypassSandbox so the person can allow it once. While you are idle it starts a turn in this conversation when messages wait. The person sees your reply in their window, but not the notice. It stops when Antigravity closes or its background task is stopped.',
+  );
+  // Only Antigravity has a watcher.
+  for (const host of Object.values(hosts))
+    assert.equal(host.watcher !== undefined, host === hosts.antigravity, host.name);
+});
+
+test("Antigravity's watcher needs the environment agy gives the agent's commands", () => {
+  const { watcher } = hosts.antigravity;
+  assert.ok(watcher !== undefined);
+  assert.equal(watcher({}), null);
+  assert.equal(watcher({ ANTIGRAVITY_CONVERSATION_ID: "c1" }), null);
+  assert.equal(watcher({ ANTIGRAVITY_LS_ADDRESS: "localhost:1" }), null);
+  const found = watcher({
+    ANTIGRAVITY_CONVERSATION_ID: "c1",
+    ANTIGRAVITY_LS_ADDRESS: "localhost:1",
+  });
+  assert.equal(found?.sessionId, "c1");
+});

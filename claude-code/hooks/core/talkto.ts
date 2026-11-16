@@ -19,11 +19,35 @@ export interface IncomingMessage {
   readonly from: string;
 }
 
+/** Who renamed a participant: itself (an agent operation for it) or a person, by name. */
+export type RenamedBy =
+  | { readonly kind: "self" }
+  | { readonly kind: "person"; readonly name: string };
+
+/**
+ * One participant's name change. The participant keeps its ID; only its name on the server changed.
+ */
+export interface ParticipantRename {
+  readonly id: string;
+  readonly participantId: string;
+  readonly previousName: string;
+  readonly name: string;
+  /** Who made the change, or null when the server named nobody this plugin understands. */
+  readonly by: RenamedBy | null;
+}
+
 /** One `get_updates` page. */
 export interface UpdatesPage {
   readonly messages: ReadonlyArray<IncomingMessage>;
+  /** Renames since the checkpoint; empty from a server that does not send them. */
+  readonly renames: ReadonlyArray<ParticipantRename>;
   readonly checkpoint: string;
   readonly hasMore: boolean;
+  /**
+   * The person's wake cadence: start an idle turn for normal messages at most this often. Null
+   * from a server that does not send it, which keeps the old behavior.
+   */
+  readonly wakeIntervalSeconds: number | null;
 }
 
 /** A failed call: TalkTo's error code and message, or `transport` when the call itself failed. */
@@ -96,6 +120,31 @@ export const messageIdsOf = (answer: ToolAnswer): ReadonlyArray<string> => {
   });
 };
 
+/**
+ * The page's renames, read leniently: the field is additive, so an entry this plugin cannot read
+ * is skipped rather than failing the page and its messages.
+ */
+const renamesOf = (data: Fields): ReadonlyArray<ParticipantRename> =>
+  listOf(data, "renames").flatMap((entry): ReadonlyArray<ParticipantRename> => {
+    if (!isObject(entry)) return [];
+    const item: Fields = new Map(Object.entries(entry));
+    const id = textOf(item, "id"),
+      participantId = textOf(item, "participantId"),
+      previousName = textOf(item, "previousName"),
+      name = textOf(item, "name");
+    if (id === null || participantId === null || previousName === null || name === null) return [];
+    const actor = fieldsAt(item, "renamedBy");
+    const kind = actor === null ? null : textOf(actor, "kind");
+    const person = actor === null ? null : textOf(actor, "name");
+    const by: RenamedBy | null =
+      kind === "self"
+        ? { kind: "self" }
+        : kind === "person" && person !== null
+          ? { kind: "person", name: person }
+          : null;
+    return [{ id, participantId, previousName, name, by }];
+  });
+
 /** Decode one `get_updates` answer for `participantId`, naming senders and conversations from `included`. */
 export const decodeUpdates = (answer: ToolAnswer, participantId: string): UpdatesReply => {
   const envelope = envelopeOf(answer);
@@ -166,8 +215,18 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
       from: names.get(senderId) ?? `participant ${senderId}`,
     });
   }
+  const interval = data.get("wakeIntervalSeconds");
   return {
     kind: "page",
-    page: { messages, checkpoint, hasMore: textOf(data, "nextCursor") !== null },
+    page: {
+      messages,
+      renames: renamesOf(data),
+      checkpoint,
+      hasMore: textOf(data, "nextCursor") !== null,
+      wakeIntervalSeconds:
+        Number.isSafeInteger(interval) && Number(interval) >= 0 && Number(interval) <= 86_400
+          ? Number(interval)
+          : null,
+    },
   };
 };

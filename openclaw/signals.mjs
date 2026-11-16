@@ -10,7 +10,9 @@
  * the agent then reads them with `get_updates` through its MCP connection.
  *
  * - Normal messages: once the session has been idle for a moment, one system event for the
- *   session's next turn, and a wake so that turn starts now (`Host.notify`).
+ *   session's next turn, and a wake so that turn starts now (`Host.notify`). The person's wake
+ *   cadence (`wakeIntervalSeconds` in the counts) spaces those wakes; inside the gap the event
+ *   waits for the next prompt, and the wake follows once the gap has passed.
  * - Urgent direct messages while a turn runs: steered into that turn (`Host.steer`), read after
  *   the tool calls in progress. If the runtime refuses, they wait for the turn end like others.
  * - The link's cursor moves on only once a notice reached a turn, or the agent read with
@@ -19,7 +21,7 @@
  * Identity: a follow names the participant the agent passed to create_signal. Nothing is
  * inferred from the MCP connection.
  */
-import { check, isText, linkFrom, linkPattern } from "./core/core.mjs";
+import { check, isText, linkFrom, linkPattern, mayWake } from "./core/core.mjs";
 
 /** @typedef {import("./core/core.mjs").Counts} Counts */
 
@@ -88,13 +90,14 @@ export const backoffMs = 60_000;
  * @typedef {object} Entry
  * @property {Follow} follow
  * @property {(Counts & { observedAt: number }) | null} latest Counts not yet delivered.
- * @property {{ cursor: string | null } | null} notified A notice handed to OpenClaw, not yet seen in a turn.
+ * @property {{ cursor: string | null, woke: boolean } | null} notified A notice handed to OpenClaw,
+ *   not yet seen in a turn, and whether it asked for a turn to start.
  * @property {string | null} steerTried The cursor of the last refused steer, so it is not retried.
  * @property {number} lastCheckAt
  * @property {number} retryAt
  */
 
-/** @typedef {{ runs: Set<string>, idleSince: number, activeAt: number }} Session */
+/** @typedef {{ runs: Set<string>, idleSince: number, activeAt: number, lastWakeAt: number }} Session */
 
 /** @param {number} count @param {string} one @param {string} many */
 const plural = (count, one, many) => (count === 1 ? one : many);
@@ -214,7 +217,7 @@ export class Signals {
   #session(sessionKey) {
     let session = this.#sessions.get(sessionKey);
     if (session === undefined) {
-      session = { runs: new Set(), idleSince: 0, activeAt: 0 };
+      session = { runs: new Set(), idleSince: 0, activeAt: 0, lastWakeAt: 0 };
       this.#sessions.set(sessionKey, session);
     }
     return session;
@@ -437,13 +440,19 @@ export class Signals {
       if (steered) await this.#settle(key, entry, latest.cursor);
       return;
     }
-    if (this.#host.now() - session.idleSince < settleMillis) return;
-    if (entry.notified !== null && entry.notified.cursor === latest.cursor) return;
-    const wake = this.#settings.delivery === "idle" || inject;
+    const now = this.#host.now();
+    if (now - session.idleSince < settleMillis) return;
+    // Inside the cadence gap the event still goes in for the next prompt, without starting a turn.
+    const allowed = mayWake(latest, session.lastWakeAt, now);
+    const wake = (this.#settings.delivery === "idle" && allowed) || inject;
+    const notified = entry.notified;
+    if (notified !== null && notified.cursor === latest.cursor && (notified.woke || !wake)) return;
     const told = await this.#try(() =>
       this.#host.notify(target, notices.queued(follow, latest), wake),
     );
-    if (told) entry.notified = { cursor: latest.cursor };
+    if (!told) return;
+    entry.notified = { cursor: latest.cursor, woke: wake };
+    if (wake) session.lastWakeAt = now;
   }
 
   /** A plain description for the person's /talkto-inbox command. */

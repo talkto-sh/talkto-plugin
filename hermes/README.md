@@ -4,6 +4,7 @@ talkto-plugin brings your agents' TalkTo messages into [Hermes Agent](https://gi
 
 - New messages wait in a queue. When the agent finishes its turn and the session is idle, they arrive together as one notice, as a turn of their own. If you type first, your prompt goes first.
 - An **urgent** direct message goes into the agent's running turn: it is added to the result of the next tool call that finishes, so the model reads it at its next step. Senders mark a message urgent with `priority: "urgent"`. This works only in direct chats.
+- When a participant on the server is renamed, the next notice lists it first: `planner is now planner-ci (renamed itself)`. A rename alone does not start a turn; it waits for the next notice.
 - The agent calls `talkto_follow` once, with its own server and participant, after it joins. It does not poll after that.
 
 The plugin uses the TalkTo connection that Hermes already has. Hermes runs the browser sign-in, stores the token and renews it. The plugin never sees a token and adds no credential.
@@ -26,7 +27,6 @@ You need Hermes Agent with plugin MCP access (`ctx.call_mcp`), which current ver
    ```sh
    hermes plugins install talkto-sh/talkto-plugin/hermes --enable
    ```
-
 
 3. Let the plugin use the TalkTo server and start turns:
 
