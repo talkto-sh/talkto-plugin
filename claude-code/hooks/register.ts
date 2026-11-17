@@ -18,11 +18,11 @@ import {
   Inbox,
   isSaved,
   readFollowInput,
+  waitPolicyOf,
   type Delivery,
   type Host,
   type Saved,
   type Settings,
-  type WaitPolicy,
 } from "./core/inbox.ts";
 import {
   connectionHintOf,
@@ -77,13 +77,11 @@ const unfollowSpec = {
 const settingsOf = (options: PluginOptions): Settings & { readonly server: string } => {
   const delivery: Delivery = options["delivery"] === "next-prompt" ? "next-prompt" : "idle";
   const seconds = Number(options["pollSeconds"] ?? 15);
-  const waiting = options["wait"];
-  const wait: WaitPolicy = waiting === "always" || waiting === "never" ? waiting : "auto";
   return {
     delivery,
     urgent: options["urgent"] === "queue" ? "queue" : "inject",
     pollMillis: Math.max(5, Math.min(300, Number.isFinite(seconds) ? seconds : 15)) * 1000,
-    wait,
+    wait: waitPolicyOf(String(options["wait"] ?? "")),
     server: String(options["mcpServer"] ?? "").trim(),
   };
 };
@@ -171,17 +169,21 @@ const claimLease = async ($: EngineInterface, lease: ThreadLease): Promise<boole
 
 /**
  * Writes the thread's state (or keeps the stored one) with a renewed lease; false, writing
- * nothing, when another live process holds the lease. A thread that follows no one keeps its
- * record for the lease; `forgetOldThreads` removes it once nobody renews it.
+ * nothing, when another live process holds the lease. `holding` is asked again right before the
+ * write: a process that ended or stood down while it read writes nothing, so a lease it freed
+ * meanwhile stays free. A thread that follows no one keeps its record for the lease;
+ * `forgetOldThreads` removes it once nobody renews it.
  */
 const writeLeased = async (
   $: EngineInterface,
   lease: ThreadLease,
   state: Saved | null,
+  holding: () => boolean,
 ): Promise<boolean> => {
   const stored = await $.store.get(lease.key);
   const now = await $.clock.now();
   if (!mayHold(leaseOf(isLeased(stored) ? stored : null), lease.holder, now)) return false;
+  if (!holding()) return true;
   const next = state ?? (isSaved(stored) ? stored : emptyState);
   await $.store.set(lease.key, leasedRecord(next, { holder: lease.holder, aliveAt: now }));
   return true;
@@ -257,7 +259,10 @@ const hostOf = (
     },
     save: async (state) => {
       if (lease !== null) {
-        if (!(await writeLeased($, lease, state))) onLost();
+        // A process that ended or stood down saves nothing: the answer to a wait it still had
+        // open must not renew a lease it gave up. The holder reads that answer again.
+        if (!isLive()) return;
+        if (!(await writeLeased($, lease, state, isLive))) onLost();
         return;
       }
       await (state.follows.length === 0 && state.notes.length === 0
@@ -335,7 +340,7 @@ const renewThread = async (
   lease: ThreadLease,
 ): Promise<void> => {
   if (live.phase === "ready") {
-    if (!(await writeLeased($, lease, null))) standDown(live);
+    if (!(await writeLeased($, lease, null, () => live.phase === "ready"))) standDown(live);
   } else if (live.phase === "standby" && (await claimLease($, lease)))
     await activate($, live, created);
 };

@@ -35,6 +35,12 @@ const page = (messages, checkpoint) => ({
     meta: {},
   },
 });
+/** TalkTo refusing a call's input, as it refuses a wait longer than it allows. */
+const refusal = (text) => ({
+  isError: true,
+  content: [],
+  structuredContent: { error: { code: "invalid_input", message: text }, meta: {} },
+});
 let sequence = 0;
 const message = (fields = {}) => {
   sequence += 1;
@@ -59,6 +65,13 @@ const fakeTalkTo = () => {
   const talkto = {
     calls: [],
     updates: [],
+    /**
+     * When set, a waiting get_updates with nothing new is held, as TalkTo holds it: until a page is
+     * queued, or until its deadline, when it answers empty.
+     */
+    hold: false,
+    /** The longest wait TalkTo allows a call that names its plugin; 20 before November 17, 2026. */
+    pluginWait: 50,
     fetch: async (url, init) => {
       assert.equal(url, mcpUrl);
       const body = JSON.parse(init.body);
@@ -82,11 +95,19 @@ const fakeTalkTo = () => {
         });
       const result =
         body.params.name === "get_updates"
-          ? (talkto.updates.shift() ?? page([], `cp-${sequence}`))
+          ? await talkto.updatesFor(body.params.arguments ?? {})
           : body.params.name === "get_context"
             ? { isError: false, content: [{ type: "text", text: context }] }
             : { isError: false, content: [{ type: "text", text: `{"ok":"${body.params.name}"}` }] };
       return json(200, { jsonrpc: "2.0", id: body.id, result });
+    },
+    updatesFor: async (args) => {
+      const wait = args.waitSeconds ?? 0;
+      const longest = args.plugin === undefined ? 20 : talkto.pluginWait;
+      if (wait > longest) return refusal(`waitSeconds must be a value between 0 and ${longest}`);
+      for (let held = 0; talkto.hold && held < wait && talkto.updates.length === 0; held += 1)
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      return talkto.updates.shift() ?? page([], `cp-${sequence}`);
     },
   };
   return talkto;
@@ -134,14 +155,21 @@ const fakePi = () => {
 };
 
 const settings = { delivery: "idle", urgent: "inject", pollMillis: 15000, wait: "auto" };
-/** Let promise chains started by timers finish. */
-// Lets the extension finish what a tick started, including its state file writes: each round
-// waits one file-system round trip as well as one event-loop turn, so a slower disk (Linux CI)
-// does not leave a save, and the delivery after it, still pending.
+/** A file request in flight, or the close of a file written: what a state save waits on. */
+const fileRequest = /^(?:FSReq|CloseReq|FileHandle)/;
+/**
+ * Lets the extension finish what a tick started, its state file writes included, before the mocked
+ * clock moves on: it waits until no file request has been pending for 40 event-loop turns. A fixed
+ * number of turns let a slow disk (a busy CI machine) fall behind the clock, so a save, and the
+ * check or delivery after it, ran mocked seconds late.
+ */
 const settle = async () => {
-  for (let round = 0; round < 40; round += 1) {
+  let quiet = 0;
+  for (let round = 0; quiet < 40; round += 1) {
+    assert.ok(round < 1_000_000, "a file request never ended");
     await new Promise((resolve) => setImmediate(resolve));
-    await stat(tmpdir());
+    const writing = process.getActiveResourcesInfo().some((kind) => fileRequest.test(kind));
+    quiet = writing ? 0 : quiet + 1;
   }
 };
 const start = async (t) => {
@@ -226,7 +254,7 @@ test("queued messages arrive as one follow-up turn once pi is idle; urgent ones 
   await pi.emit("agent_start");
   await advance(0);
   const poll = talkto.calls.findLast((call) => call.params.name === "get_updates");
-  assert.equal(poll.params.arguments.waitSeconds, 20, "a running turn waits on the server");
+  assert.equal(poll.params.arguments.waitSeconds, 50, "a running turn waits on the server");
   assert.equal(pi.sent.length, 1);
   assert.equal(pi.sent[0].deliverAs, "steer");
   assert.match(pi.sent[0].text, /stop the deploy/);
@@ -248,6 +276,60 @@ test("queued messages arrive as one follow-up turn once pi is idle; urgent ones 
   await settle();
   const after = JSON.parse(await readFile(join(stateDir, "session-1.json"), "utf8"));
   assert.equal(after.follows[0].pending.length, 0);
+});
+
+/** The polls a fake TalkTo answered, in order. */
+const pollsOf = (talkto) =>
+  talkto.calls.filter(
+    (call) => call.params.name === "get_updates" && call.params.arguments.mode === "poll",
+  );
+
+/** Five idle minutes, ten minutes into a session that never runs a turn; the polls they made. */
+const idleMinutes = async (talkto, advance) => {
+  for (let second = 0; second < 10 * 60; second += 1) await advance(1000);
+  const before = pollsOf(talkto).length;
+  for (let second = 0; second < 5 * 60; second += 1) await advance(1000);
+  return pollsOf(talkto).slice(before);
+};
+
+test("an idle session keeps waiting on TalkTo, and a message sent to it starts a turn", async (t) => {
+  const { pi, talkto, advance } = await start(t);
+  talkto.hold = true;
+  await pi.emit("session_start", { reason: "startup" });
+  await follow(pi);
+  // No turn ever runs. Past the ten minutes that once ended the waits, every check still waits,
+  // 50 seconds each: about one call a minute, where 0.3.3 made three and 0.3.2 four.
+  // TalkTo holds each 50 seconds and the next starts within a second, and the clock moves only once
+  // a save is written (`settle`): 5 or 6 starts in 5 minutes, 7 at the most.
+  const idle = await idleMinutes(talkto, advance);
+  assert.ok(idle.length >= 5 && idle.length <= 7, `${idle.length} checks in 5 idle minutes`);
+  assert.ok(idle.every((call) => call.params.arguments.waitSeconds === 50));
+  assert.equal(pi.sent.length, 0);
+
+  // A message ends the wait it arrives in, so the idle agent's turn starts within seconds.
+  talkto.updates.push(page([message({ conversationId: direct, body: "are you there?" })], "cp-9"));
+  for (let second = 0; second < 5; second += 1) await advance(1000);
+  assert.equal(pi.sent.length, 1);
+  assert.equal(pi.sent[0].deliverAs, "followUp", "a turn of its own");
+  assert.match(pi.sent[0].text, /are you there\?/);
+});
+
+test("a TalkTo that refuses the long wait gets 20-second waits, and idle delivery works the same", async (t) => {
+  const { pi, talkto, advance } = await start(t);
+  talkto.hold = true;
+  talkto.pluginWait = 20;
+  await pi.emit("session_start", { reason: "startup" });
+  await follow(pi);
+  const idle = await idleMinutes(talkto, advance);
+  assert.ok(idle.length >= 13 && idle.length <= 16, `${idle.length} checks in 5 idle minutes`);
+  assert.ok(idle.every((call) => call.params.arguments.waitSeconds === 20));
+  const long = pollsOf(talkto).filter((call) => call.params.arguments.waitSeconds === 50);
+  assert.equal(long.length, 1, "the long wait is asked for once");
+
+  talkto.updates.push(page([message({ conversationId: direct, body: "are you there?" })], "cp-9"));
+  for (let second = 0; second < 5; second += 1) await advance(1000);
+  assert.equal(pi.sent.length, 1);
+  assert.match(pi.sent[0].text, /are you there\?/);
 });
 
 test("an urgent message the agent read with get_updates in the turn gets no follow-up turn", async (t) => {

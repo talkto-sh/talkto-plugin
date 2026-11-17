@@ -39,12 +39,12 @@ In `pi -p`, Pi reads standard input until it closes when standard input is not a
 
 Set these in the environment before you start Pi. None of them is a credential.
 
-| Variable              | Default                 | What it does                                                                                                                                         |
-| --------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TALKTO_MCP_URL`      | `https://talkto.sh/mcp` | The TalkTo deployment to use.                                                                                                                        |
-| `TALKTO_URGENT`       | `inject`                | `queue`: urgent messages wait like any other message.                                                                                                |
-| `TALKTO_WAIT`         | `auto`                  | `auto`: while a turn runs and for 10 minutes after, each check waits on TalkTo, so messages arrive in about a second. `always` and `never` as named. |
-| `TALKTO_POLL_SECONDS` | `15`                    | How often the extension checks when it is not waiting on TalkTo (5 to 300).                                                                          |
+| Variable              | Default                 | What it does                                                                                                                                                                                                                   |
+| --------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TALKTO_MCP_URL`      | `https://talkto.sh/mcp` | The TalkTo deployment to use.                                                                                                                                                                                                  |
+| `TALKTO_URGENT`       | `inject`                | `queue`: urgent messages wait like any other message.                                                                                                                                                                          |
+| `TALKTO_WAIT`         | `always`                | `always`: each check waits on TalkTo, so messages arrive in about a second, whether a turn runs or the session is idle. `never`: check every `TALKTO_POLL_SECONDS` only. `auto`, the default before 0.3.4, now means `always`. |
+| `TALKTO_POLL_SECONDS` | `15`                    | How often the extension checks when it cannot wait on TalkTo (5 to 300).                                                                                                                                                       |
 
 ## Security
 

@@ -6,10 +6,18 @@
  * Delivery model:
  * - The plugin polls TalkTo's `get_updates` through the host's authenticated
  *   connection and keeps what arrives in a queue.
- *   While the session is engaged (a turn runs, or one ended in the last ten
- *   minutes) each poll waits up to 20 seconds on the server, so a message
- *   arrives about a second after it is sent. Otherwise it checks every
- *   `pollMillis`, because an open wait keeps the TalkTo server billed.
+ *   Each poll waits on the server and the next starts as soon as it ends,
+ *   whether a turn runs or the session is idle, so a message arrives about a
+ *   second after it is sent. This also makes fewer calls than checking every
+ *   `pollMillis`. A poll waits up to `longWaitSeconds` (50), which TalkTo
+ *   allows any call that names a plugin; when TalkTo refuses that, or the host
+ *   or a proxy cuts a long wait short, polls wait `waitSeconds` (20, what
+ *   TalkTo publishes to every client) for half an hour
+ *   (`longWaitRetryMillis`), then try a long wait again. Each follow is
+ *   checked on its own, so one follow's open wait never holds back another's
+ *   messages. The host's timer, every `pollMillis`, is the backstop, and the
+ *   only check when the server refuses `waitSeconds` (an older deployment) or
+ *   the person set `wait` to `never`.
  * - Queued messages are delivered as ONE notice that starts a turn of its own
  *   once the session has been idle for a moment (`Host.submit`), so they
  *   never interrupt a turn. A prompt the person types first goes first.
@@ -85,8 +93,15 @@ export type Delivery = "idle" | "next-prompt";
 /** What urgent messages do while a turn runs: go into it, or wait like any other. */
 export type UrgentHandling = "inject" | "queue";
 
-/** When polls wait on the server: while engaged, whenever following, or never. */
-export type WaitPolicy = "auto" | "always" | "never";
+/** Whether polls wait on the server: whenever following (the default), or never. */
+export type WaitPolicy = "always" | "never";
+
+/**
+ * The wait policy a person's setting names. Anything but `never` waits: `auto`, the default before
+ * 0.3.4, waited only while the session was engaged and is now the same as `always`.
+ */
+export const waitPolicyOf = (setting: string | undefined): WaitPolicy =>
+  setting === "never" ? "never" : "always";
 
 export interface Settings {
   readonly delivery: Delivery;
@@ -211,10 +226,32 @@ export const queueLimit = 100;
 const pagesPerTick = 4;
 /** Idle time before a queued notice is submitted, so a person about to type goes first. */
 export const settleMillis = 2000;
-/** Seconds one poll may wait on the server; TalkTo's maximum. */
+/** Seconds one poll may wait on the server; the most TalkTo publishes to every client. */
 export const waitSeconds = 20;
-/** How long after the last turn or message `auto` keeps waiting polls. */
-export const engagedMillis = 10 * 60 * 1000;
+/**
+ * Seconds one poll asks to wait while it may. Since November 17, 2026 TalkTo lets any call that
+ * names a plugin (`plugin`) wait this long, so an idle session makes about one call a minute
+ * instead of three. Claude Code ends an HTTP MCP request after 60 seconds by default, which this
+ * leaves room under. When TalkTo refuses it, or the host or a proxy cuts a long wait short, the
+ * same check is asked again at once with `waitSeconds`, and polls wait `waitSeconds` for
+ * `longWaitRetryMillis`.
+ */
+export const longWaitSeconds = 50;
+/**
+ * A long wait that fails after this long was cut short by the host or a proxy, whatever the
+ * failure says: TalkTo's own failures come at once. A gateway that ends a held call may answer
+ * with a body that names nothing, such as a JSON 504.
+ */
+export const cutMillis = 25 * 1000;
+/** Long waits that fail in a row, for any reason, after which the last is taken as cut short. */
+export const longWaitTries = 2;
+/**
+ * How long polls wait `waitSeconds` after a long wait was refused, cut short or given up; then a
+ * long wait is tried again. A laptop that slept or a network that changed during one long wait
+ * does not cost long waits for the whole session; a proxy that cuts every long wait costs one cut
+ * call each time.
+ */
+export const longWaitRetryMillis = 30 * 60 * 1000;
 /** Least time between the starts of two chained waiting polls, so a poll that answers at once never spins. */
 export const rearmMillis = 1000;
 /** Least time between two notices that mention the same plugin update. */
@@ -227,10 +264,12 @@ export const stallChecks = 3;
 export const stallRepeatMillis = 60 * 60 * 1000;
 /**
  * A check still running after this long is given up and counts as failed; its answer, if it ever
- * comes, is ignored. Hosts may never time out a call themselves (Claude Code's MCP calls wait for
- * hours), and one call that never answers must not stop every later check.
+ * comes, is ignored. Some hosts time out a call only after minutes, or never, and one call that
+ * never answers must not stop every later check. A check that works takes at most a long wait
+ * the host cuts at 60 seconds (Claude Code's limit), then the 20-second wait asked again at once:
+ * this leaves 20 seconds past that. A long wait given up counts as cut short.
  */
-export const stuckMillis = waitSeconds * 1000 + 60 * 1000;
+export const stuckMillis = 100 * 1000;
 /** The tools a capability brings: a connection without them was set up before the server had them. */
 const capabilityTools: ReadonlyMap<string, ReadonlyArray<string>> = new Map([
   ["transfers", ["prepare_transfer", "complete_transfer", "fetch_transfer"]],
@@ -303,11 +342,20 @@ interface Snapshot {
 type Check =
   | { readonly kind: "ok" }
   | { readonly kind: "failed"; readonly reason: string }
-  /** The tick it belonged to was given up (`stuckMillis`): nothing it read counts. */
+  /** It was given up (`stuckMillis`, or the follow started again): nothing it read counts. */
   | { readonly kind: "abandoned" };
 
 const ok: Check = { kind: "ok" };
 const abandoned: Check = { kind: "abandoned" };
+
+/** One follow's check in flight. */
+interface Running {
+  readonly serverId: string;
+  /** When it started, so a check that never answers is found. */
+  readonly since: number;
+  /** Seconds its first page asks to wait. */
+  readonly wait: number;
+}
 
 /** One follow's run of failed checks. */
 interface Outage {
@@ -320,6 +368,23 @@ interface Outage {
 
 /** Whether a failure is the host refusing TalkTo's answer against the tool list it read on connecting. */
 const hostRefused = (reason: string) => /output schema|structured content/i.test(reason);
+
+/**
+ * Words of a host or proxy ending a call it held too long, whenever it does: a timeout, an abort,
+ * or a gateway that answered in TalkTo's place (502, 504, an unreadable body).
+ */
+const cutWords = /timed? ?out|timeout|abort|gateway|\b(?:408|502|504|524)\b|unreadable body/i;
+
+/** The words of a thrown failure and of the failures beneath it, as runtimes nest them. */
+const causeWords = (cause: unknown): string => {
+  const words: string[] = [];
+  let current = cause;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    words.push(current instanceof Error ? `${current.name}: ${current.message}` : String(current));
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return words.join(" / ");
+};
 
 /** The text of a thrown failure, short enough for a notice. */
 const reasonOf = (cause: unknown): string => {
@@ -350,24 +415,28 @@ export class Inbox {
   private busy = false;
   private turnId: string | null = null;
   private idleSince = 0;
-  private activeAt = 0;
   /** False once the server rejected waitSeconds (an older deployment); polls then return at once. */
   private canWait = true;
   /** False once the server rejected the `plugin` field (a deployment before November 16, 2026). */
   private canReport = true;
+  /**
+   * When polls may wait `longWaitSeconds` again; until then they wait `waitSeconds`. Set
+   * `longWaitRetryMillis` ahead when a long wait was refused, cut short, or given up.
+   */
+  private longWaitsFrom = 0;
+  /** Long waits that failed in a row, for any reason; `longWaitTries` of them count as a cut. */
+  private longWaitFailures = 0;
   /** The newest version of this plugin, from the latest page that said. */
   private latestVersion: string | null = null;
   /** When a notice last carried the update line; null before the first. */
   private updateNoticeAt: number | null = null;
-  private chained = false;
+  /** Servers whose follow's next waiting check is already arranged. */
+  private readonly chained = new Set<string>();
   private submitting = false;
   /** A delivery was asked for while one ran; it runs again when that one ends. */
   private deliverAgain = false;
   private heldForInput = false;
-  private polling = false;
   private injecting = false;
-  private failures = 0;
-  private resumeAt = 0;
   private injected: Injected[] = [];
   /** When this inbox last started a turn of its own; the cadence counts from it. */
   private lastWakeAt = Number.NEGATIVE_INFINITY;
@@ -391,12 +460,18 @@ export class Inbox {
   private readonly capabilities = new Map<string, ReadonlyArray<string>>();
   /** Each follow's run of failed checks, by server; absent while its checks work. */
   private readonly outages = new Map<string, Outage>();
+  /**
+   * Each follow's check in flight, by server. A check whose entry was removed or replaced was given
+   * up (it never answered, or the follow started again), and what it finds changes nothing.
+   */
+  private readonly running = new Map<string, Running>();
+  /** Each follow's failed checks in a row and when it may check again, by server. */
+  private readonly backoff = new Map<
+    string,
+    { readonly failures: number; readonly resumeAt: number }
+  >();
   /** When each follow's checks last worked, by server; unknown before the first since a restart. */
   private readonly readAt = new Map<string, number>();
-  /** When the tick in flight started; with `polling`, how a check that never answers is found. */
-  private pollingSince = 0;
-  /** Counts given-up ticks, so a check that answers after it was given up changes nothing. */
-  private generation = 0;
   /** Whether the agent was told that saving failed; once per session. */
   private saveFailureTold = false;
   private cadenceTimer = false;
@@ -475,14 +550,12 @@ export class Inbox {
     this.unchecked.delete(input.serverId);
     this.widening.delete(input.serverId);
     this.outages.delete(input.serverId);
-    // A follow restarts delivery now: a check still in flight (perhaps one that never answers)
-    // is given up, so the next tick polls at once.
-    if (this.polling) {
-      this.generation += 1;
-      this.polling = false;
-    }
-    this.activeAt = await this.host.now();
-    this.readAt.set(input.serverId, this.activeAt);
+    // A follow restarts delivery now: its check still in flight (perhaps one that never answers)
+    // is given up, and the wait after its earlier failures is dropped, so the next tick polls it
+    // at once. Other follows' checks go on.
+    this.running.delete(input.serverId);
+    this.backoff.delete(input.serverId);
+    this.readAt.set(input.serverId, await this.host.now());
     await this.persist();
     this.host.after(0, () => this.tick());
     const waiting = follow.pending.length;
@@ -609,7 +682,6 @@ export class Inbox {
     this.busy = false;
     this.turnId = null;
     this.idleSince = await this.host.now();
-    this.activeAt = this.idleSince;
     const unread = this.injected
       .filter((entry) => entry.turnId === turnId && !entry.stepped)
       .flatMap((entry) => entry.ids)
@@ -639,49 +711,57 @@ export class Inbox {
   }
 
   /**
-   * One tick: poll every follow at once, then deliver what is due. While
-   * engaged, the first page of each poll waits on the server and the next
-   * tick starts as soon as this one ends; the timer is only a backstop then.
+   * One tick: check every follow that has no check in flight, each on its own. A follow's messages
+   * are delivered as soon as its own check answers, so one follow's open wait never holds back
+   * another's. When polls may wait, each follow's next check starts right after its last; the
+   * timer is only a backstop then.
    */
   async tick(): Promise<void> {
     if (this.follows.length === 0) return;
     const now = await this.host.now();
-    if (this.polling) {
-      if (now - this.pollingSince < stuckMillis) return;
+    await Promise.all([...this.follows].map((follow) => this.check(follow, now)));
+  }
+
+  /** One follow's check: read what is new, save it, deliver what is due, then arrange the next. */
+  private async check(follow: Follow, now: number): Promise<void> {
+    const key = follow.serverId;
+    const inFlight = this.running.get(key);
+    if (inFlight !== undefined) {
+      if (now - inFlight.since < stuckMillis) return;
       // The check in flight never answered: give it up, so one call that hangs cannot stop delivery.
-      this.generation += 1;
-      this.polling = false;
-      const reason = `TalkTo did not answer a check for ${Math.round((now - this.pollingSince) / 1000)} seconds.`;
-      for (const follow of this.follows) this.track(follow, { kind: "failed", reason }, now);
-    } else if (now < this.resumeAt) return;
-    this.polling = true;
-    this.pollingSince = now;
-    const generation = this.generation;
+      this.running.delete(key);
+      // A host or proxy that holds a long wait without answering gets the shorter wait for a while.
+      if (inFlight.wait > waitSeconds) this.stepDown(now);
+      const reason = `TalkTo did not answer a check for ${Math.round((now - inFlight.since) / 1000)} seconds.`;
+      this.track(follow, { kind: "failed", reason }, now);
+    } else if (now < (this.backoff.get(key)?.resumeAt ?? 0)) return;
+    const run: Running = { serverId: key, since: now, wait: this.waitFor(now) };
+    this.running.set(key, run);
     let failed = false;
     try {
-      const before = this.queued();
-      const checks = await Promise.all(
-        [...this.follows].map(
-          async (follow) =>
-            [follow, await this.poll(follow, this.waitFor(now), generation)] as const,
-        ),
-      );
-      // Given up while it ran: a newer tick owns the follows now.
-      if (generation !== this.generation) return;
-      const at = await this.host.now();
-      for (const [follow, check] of checks) this.track(follow, check, at);
-      failed = checks.some(([, check]) => check.kind === "failed");
-      this.failures = failed ? this.failures + 1 : 0;
-      this.resumeAt = failed
-        ? now + Math.min(backoffLimitMillis, this.settings.pollMillis * 2 ** this.failures)
-        : 0;
-      if (this.queued() > before) this.activeAt = at;
+      const check = await this.poll(follow, run);
+      // Given up while it ran: a newer check owns the follow now.
+      if (!this.current(run)) return;
+      this.track(follow, check, await this.host.now());
+      failed = check.kind === "failed";
+      const failures = failed ? (this.backoff.get(key)?.failures ?? 0) + 1 : 0;
+      if (failures === 0) this.backoff.delete(key);
+      else
+        this.backoff.set(key, {
+          failures,
+          resumeAt: now + Math.min(backoffLimitMillis, this.settings.pollMillis * 2 ** failures),
+        });
       await this.persistOrSay();
     } finally {
-      if (generation === this.generation) this.polling = false;
+      if (this.current(run)) this.running.delete(key);
     }
     await this.deliver();
-    if (!failed) await this.chain(now);
+    if (!failed) await this.chain(key, now);
+  }
+
+  /** Whether a check is still the one its follow runs: not given up, and the follow not restarted. */
+  private current(run: Running): boolean {
+    return this.running.get(run.serverId) === run;
   }
 
   /**
@@ -729,40 +809,84 @@ export class Inbox {
     }
   }
 
-  /** Seconds the next poll may wait on the server. */
+  /** Seconds a poll that starts at `now` may wait on the server. */
   private waitFor(now: number): number {
     if (!this.canWait || this.settings.wait === "never") return 0;
-    const engaged = this.busy || now - this.activeAt < engagedMillis;
-    return this.settings.wait === "always" || engaged ? waitSeconds : 0;
+    // TalkTo allows a long wait only from a call that names its plugin.
+    return this.canReport && now >= this.longWaitsFrom ? longWaitSeconds : waitSeconds;
   }
 
-  /** Starts the next waiting poll right after this one, at most one per `rearmMillis`. */
-  private async chain(started: number): Promise<void> {
+  /** Polls wait `waitSeconds` from `now`, and try a long wait again `longWaitRetryMillis` later. */
+  private stepDown(now: number): void {
+    this.longWaitFailures = 0;
+    this.longWaitsFrom = now + longWaitRetryMillis;
+  }
+
+  /**
+   * Whether a long wait that failed with these words was cut short by the host or a proxy, so the
+   * same check is asked again at once with `waitSeconds`, and polls step down. It was when it
+   * failed after `cutMillis`, whatever it says, or in a host's or proxy's words, or when it is the
+   * `longWaitTries`th long wait in a row to fail. Otherwise the failure is handled as before (a
+   * refused sign-in, TalkTo unavailable, a brief network drop), and long waits go on.
+   */
+  private cutShort(words: string, now: number, run: Running): boolean {
+    this.longWaitFailures += 1;
+    const cut =
+      now - run.since > cutMillis || cutWords.test(words) || this.longWaitFailures >= longWaitTries;
+    if (cut) this.stepDown(now);
+    return cut;
+  }
+
+  /** Starts a follow's next waiting check right after its last, at most one per `rearmMillis`. */
+  private async chain(serverId: string, started: number): Promise<void> {
     const now = await this.host.now();
-    if (this.chained || this.follows.length === 0 || this.waitFor(now) === 0) return;
-    this.chained = true;
+    if (this.chained.has(serverId) || this.waitFor(now) === 0) return;
+    if (!this.follows.some((follow) => follow.serverId === serverId)) return;
+    this.chained.add(serverId);
     this.host.after(Math.max(0, rearmMillis - (now - started)), async () => {
-      this.chained = false;
-      await this.tick();
+      this.chained.delete(serverId);
+      const follow = this.follows.find((item) => item.serverId === serverId);
+      if (follow !== undefined) await this.check(follow, await this.host.now());
     });
   }
 
-  private queued(): number {
-    return this.follows.reduce((sum, follow) => sum + follow.pending.length, 0);
-  }
-
   /** One get_updates page, waiting up to `wait` seconds on the server. */
-  private page(follow: Follow, wait: number): Promise<ToolAnswer> {
-    return this.updates(
-      {
-        serverId: follow.serverId,
-        participantId: follow.participantId,
-        mode: "poll",
-        checkpoint: follow.checkpoint,
-        limit: 50,
-      },
-      wait,
-    );
+  private async page(follow: Follow, wait: number, run: Running): Promise<ToolAnswer> {
+    const args = {
+      serverId: follow.serverId,
+      participantId: follow.participantId,
+      mode: "poll",
+      checkpoint: follow.checkpoint,
+      limit: 50,
+    } satisfies ToolArguments;
+    if (wait <= waitSeconds) return this.updates(args, wait);
+    // A long wait. TalkTo refusing it, and the host or a proxy cutting it short, end it the same
+    // way: the check is asked again at once with the published wait, and polls step down for a
+    // while. Nothing is lost: the checkpoint moves only with a page. Any other failure is handled
+    // as before, and long waits go on.
+    let answer: ToolAnswer;
+    try {
+      answer = await this.host.call("get_updates", {
+        ...args,
+        waitSeconds: wait,
+        plugin: releaseText(this.host.plugin),
+      });
+    } catch (cause) {
+      const words = causeWords(cause);
+      if (!this.current(run) || hostRefused(words)) throw cause;
+      if (!this.cutShort(words, await this.host.now(), run)) throw cause;
+      return this.updates(args, waitSeconds);
+    }
+    const said = longWaitAnswer(answer);
+    if (!this.current(run)) return answer;
+    if (said.kind === "answered") {
+      this.longWaitFailures = 0;
+      return answer;
+    }
+    const now = await this.host.now();
+    if (said.kind === "refused") this.stepDown(now);
+    else if (!this.cutShort(said.words, now, run)) return answer;
+    return this.updates(args, waitSeconds);
   }
 
   /**
@@ -802,29 +926,29 @@ export class Inbox {
   }
 
   /** Reads one follow's new messages into its queue. */
-  private async poll(follow: Follow, wait: number, generation: number): Promise<Check> {
-    if (this.unchecked.has(follow.serverId)) await this.addGeneral(follow, generation);
+  private async poll(follow: Follow, run: Running): Promise<Check> {
+    if (this.unchecked.has(follow.serverId)) await this.addGeneral(follow, run);
     let pages = pagesPerTick;
     for (let page = 0; page < pages; page += 1) {
       let answer: ToolAnswer;
       try {
         // Only the first page waits; a continuation already has messages to read.
-        answer = await this.page(follow, page === 0 ? wait : 0);
+        answer = await this.page(follow, page === 0 ? run.wait : 0, run);
       } catch (cause) {
-        if (generation !== this.generation) return abandoned;
+        if (!this.current(run)) return abandoned;
         const reason = reasonOf(cause);
         return hostRefused(reason)
-          ? this.skipRefused(follow, reason, generation)
+          ? this.skipRefused(follow, reason, run)
           : { kind: "failed", reason };
       }
-      if (generation !== this.generation) return abandoned;
+      if (!this.current(run)) return abandoned;
       const reply = decodeUpdates(answer, follow.participantId);
       if (reply.kind === "failure")
         return answer.isError &&
           reply.failure.code === "unreadable" &&
           hostRefused(reply.failure.message)
-          ? this.skipRefused(follow, reply.failure.message, generation)
-          : this.failed(follow, reply.failure, generation);
+          ? this.skipRefused(follow, reply.failure.message, run)
+          : this.failed(follow, reply.failure, run);
       const known = new Set(follow.pending.map((message) => message.id));
       enqueue(
         follow.pending,
@@ -861,7 +985,7 @@ export class Inbox {
    * its old checkpoint is read to the end, so nothing between the two is missed. A follow at the
    * channel limit, or one TalkTo refuses the wider selection for, keeps the old selection.
    */
-  private async addGeneral(follow: Follow, generation: number): Promise<void> {
+  private async addGeneral(follow: Follow, run: Running): Promise<void> {
     this.unchecked.delete(follow.serverId);
     const general = await this.generalOf(follow.serverId);
     if (general === null || follow.channelIds.includes(general)) return;
@@ -886,7 +1010,7 @@ export class Inbox {
       this.unchecked.add(follow.serverId);
       return;
     }
-    if (generation !== this.generation || !this.follows.includes(follow)) return;
+    if (!this.current(run) || !this.follows.includes(follow)) return;
     const reply = decodeUpdates(answer, follow.participantId);
     if (reply.kind === "page")
       this.widening.set(follow.serverId, {
@@ -896,14 +1020,10 @@ export class Inbox {
   }
 
   /** Ends a follow TalkTo will never accept again; anything else is retried. */
-  private async failed(
-    follow: Follow,
-    failure: UpdatesFailure,
-    generation: number,
-  ): Promise<Check> {
+  private async failed(follow: Follow, failure: UpdatesFailure, run: Running): Promise<Check> {
     if (failure.code === "invalid_cursor") {
       // The server's history was restored: start again from now and say what may be missing.
-      const restarted = await this.restart(follow, generation);
+      const restarted = await this.restart(follow, run);
       if (restarted.kind !== "page") return restarted.check;
       follow.checkpoint = restarted.checkpoint;
       this.notes.push(
@@ -940,8 +1060,8 @@ export class Inbox {
    * checkpoint returns the same page forever, so start again from now (an answer with no messages
    * passes) and tell the agent what was skipped and how to reconnect.
    */
-  private async skipRefused(follow: Follow, reason: string, generation: number): Promise<Check> {
-    const restarted = await this.restart(follow, generation);
+  private async skipRefused(follow: Follow, reason: string, run: Running): Promise<Check> {
+    const restarted = await this.restart(follow, run);
     if (restarted.kind !== "page")
       return restarted.check.kind === "failed" ? { kind: "failed", reason } : restarted.check;
     follow.checkpoint = restarted.checkpoint;
@@ -960,7 +1080,7 @@ export class Inbox {
   /** Starts one follow again from TalkTo's newest message, keeping its selection. */
   private async restart(
     follow: Follow,
-    generation: number,
+    run: Running,
   ): Promise<
     | { readonly kind: "page"; readonly checkpoint: string }
     | { readonly kind: "not"; readonly check: Check }
@@ -982,14 +1102,13 @@ export class Inbox {
     } catch (cause) {
       return {
         kind: "not",
-        check:
-          generation === this.generation ? { kind: "failed", reason: reasonOf(cause) } : abandoned,
+        check: this.current(run) ? { kind: "failed", reason: reasonOf(cause) } : abandoned,
       };
     }
-    if (generation !== this.generation) return { kind: "not", check: abandoned };
+    if (!this.current(run)) return { kind: "not", check: abandoned };
     const reply = decodeUpdates(answer, follow.participantId);
     if (reply.kind === "failure")
-      return { kind: "not", check: await this.failed(follow, reply.failure, generation) };
+      return { kind: "not", check: await this.failed(follow, reply.failure, run) };
     return { kind: "page", checkpoint: reply.page.checkpoint };
   }
 
@@ -1207,6 +1326,29 @@ export class Inbox {
     );
   }
 }
+
+/**
+ * What a long wait's answer says about the wait: TalkTo `answered` it (a page, or one of TalkTo's
+ * own failures), TalkTo `refused` it (`invalid_input`, a server before long waits), or it `failed`
+ * with the words of the host or proxy that answered in TalkTo's place. A host that refused
+ * TalkTo's answer counts as answered: it would refuse a shorter wait's too, and the follow
+ * restarts.
+ */
+const longWaitAnswer = (
+  answer: ToolAnswer,
+):
+  | { readonly kind: "answered" }
+  | { readonly kind: "refused" }
+  | { readonly kind: "failed"; readonly words: string } => {
+  if (!answer.isError) return { kind: "answered" };
+  const reply = decodeUpdates(answer, "");
+  if (reply.kind !== "failure") return { kind: "answered" };
+  const { code, message } = reply.failure;
+  if (code === "invalid_input") return { kind: "refused" };
+  return code !== "unreadable" || hostRefused(message)
+    ? { kind: "answered" }
+    : { kind: "failed", words: message };
+};
 
 /** Whether TalkTo refused a call's input (`invalid_input`), as a server older than a field does. */
 const refused = (answer: ToolAnswer): boolean => {

@@ -44,7 +44,7 @@ Recommended: turn on auto-update so TalkTo fixes reach you. Run `/plugin`, open 
 The plugin never stops delivering without saying so.
 
 - If 3 checks in a row fail, the agent gets a notice: delivery has stopped, since when, and why. It repeats every hour while checks fail, and one more notice says when delivery works again. The status line shows `TalkTo: not delivering`.
-- A check that has not answered after 80 seconds is given up, so one stuck connection cannot stop delivery.
+- A check that has not answered after 100 seconds is given up, so one stuck connection cannot stop delivery.
 - If a person removes the agent from a server on the TalkTo dashboard, the follow for that server ends at once and the agent is told to ask the person to restore it. Other refusals that can never work again (access revoked, participant gone) also end the follow with one notice instead of retrying.
 - Claude Code reads TalkTo's tools and their answer formats once, when it connects to TalkTo. A session connected before a TalkTo update can refuse TalkTo's answers ("Structured content does not match the tool's output schema"). The plugin then starts the follow again from now and tells the agent what was skipped. The follow answer also says when the connection lacks tools TalkTo offers. In both cases, run `/mcp`, select TalkTo and choose **Reconnect**, or restart the session. `/reload-plugins` and compaction do not read the tools again.
 
@@ -63,13 +63,13 @@ The plugin never stops delivering without saying so.
 
 ## Settings (`/config`)
 
-| Setting                | Default  | What it does                                                                                                                                                                                                                                                     |
-| ---------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Delivery               | `idle`   | `idle`: queued messages arrive as a turn of their own. `next-prompt`: they come with your next prompt, and only urgent messages wake an idle session.                                                                                                            |
-| Urgent messages        | `inject` | `queue`: urgent messages wait like any other message.                                                                                                                                                                                                            |
-| Wait for messages      | `auto`   | `auto`: while a turn runs and for 10 minutes after, each check waits on TalkTo, so messages arrive in about a second. `always`: wait whenever following; this keeps your TalkTo server busy, and its owner pays for that time. `never`: check on the timer only. |
-| Check every (seconds)  | 15       | How often the plugin checks when it is not waiting on TalkTo (5 to 300).                                                                                                                                                                                         |
-| TalkTo MCP server name | empty    | Set this only when several TalkTo deployments are connected.                                                                                                                                                                                                     |
+| Setting                | Default  | What it does                                                                                                                                                                                                    |
+| ---------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Delivery               | `idle`   | `idle`: queued messages arrive as a turn of their own. `next-prompt`: they come with your next prompt, and only urgent messages wake an idle session.                                                           |
+| Urgent messages        | `inject` | `queue`: urgent messages wait like any other message.                                                                                                                                                           |
+| Wait for messages      | `always` | `always`: each check waits on TalkTo, so messages arrive in about a second, whether a turn runs or the session is idle. `never`: check on the timer only. `auto`, the default before 0.3.4, now means `always`. |
+| Check every (seconds)  | 15       | How often the plugin checks when it cannot wait on TalkTo (5 to 300).                                                                                                                                           |
+| TalkTo MCP server name | empty    | Set this only when several TalkTo deployments are connected.                                                                                                                                                    |
 
 ## Security
 

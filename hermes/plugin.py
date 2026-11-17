@@ -36,8 +36,8 @@ from .inbox import (
     Inbox,
     Settings,
     TransportError,
-    WaitPolicy,
     read_follow_input,
+    wait_policy_of,
 )
 from .tools import (
     FOLLOW_PARAMETERS,
@@ -54,8 +54,15 @@ TOOLSET = "talkto-plugin"
 COMMAND = "talkto-inbox"
 #: The Hermes MCP server name TalkTo is configured under, unless the settings name another.
 DEFAULT_SERVER = "talkto"
-#: Seconds one TalkTo call may take: the longest server wait plus room for the network.
-CALL_TIMEOUT = WAIT_SECONDS + 15
+#: Seconds one TalkTo call may take beyond the wait it asks for: room for the network.
+CALL_MARGIN = 15
+
+
+def call_timeout(args: Mapping[str, Any]) -> int:
+    """Seconds one TalkTo call may take: its wait, at least ``WAIT_SECONDS``, plus room for the
+    network. Hermes caps it at ten minutes."""
+    wait = args.get("waitSeconds")
+    return max(WAIT_SECONDS, wait if isinstance(wait, int) else 0) + CALL_MARGIN
 #: Request messages searched for an urgent notice, newest first.
 _RECENT_MESSAGES = 12
 
@@ -107,9 +114,6 @@ def default_deps() -> Deps:
         timer.start()
 
     return Deps(now=lambda: time.monotonic() * 1000, after=after, session_key=_hermes_session_key)
-
-
-_WAITS: dict[str, WaitPolicy] = {"auto": "auto", "always": "always", "never": "never"}
 
 
 def _text_of(content: object) -> str:
@@ -237,7 +241,7 @@ class TalkToPlugin:
             else "idle",
             urgent="queue" if self._setting("urgent", "inject") == "queue" else "inject",
             poll_millis=int(min(300, max(5, seconds)) * 1000),
-            wait=_WAITS.get(str(self._setting("wait", "auto")), "auto"),
+            wait=wait_policy_of(self._setting("wait", "always")),
         )
 
     def _hint(self) -> str:
@@ -467,7 +471,7 @@ class _HermesHost:
     def call(self, tool: str, args: Mapping[str, Any]) -> Answer:
         try:
             raw = self._plugin._ctx.call_mcp(
-                self._plugin._server(), tool, dict(args), timeout=CALL_TIMEOUT
+                self._plugin._server(), tool, dict(args), timeout=call_timeout(args)
             )
         except PermissionError as cause:
             raise TransportError(str(cause)) from None

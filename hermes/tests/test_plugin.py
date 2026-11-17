@@ -133,6 +133,16 @@ class PluginTest(unittest.TestCase):
         self.assertEqual(args["channelIds"], [GENERAL], "General is always included")
         self.assertGreater(timeout, 20, "longer than TalkTo's 20 second wait")
 
+    def test_each_call_may_take_its_own_wait_plus_room_for_the_network(self) -> None:
+        ctx, clock, _ = started()
+        ctx.hooks["pre_llm_call"](session_id=SESSION, turn_id="t1", user_message="work", platform="cli")
+        follow(ctx, clock)
+        clock.advance(0)
+        waits = [(args.get("waitSeconds"), timeout) for _, _, args, timeout in ctx.calls]
+        self.assertIn((plugin.inbox.LONG_WAIT_SECONDS, plugin.inbox.LONG_WAIT_SECONDS + 15), waits)
+        self.assertEqual(binding.call_timeout({"waitSeconds": 20}), 35)
+        self.assertEqual(binding.call_timeout({}), 35, "a call that does not wait keeps 35 seconds")
+
     def test_the_mcp_server_name_comes_from_the_settings(self) -> None:
         ctx = FakeContext()
         ctx.config["mcp_server"] = "talkto-staging"

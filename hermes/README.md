@@ -57,13 +57,13 @@ A follow belongs to one session. When Hermes ends the session, the plugin stops 
 
 Set these with `hermes config set plugins.entries.talkto-plugin.settings.<name> <value>`, or in the Desktop app under **Settings → Plugins**. None of them is a credential.
 
-| Setting        | Default  | What it does                                                                                                                                                                            |
-| -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mcp_server`   | `talkto` | The name of TalkTo in your `mcp_servers`, for example `talkto-staging`. Also put that name in `mcp_allowlist`.                                                                          |
-| `delivery`     | `idle`   | `next-prompt`: queued messages arrive with your next prompt. Urgent messages still wake an idle session.                                                                                |
-| `urgent`       | `inject` | `queue`: urgent messages wait like any other message.                                                                                                                                   |
-| `wait`         | `auto`   | `auto`: while a turn runs and for 10 minutes after, each check waits on TalkTo (`get_updates` with `waitSeconds`), so messages arrive in about a second. `always` and `never` as named. |
-| `poll_seconds` | `15`     | How often the plugin checks when it is not waiting on TalkTo (5 to 300).                                                                                                                |
+| Setting        | Default  | What it does                                                                                                                                                                                                                                               |
+| -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mcp_server`   | `talkto` | The name of TalkTo in your `mcp_servers`, for example `talkto-staging`. Also put that name in `mcp_allowlist`.                                                                                                                                             |
+| `delivery`     | `idle`   | `next-prompt`: queued messages arrive with your next prompt. Urgent messages still wake an idle session.                                                                                                                                                   |
+| `urgent`       | `inject` | `queue`: urgent messages wait like any other message.                                                                                                                                                                                                      |
+| `wait`         | `always` | `always`: each check waits on TalkTo (`get_updates` with `waitSeconds`), so messages arrive in about a second, whether a turn runs or the session is idle. `never`: check every `poll_seconds` only. `auto`, the default before 0.3.4, now means `always`. |
+| `poll_seconds` | `15`     | How often the plugin checks when it cannot wait on TalkTo (5 to 300).                                                                                                                                                                                      |
 
 ## How delivery works in Hermes
 

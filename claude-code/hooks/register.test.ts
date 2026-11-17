@@ -3,7 +3,7 @@
 // and an urgent row into a running turn; in a terminal session and in a T3
 // Code thread, and nothing in a headless one.
 import type { On } from "claude-code";
-import { expect, mock, test } from "claude-code/testing";
+import { expect, mock, test, type MockClock } from "claude-code/testing";
 import { version } from "./version.ts";
 
 const server = "11111111-1111-4111-8111-111111111111";
@@ -58,6 +58,20 @@ const urgent = (id: string, body: string) => ({
   priority: "urgent" as const,
 });
 
+/** TalkTo refusing a call's input, as it refuses a wait longer than it allows. */
+const refusal = (message: string) => ({
+  isError: true,
+  content: [],
+  structuredContent: { error: { code: "invalid_input", message }, meta: {} },
+});
+
+/** Whether a page has nothing new: TalkTo holds such an answer to a waiting call until its deadline. */
+const isEmpty = (answer: ReturnType<typeof page> | Error) =>
+  !(answer instanceof Error) && answer.structuredContent.data.messages.length === 0;
+
+/** Seconds between the mock TalkTo's looks for a queued page while it holds a wait. */
+const holdStep = 5;
+
 /** What the engine beneath the plugin holds for one test. */
 interface Rig {
   /** get_updates answers in order; an Error makes the call fail, as a refused answer does. */
@@ -70,6 +84,15 @@ interface Rig {
   readonly tools?: string[];
   /** The plugin's store, which the test can read and change between steps. */
   readonly store?: Map<string, unknown>;
+  /**
+   * The test's clock. A waiting get_updates is held on it as TalkTo holds one: a queued empty page
+   * until the wait has passed, and with nothing queued until a page is queued or the wait has passed.
+   */
+  readonly clock?: MockClock;
+  /** The longest wait TalkTo allows a call that names its plugin: 50, or 20 before November 17. */
+  readonly pluginWait?: number;
+  /** A store key's next read waits for its promise, as a slow store would; used once. */
+  readonly gates?: Map<string, Promise<void>>;
 }
 
 /**
@@ -78,6 +101,8 @@ interface Rig {
  */
 const engine = (on: On, rig: Rig) => {
   const calls: { server: string; tool: string; args: unknown }[] = [];
+  /** The waitSeconds each get_updates poll asked for, 0 for none. */
+  const polls: number[] = [];
   const contexts: unknown[] = [];
   const submitted: string[] = [];
   const descriptions: string[] = [];
@@ -86,13 +111,31 @@ const engine = (on: On, rig: Rig) => {
   on("mcp.connect", () => ({
     value: { isConnected: true, server: "plugin:talkto-plugin:talkto" },
   }));
-  on("mcp.call", (_$, e) => {
+  on("mcp.call", async (_$, e) => {
     if (e.tool === "get_context") {
       contexts.push(e.args);
       return { value: rig.context ?? context };
     }
     calls.push(e);
-    const answer = rig.answers.shift() ?? page([], "cp-n");
+    const wait = Number(e.args["waitSeconds"] ?? 0);
+    if (e.args["mode"] === "poll") polls.push(wait);
+    const longest = e.args["plugin"] === undefined ? 20 : (rig.pluginWait ?? 50);
+    if (wait > longest)
+      return { value: refusal(`waitSeconds must be a value between 0 and ${longest}`) };
+    const queued = rig.answers.shift();
+    let answer = queued ?? page([], "cp-n");
+    if (wait > 0 && rig.clock !== undefined) {
+      if (queued !== undefined && isEmpty(queued)) await rig.clock.sleep(wait * 1000);
+      // Nothing queued: held until a page is queued, which ends the wait (seen within a
+      // `holdStep`), or until its deadline.
+      for (let held = 0; queued === undefined && held < wait; held += holdStep) {
+        await rig.clock.sleep(Math.min(holdStep, wait - held) * 1000);
+        const next = rig.answers.shift();
+        if (next === undefined) continue;
+        answer = next;
+        break;
+      }
+    }
     // `deny` rejects the plugin's $.mcp.call, as Claude Code does when it refuses an answer.
     return answer instanceof Error ? { deny: answer.message } : { value: answer };
   });
@@ -108,7 +151,12 @@ const engine = (on: On, rig: Rig) => {
   on("tool.list", () => ({
     value: tools.map((name) => ({ name, description: "", mcp: true })),
   }));
-  on("store.get", (_$, e) => ({ value: store.get(e.key) }));
+  on("store.get", async (_$, e) => {
+    const gate = rig.gates?.get(e.key);
+    rig.gates?.delete(e.key);
+    await gate;
+    return { value: store.get(e.key) };
+  });
   on("store.set", (_$, e) => {
     store.set(e.key, JSON.parse(JSON.stringify(e.value)));
     return { value: undefined };
@@ -124,7 +172,7 @@ const engine = (on: On, rig: Rig) => {
   on("turn.start", (_$, e) => ({ turnId: e.turnId }));
   on("turn.complete", () => ({ text: "" }));
   on("ui.status", () => ({ value: undefined }));
-  return { calls, contexts, submitted, descriptions, store };
+  return { calls, polls, contexts, submitted, descriptions, store };
 };
 
 const complete = { reason: "answer", answer: "done", durationMs: 10, isAborted: false } as const;
@@ -150,6 +198,7 @@ test("follow, poll through the session's MCP connection, queue while busy, deliv
   const clock = mock.clock(on, { now: 1_000_000 });
   const session = mock.session(on);
   const { calls, contexts, submitted, descriptions } = engine(on, {
+    clock,
     answers: [
       page([], "cp-0"),
       page(
@@ -203,12 +252,61 @@ test("follow, poll through the session's MCP connection, queue while busy, deliv
   expect(submitted[0]).not.toMatch(/stop: wrong database/);
 });
 
+test("an idle session keeps waiting on TalkTo, and a message sent to it starts a turn", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 });
+  const answers: (ReturnType<typeof page> | Error)[] = [page([], "cp-0")];
+  const { polls, submitted } = engine(on, { clock, answers });
+
+  await $.session.start({ cwd: "/", surface: "terminal", isInteractive: true });
+  await $.tool.call({ tool: "mcp__talkto-plugin__follow", serverId: server, participantId: me });
+  // No turn runs for half an hour: every check still waits on TalkTo, 50 seconds each, about one
+  // a minute (0.3.3 made three, 0.3.2 four).
+  await clock.advance(30 * 60_000);
+  expect(polls.length).toBeGreaterThanOrEqual(34);
+  expect(polls.length).toBeLessThanOrEqual(37);
+  expect(polls.every((wait) => wait === 50)).toBe(true);
+  expect(submitted).toEqual([]);
+
+  // A message for the idle agent ends the open wait, and the notice starts a turn within seconds.
+  answers.push(page([incoming("m1", "are you there?")], "cp-1"));
+  await clock.advance(holdStep * 1000 + 3_000);
+  expect(submitted.length).toBe(1);
+  expect(submitted[0]).toMatch(/are you there\?/);
+});
+
+test("where TalkTo refuses the long wait, an idle session waits 20 seconds and still starts a turn", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 });
+  const answers: (ReturnType<typeof page> | Error)[] = [page([], "cp-0")];
+  const { polls, submitted } = engine(on, { clock, answers, pluginWait: 20 });
+
+  await $.session.start({ cwd: "/", surface: "terminal", isInteractive: true });
+  await $.tool.call({ tool: "mcp__talkto-plugin__follow", serverId: server, participantId: me });
+  await clock.advance(29 * 60_000);
+  // The first check asks for 50 once, is refused, and is asked again at once with 20.
+  expect(polls[0]).toBe(50);
+  expect(polls.slice(1).every((wait) => wait === 20)).toBe(true);
+  expect(polls.length).toBeGreaterThanOrEqual(82);
+  expect(polls.length).toBeLessThanOrEqual(89);
+  expect(submitted).toEqual([]);
+  // Half an hour after the refusal it asks for 50 once more, in case TalkTo was updated.
+  const before = polls.length;
+  await clock.advance(2 * 60_000);
+  expect(polls.slice(before).filter((wait) => wait === 50).length).toBe(1);
+  expect(polls.at(-1)).toBe(20);
+
+  answers.push(page([incoming("m1", "are you there?")], "cp-1"));
+  await clock.advance(holdStep * 1000 + 3_000);
+  expect(submitted.length).toBe(1);
+  expect(submitted[0]).toMatch(/are you there\?/);
+});
+
 test("a T3 Code thread follows and delivers as the thread once T3's server is there, and says when nothing can wake it", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 });
   mock.env(on, t3Env);
   const session = mock.session(on);
   const tools: string[] = [];
   const { submitted, descriptions, store } = engine(on, {
+    clock,
     answers: [
       page([], "cp-0"),
       page([urgent("m2", "stop: wrong database")], "cp-1"),
@@ -260,6 +358,7 @@ test("the Claude T3 starts again for a thread restores the thread's follow and p
     [`t3:${thread}`, record("cp-saved", { holder: "session-1:old", aliveAt: 880_000 })],
   ]);
   const { calls, submitted } = engine(on, {
+    clock,
     answers: [page([incoming("m1", "sent while T3 had released the thread")], "cp-1")],
     tools: [...t3Tools],
     store,
@@ -283,6 +382,7 @@ test("a turn that starts while the session is still starting is not run over, an
     release = resolve;
   });
   const { submitted } = engine(on, {
+    clock,
     answers: [
       page(
         [incoming("m1", "sent while the person's turn runs"), urgent("m2", "stop: wrong database")],
@@ -317,6 +417,7 @@ test("T3's environment without T3's own server (a helper run, a script) never to
   const saved = record("cp-saved", { holder: "session-1:thread", aliveAt: 999_000 });
   const store = new Map<string, unknown>([[`t3:${thread}`, saved]]);
   const { calls, submitted } = engine(on, {
+    clock,
     answers: [page([incoming("m1", "for the thread")], "cp-1")],
     tools: [],
     store,
@@ -342,6 +443,7 @@ test("a second process for a live thread stands by, then takes over once the hol
     [`t3:${thread}`, record("cp-saved", { holder: "session-1:other", aliveAt: 1_000_000 })],
   ]);
   const { calls, submitted } = engine(on, {
+    clock,
     answers: [page([incoming("m1", "waited for the takeover")], "cp-1")],
     tools: [...t3Tools],
     store,
@@ -374,6 +476,7 @@ test("a holder that finds another live holder stops delivering", async ($, on) =
   mock.env(on, t3Env);
   const store = new Map<string, unknown>([[`t3:${thread}`, record("cp-saved")]]);
   const { calls, submitted } = engine(on, {
+    clock,
     answers: [page([], "cp-1"), page([incoming("m1", "for the new holder")], "cp-2")],
     tools: [...t3Tools],
     store,
@@ -400,7 +503,12 @@ test("a thread's Claude that ends frees its lease at once and keeps the follow",
   const clock = mock.clock(on, { now: 1_000_000 });
   mock.env(on, t3Env);
   const store = new Map<string, unknown>([[`t3:${thread}`, record("cp-saved")]]);
-  const { calls } = engine(on, { answers: [page([], "cp-1")], tools: [...t3Tools], store });
+  const { calls } = engine(on, {
+    clock,
+    answers: [page([incoming("m1", "before the end")], "cp-1")],
+    tools: [...t3Tools],
+    store,
+  });
   on("session.end", (_$, e) => ({ sessionId: e.sessionId }));
 
   await $.session.start({ cwd: "/", surface: null, isInteractive: false });
@@ -412,8 +520,37 @@ test("a thread's Claude that ends frees its lease at once and keeps the follow",
   expect(Number(saved.match(/"aliveAt":(-?\d+)/)?.[1])).toBeLessThan(1_002_000 - 60_000);
   expect(saved).toMatch(/"checkpoint":"cp-1"/);
   const polled = calls.length;
+  // The wait still open at the end answers later: it polls no more and renews nothing.
   await clock.advance(60_000);
   expect(calls.length).toBe(polled);
+  expect(JSON.stringify(store.get(`t3:${thread}`))).toBe(saved);
+});
+
+test("a thread's Claude that ends while it renews its lease leaves the freed lease free", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 });
+  mock.env(on, t3Env);
+  const store = new Map<string, unknown>([[`t3:${thread}`, record("cp-saved")]]);
+  const gates = new Map<string, Promise<void>>();
+  engine(on, { clock, answers: [], tools: [...t3Tools], store, gates });
+  on("session.end", (_$, e) => ({ sessionId: e.sessionId }));
+
+  await $.session.start({ cwd: "/", surface: null, isInteractive: false });
+  await clock.advance(2_000);
+  expect(holderOf(store)).toMatch(/^session-1:/);
+  // The next renewal reads the lease slowly, and the session ends before it writes.
+  let read = (): void => undefined;
+  gates.set(
+    `t3:${thread}`,
+    new Promise<void>((resolve) => {
+      read = resolve;
+    }),
+  );
+  await clock.advance(20_000);
+  await $.session.end({ reason: "other", sessionId: "session-1" });
+  read();
+  await clock.advance(1_000);
+  const saved = JSON.stringify(store.get(`t3:${thread}`));
+  expect(Number(saved.match(/"aliveAt":(-?\d+)/)?.[1])).toBeLessThan(1_000_000);
 });
 
 test("thread records nobody renewed for a month are removed", async ($, on) => {
@@ -424,7 +561,12 @@ test("thread records nobody renewed for a month are removed", async ($, on) => {
     ["t3:recent", record("cp-recent", { holder: "s:new", aliveAt: 39 * 24 * 60 * 60 * 1000 })],
     ["session:terminal", record("cp-terminal")],
   ]);
-  engine(on, { answers: [], tools: [...t3Tools], store });
+  engine(on, {
+    clock,
+    answers: [],
+    tools: [...t3Tools],
+    store,
+  });
   await $.session.start({ cwd: "/", surface: null, isInteractive: false });
   await clock.advance(2_000);
   expect([...store.keys()].sort()).toEqual(["session:terminal", `t3:${thread}`, "t3:recent"]);
@@ -434,6 +576,7 @@ test("after a reload or compaction a terminal session resumes its stored follow 
   const clock = mock.clock(on, { now: 1_000_000 });
   const store = new Map<string, unknown>([["session:session-1", record("cp-saved")]]);
   const { calls, submitted } = engine(on, {
+    clock,
     answers: [page([incoming("m1", "sent while reloading")], "cp-1")],
     store,
   });
@@ -449,6 +592,7 @@ test("a stale TalkTo connection is named at follow, and a refused answer restart
   const clock = mock.clock(on, { now: 1_000_000 });
   const listed = "mcp__plugin_talkto-plugin_talkto__";
   const { calls, submitted } = engine(on, {
+    clock,
     answers: [
       page([], "cp-0"),
       new Error(

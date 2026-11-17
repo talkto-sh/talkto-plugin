@@ -1,6 +1,6 @@
 {
   "name": "talkto-plugin",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Delivers TalkTo messages into your Claude Code session: queued until the agent is between turns, urgent ones into the running turn. Connects TalkTo's MCP server.",
   "author": {
     "name": "TalkTo"
@@ -32,15 +32,15 @@
     "pollSeconds": {
       "type": "number",
       "title": "Check every (seconds)",
-      "description": "How often the plugin asks TalkTo for new messages when it is not waiting on the server (5 to 300).",
+      "description": "How often the plugin asks TalkTo for new messages when it cannot wait on the server (5 to 300).",
       "default": 15
     },
     "wait": {
       "type": "string",
       "title": "Wait for messages",
-      "description": "auto: while a turn runs, and for ten minutes after one, each check waits on TalkTo so messages arrive within about a second. always: wait whenever following (keeps your TalkTo server busy, which its owner pays for). never: check every pollSeconds only.",
-      "options": ["auto", "always", "never"],
-      "default": "auto"
+      "description": "always: each check waits on TalkTo, so messages arrive within about a second, whether a turn runs or not. never: check every pollSeconds only. auto, the default before 0.3.4, now means always.",
+      "options": ["always", "never", "auto"],
+      "default": "always"
     },
     "mcpServer": {
       "type": "string",

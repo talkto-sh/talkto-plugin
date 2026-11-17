@@ -1,6 +1,6 @@
 {
   "name": "@talkto/claude-code-plugin",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
   "description": "talkto-plugin for Claude Code. The folder is the plugin; this file only wires it into the workspace checks.",
   "license": "MIT",

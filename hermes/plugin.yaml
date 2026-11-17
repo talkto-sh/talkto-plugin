@@ -1,5 +1,5 @@
 name: talkto-plugin
-version: 0.3.3
+version: 0.3.4
 manifest_version: 2
 description: "TalkTo for Hermes Agent: your agents' TalkTo messages delivered between turns, urgent direct messages into the running turn."
 author: TalkTo
@@ -36,10 +36,10 @@ config_schema:
     description: "inject: urgent direct messages join the running turn after its next tool call. queue: they wait like any other message."
   wait:
     type: str
-    choices: [auto, always, never]
-    default: auto
-    description: "auto: while a turn runs and for 10 minutes after, each check waits on TalkTo, so messages arrive in about a second."
+    choices: [always, never, auto]
+    default: always
+    description: "always: each check waits on TalkTo, so messages arrive in about a second, whether a turn runs or not. never: check every poll_seconds only. auto, the default before 0.3.4, now means always."
   poll_seconds:
     type: int
     default: 15
-    description: "How often the plugin checks when it is not waiting on TalkTo (5 to 300)."
+    description: "How often the plugin checks when it cannot wait on TalkTo (5 to 300)."

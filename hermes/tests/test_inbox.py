@@ -3,6 +3,8 @@ delivered, what goes into a running turn, and what survives a restart."""
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 from support import (
@@ -20,6 +22,7 @@ from support import (
 )
 
 plugin = load()
+OTHER_SERVER = "66666666-6666-4666-8666-666666666666"
 inbox_module = plugin.inbox
 Inbox, Settings = inbox_module.Inbox, inbox_module.Settings
 SETTLE = inbox_module.SETTLE_MILLIS
@@ -349,10 +352,13 @@ class InboxTest(unittest.TestCase):
         host = FakeHost()
         inbox = followed(host)
         inbox.on_turn_start("t1", "x")
-        # Such a server predates the plugin field too: it refuses the call with it, then without it.
+        # Such a server predates the plugin field too: it refuses the long wait, then the published
+        # wait with the plugin field, then without it.
+        host.answers.append(refusal("invalid_input", "waitSeconds must be a value between 0 and 20"))
         host.answers.append(refusal("invalid_input", "plugin is not allowed"))
         host.answers.append(refusal("invalid_input", "waitSeconds is not allowed"))
         inbox.tick()
+        self.assertEqual(host.calls[-4][1].get("waitSeconds"), inbox_module.LONG_WAIT_SECONDS)
         self.assertEqual(host.calls[-3][1].get("plugin"), f"hermes/{plugin.version.VERSION}")
         self.assertEqual(host.calls[-2][1].get("waitSeconds"), 20)
         self.assertNotIn("plugin", host.calls[-2][1])
@@ -365,6 +371,7 @@ class InboxTest(unittest.TestCase):
         host = FakeHost()
         inbox = followed(host)
         inbox.on_turn_start("t1", "x")
+        host.answers.append(refusal("invalid_input", "waitSeconds must be a value between 0 and 20"))
         host.answers.append(refusal("invalid_input", "plugin is not allowed"))
         host.answers.append(envelope([message()]))
         inbox.tick()
@@ -423,14 +430,309 @@ class InboxTest(unittest.TestCase):
             self.assertEqual(len(host.submitted), 1)
             self.assertNotIn("plugin update", host.submitted[0], version)
 
-    def test_an_idle_session_stops_waiting_after_ten_minutes(self) -> None:
+    def test_an_idle_session_keeps_waiting_and_a_message_to_it_starts_a_turn(self) -> None:
         host = FakeHost()
         inbox = followed(host)
         inbox.on_turn_start("t1", "x")
         inbox.on_turn_complete("t1")
-        host.clock.time += inbox_module.ENGAGED_MILLIS
+        # Half an hour without a turn: every check still waits, and each arranges the next.
+        for second in range(30 * 60):
+            if second == 20 * 60:
+                host.answers.append(envelope([message(conversationId=DIRECT, body="are you there?")]))
+            host.clock.advance(1000)
+        polls = [args for _, args in host.calls if args.get("mode") == "poll"]
+        self.assertGreater(len(polls), 30)
+        long = inbox_module.LONG_WAIT_SECONDS
+        self.assertTrue(all(args.get("waitSeconds") == long for args in polls))
+        self.assertTrue(all(args.get("plugin") for args in polls), "TalkTo allows it a plugin")
+        self.assertEqual(len(host.submitted), 1, "the message started a turn of its own")
+        self.assertIn("are you there?", host.submitted[0])
+
+    def test_every_wait_setting_but_never_waits(self) -> None:
+        self.assertEqual(inbox_module.wait_policy_of("never"), "never")
+        for setting in ("always", "auto", None, "", "sometimes", 20):
+            self.assertEqual(inbox_module.wait_policy_of(setting), "always", setting)
+        self.assertEqual(Settings().wait, "always")
+
+    def test_without_waits_an_idle_session_is_checked_every_poll_seconds(self) -> None:
+        for refuses in (True, False):
+            host = FakeHost()
+            inbox = followed(host, None if refuses else Settings(wait="never"))
+            if refuses:
+                # An older server: it refuses the long wait, the plugin field, then waitSeconds.
+                host.answers.append(
+                    refusal("invalid_input", "waitSeconds must be a value between 0 and 20")
+                )
+                host.answers.append(refusal("invalid_input", "plugin is not allowed"))
+                host.answers.append(refusal("invalid_input", "waitSeconds is not allowed"))
+            inbox.tick()
+            first = len(host.calls)
+            host.clock.advance(15_000 - 1)
+            self.assertEqual(len(host.calls), first, "no check before poll_seconds")
+            host.answers.append(envelope([message(body="still delivered")]))
+            host.clock.advance(1)
+            self.assertNotIn("waitSeconds", host.calls[-1][1])
+            host.clock.advance(SETTLE)
+            self.assertEqual(len(host.submitted), 1, refuses)
+            self.assertIn("still delivered", host.submitted[0])
+            host.clock.advance(15_000)
+            self.assertEqual(len(host.calls), first + 2, "and on every poll_seconds after")
+
+    def test_a_failed_check_is_tried_again_when_the_backoff_ends(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        host.answers.append(inbox_module.TransportError("offline"))
         inbox.tick()
-        self.assertNotIn("waitSeconds", host.calls[-1][1])
+        calls = len(host.calls)
+        inbox.on_turn_start("t1", "x")
+        inbox.on_turn_complete("t1")
+        host.clock.advance(SETTLE)
+        self.assertEqual(len(host.calls), calls, "no call before the backoff ends")
+        host.answers.append(envelope([message(body="after the outage")]))
+        host.clock.advance(30_000)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), inbox_module.LONG_WAIT_SECONDS)
+        host.clock.advance(SETTLE)
+        self.assertEqual(len(host.submitted), 1)
+        self.assertIn("after the outage", host.submitted[0])
+
+    def test_a_refused_long_wait_is_asked_again_with_20_and_tried_again_half_an_hour_on(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        # A server from November 16, 2026: it knows the plugin field and waits up to 20 seconds.
+        host.answers.append(refusal("invalid_input", "waitSeconds must be a value between 0 and 20"))
+        host.answers.append(envelope([message(body="not lost")]))
+        inbox.tick()
+        long, retried = host.calls[-2][1], host.calls[-1][1]
+        self.assertEqual(long.get("waitSeconds"), inbox_module.LONG_WAIT_SECONDS)
+        self.assertEqual(retried.get("waitSeconds"), 20)
+        self.assertEqual(retried.get("plugin"), f"hermes/{plugin.version.VERSION}")
+        self.assertEqual(retried["checkpoint"], long["checkpoint"], "the same check")
+        host.clock.advance(SETTLE)
+        self.assertIn("not lost", host.submitted[-1])
+        host.clock.advance(inbox_module.REARM_MILLIS)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20, "no long wait for a while")
+        # Half an hour later a long wait is tried again: the server may have been updated.
+        host.clock.time += inbox_module.LONG_WAIT_RETRY_MILLIS
+        host.clock.advance(inbox_module.REARM_MILLIS)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), inbox_module.LONG_WAIT_SECONDS)
+
+    def test_a_long_wait_hermes_cuts_is_asked_again_at_once_with_20(self) -> None:
+        long = inbox_module.LONG_WAIT_SECONDS
+        host = FakeHost()
+        inbox = followed(host)
+        cut = inbox_module.TransportError("TimeoutError: timed out")
+        host.answers.append(cut)
+        host.answers.append(envelope([message(conversationId=DIRECT, body="still here")]))
+        inbox.tick()
+        self.assertEqual(host.calls[-2][1].get("waitSeconds"), long)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20)
+        host.clock.advance(SETTLE)
+        self.assertIn("still here", host.submitted[-1], "the idle agent still gets its turn")
+        host.clock.advance(inbox_module.REARM_MILLIS)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20)
+        # A laptop that slept, or a network that changed, does not cost long waits for good.
+        host.clock.time += inbox_module.LONG_WAIT_RETRY_MILLIS
+        host.clock.advance(inbox_module.REARM_MILLIS)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), long, "tried again")
+        host.answers.append(cut)
+        host.answers.append(envelope([message(conversationId=DIRECT, body="cut again")]))
+        host.clock.advance(inbox_module.REARM_MILLIS)
+        self.assertEqual(host.calls[-2][1].get("waitSeconds"), long)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20, "a cut steps down again")
+        queued = [item["body"] for item in host.stored["follows"][0]["pending"]]
+        self.assertIn("cut again", queued, "what the 20-second wait read is queued")
+
+    def test_talktos_own_thrown_failures_and_brief_network_drops_keep_long_waits(self) -> None:
+        for failure in (
+            "HTTPStatusError: Server error '503 Service Unavailable' for url 'https://talkto.sh/mcp'",
+            "McpError: Unauthorized",
+            "ConnectError: [Errno 61] Connection refused",
+        ):
+            host = FakeHost()
+            inbox = followed(host)
+            host.answers.append(inbox_module.TransportError(failure))
+            calls = len(host.calls)
+            inbox.tick()
+            self.assertEqual(len(host.calls), calls + 1, failure)
+            host.clock.advance(10 * 60 * 1000)
+            long = inbox_module.LONG_WAIT_SECONDS
+            self.assertEqual(host.calls[-1][1].get("waitSeconds"), long, failure)
+
+    def test_a_long_wait_that_fails_after_25_seconds_was_cut_whatever_it_says(self) -> None:
+        # A gateway that ends the calls it holds 30 seconds, with words that name nothing: thrown,
+        # or answered in TalkTo's place.
+        self.assertTrue(20_000 < inbox_module.CUT_MILLIS < 30_000)
+        for failure in (
+            inbox_module.TransportError("McpError: "),
+            inbox_module.TransportError(
+                "RemoteProtocolError: Server disconnected without sending a response."
+            ),
+            inbox_module.Answer(None),
+        ):
+            host = FakeHost()
+            inbox = followed(host)
+            call = host.call
+
+            def calling(tool, args, failure=failure):
+                if tool == "get_updates" and args.get("waitSeconds", 0) > 20:
+                    host.calls.append((tool, dict(args)))
+                    host.clock.time += 30_000
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+                return call(tool, args)
+
+            host.call = calling
+            inbox.tick()
+            self.assertEqual(host.calls[-2][1].get("waitSeconds"), inbox_module.LONG_WAIT_SECONDS)
+            self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20, str(failure))
+            self.assertEqual(host.calls[-1][1]["checkpoint"], host.calls[-2][1]["checkpoint"])
+            # Later checks wait 20, which the gateway lets through: a message sent later arrives.
+            for _ in range(7):
+                host.clock.advance(inbox_module.REARM_MILLIS)
+            host.answers.append(envelope([message(conversationId=DIRECT, body="sent later")]))
+            host.clock.advance(inbox_module.REARM_MILLIS)
+            self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20)
+            host.clock.advance(SETTLE)
+            self.assertIn("sent later", host.submitted[-1], str(failure))
+
+    def test_two_long_waits_in_a_row_that_fail_step_down_however_fast(self) -> None:
+        self.assertEqual(inbox_module.LONG_WAIT_TRIES, 2)
+        long = inbox_module.LONG_WAIT_SECONDS
+        host = FakeHost()
+        inbox = followed(host)
+        fast = "HTTPStatusError: Server error '500 Internal Server Error'"
+        host.answers.append(inbox_module.TransportError(fast))
+        inbox.tick()
+        # A long wait that works in between starts the count again.
+        host.answers.append(envelope([]))
+        host.answers.append(inbox_module.TransportError(fast))
+        host.clock.advance(10 * 60 * 1000)
+        host.clock.advance(inbox_module.REARM_MILLIS)
+        polls = [args.get("waitSeconds") for _, args in host.calls if args.get("mode") == "poll"]
+        self.assertEqual(polls, [long, long, long])
+        host.answers.append(inbox_module.TransportError(fast))
+        host.answers.append(envelope([message(conversationId=DIRECT, body="after two")]))
+        host.clock.advance(10 * 60 * 1000)
+        self.assertEqual(host.calls[-2][1].get("waitSeconds"), long)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), 20, "the second in a row")
+        self.assertEqual(host.calls[-1][1]["checkpoint"], host.calls[-2][1]["checkpoint"])
+        host.clock.advance(SETTLE)
+        self.assertIn("after two", host.submitted[-1])
+
+    def test_following_again_after_failed_checks_polls_at_once(self) -> None:
+        host = FakeHost()
+        inbox = followed(host, Settings(wait="never"))
+        for _ in range(5):
+            host.answers.append(inbox_module.TransportError("ConnectError: connection refused"))
+            host.clock.time += 10 * 60 * 1000
+            inbox.tick()
+        failed = len(host.calls)
+        inbox.tick()
+        self.assertEqual(len(host.calls), failed, "the failures earned a wait")
+        host.clock.timers.clear()
+        host.answers.append(envelope([], checkpoint="refollowed"))
+        host.answers.append(envelope([message(body="at once")]))
+        follow_with(inbox, [GENERAL])
+        host.clock.advance(0)
+        self.assertEqual(host.calls[-1][1]["checkpoint"], "refollowed", "polled at once")
+        host.clock.advance(SETTLE)
+        self.assertIn("at once", host.submitted[-1])
+
+    def test_following_again_while_a_check_hangs_gives_it_up_and_polls_at_once(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        release = threading.Event()
+        call = host.call
+        hang = [True]
+
+        def calling(tool, args):
+            if hang[0] and tool == "get_updates" and args.get("mode") == "poll":
+                hang[0] = False
+                host.calls.append((tool, dict(args)))
+                release.wait(10)
+                return inbox_module.Answer(
+                    envelope([message(body="from the old follow")], checkpoint="old")
+                )
+            return call(tool, args)
+
+        host.call = calling
+        ticking = threading.Thread(target=inbox.tick, daemon=True)
+        ticking.start()
+        for _ in range(200):
+            if hang[0] is False:
+                break
+            time.sleep(0.01)
+        host.answers.append(envelope([], checkpoint="refollowed"))
+        host.answers.append(envelope([message(body="at once")], checkpoint="cp-new"))
+        follow_with(inbox, [GENERAL])
+        host.clock.advance(0)
+        self.assertFalse(release.is_set())
+        self.assertEqual(host.calls[-1][1]["checkpoint"], "refollowed", "polled at once")
+        host.clock.advance(SETTLE)
+        self.assertIn("at once", host.submitted[-1])
+        release.set()
+        ticking.join(10)
+        self.assertFalse(ticking.is_alive())
+        self.assertNotIn("from the old follow", "".join(host.submitted))
+        self.assertNotEqual(host.stored["follows"][0]["checkpoint"], "old", "its answer changed nothing")
+
+    def test_one_follows_open_wait_never_holds_back_another_follows_messages(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        host.answers.append(envelope([]))
+        answer = inbox.follow(
+            inbox_module.read_follow_input(
+                {"serverId": OTHER_SERVER, "participantId": ME, "channelIds": [GENERAL]}
+            )
+        )
+        self.assertTrue(answer.startswith("Following participant"), answer)
+        host.clock.timers.clear()
+        # The other server's wait stays open until the test ends it.
+        release = threading.Event()
+        call = host.call
+
+        def calling(tool, args):
+            if tool == "get_updates" and args.get("serverId") == OTHER_SERVER:
+                host.calls.append((tool, dict(args)))
+                release.wait(10)
+                return inbox_module.Answer(envelope([message(body="from the other server")]))
+            return call(tool, args)
+
+        host.call = calling
+        host.answers.append(envelope([message(conversationId=DIRECT, body="from the first server")]))
+        ticking = threading.Thread(target=inbox.tick, daemon=True)
+        ticking.start()
+        for _ in range(200):
+            if host.submitted:
+                break
+            time.sleep(0.01)
+        self.assertFalse(release.is_set())
+        self.assertEqual(len(host.submitted), 1, "the first server's message did not wait")
+        self.assertIn("from the first server", host.submitted[0])
+        self.assertNotIn("from the other server", host.submitted[0])
+
+        # In a turn, an urgent message on the first server is there for the next tool result.
+        inbox.on_turn_start("t1", host.submitted[0])
+        host.answers.append(envelope([message(conversationId=DIRECT, priority="urgent", body="stop")]))
+        host.clock.advance(inbox_module.REARM_MILLIS)
+        urgent = inbox.take_urgent("t1")
+        assert urgent is not None
+        self.assertIn("stop", urgent)
+        self.assertFalse(release.is_set(), "while the other server's wait is still open")
+        release.set()
+        ticking.join(10)
+        self.assertFalse(ticking.is_alive())
+
+    def test_talktos_own_failure_on_a_long_wait_is_handled_as_before(self) -> None:
+        host = FakeHost()
+        inbox = followed(host)
+        host.answers.append(refusal("storage_unavailable", "try again"))
+        calls = len(host.calls)
+        inbox.tick()
+        self.assertEqual(len(host.calls), calls + 1, "no second call: TalkTo answered")
+        host.clock.advance(10 * 60 * 1000)
+        self.assertEqual(host.calls[-1][1].get("waitSeconds"), inbox_module.LONG_WAIT_SECONDS)
 
     def test_a_truncated_page_is_read_again_with_fewer_messages(self) -> None:
         host = FakeHost()

@@ -5,9 +5,12 @@ import { test } from "node:test";
 import {
   Inbox,
   channelLimit,
-  engagedMillis,
+  cutMillis,
   isSaved,
   lockRetryMillis,
+  longWaitRetryMillis,
+  longWaitSeconds,
+  longWaitTries,
   queueBodyBudget,
   queueLimit,
   readFollowInput,
@@ -16,11 +19,13 @@ import {
   stallChecks,
   stallRepeatMillis,
   stuckMillis,
+  waitPolicyOf,
   waitSeconds,
   watchedChannels,
 } from "../src/inbox.ts";
 import { decodeUpdates, generalIdOf, messageIdsOf } from "../src/talkto.ts";
 import { bodyFloor, bodyLimit, noticeBodyBudget } from "../src/notice.ts";
+import { callTool } from "../src/mcp.ts";
 
 const server = "11111111-1111-4111-8111-111111111111";
 const me = "22222222-2222-4222-8222-222222222222";
@@ -934,7 +939,7 @@ test("while a turn runs, each poll waits on the server and the next starts right
     reply([message({ conversationId: direct, priority: "urgent", body: "stop the deploy" })]),
   );
   await host.advance(0);
-  assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds);
+  assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds);
   assert.match(host.injected[0], /stop the deploy/, "what ended the wait goes into the turn");
 
   const before = polls(host).length;
@@ -943,7 +948,7 @@ test("while a turn runs, each poll waits on the server and the next starts right
   assert.equal(host.timers.length, 1, "a backstop tick does not add a second chain");
   await host.advance(rearmMillis);
   assert.equal(polls(host).length, before + 2);
-  assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds);
+  assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds);
 });
 
 test("only the first page waits; continuations are read at once", async () => {
@@ -953,33 +958,84 @@ test("only the first page waits; continuations are read at once", async () => {
   host.answers.push(reply([message()], { nextCursor: "more" }), reply([message()]));
   await inbox.tick();
   const [first, second] = polls(host).slice(-2);
-  assert.equal(first.args.waitSeconds, waitSeconds);
+  assert.equal(first.args.waitSeconds, longWaitSeconds);
   assert.equal("waitSeconds" in second.args, false);
 });
 
-test("auto waits for ten minutes after the last turn, then checks on the timer", async () => {
+const hours = 60 * 60 * 1000;
+
+test("an idle follow keeps waiting on the server, and a message to the idle agent starts a turn", async () => {
   const host = fakeHost();
   const inbox = await followed(host);
   inbox.onTurnStart("t1");
   await inbox.onTurnComplete("t1");
+  // Hours after the last turn, every poll still waits, and the next starts as soon as one ends.
+  host.time += 3 * hours;
   host.timers = [];
-  host.time += engagedMillis - 1;
   await inbox.tick();
-  assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds);
-  host.timers = [];
-  host.time += 1;
-  await inbox.tick();
-  assert.equal(
-    "waitSeconds" in polls(host).at(-1).args,
-    false,
-    "idle sessions do not hold the server",
-  );
-  assert.equal(host.timers.length, 0, "no chained poll while idle");
-  host.answers.push(reply([message()]));
-  await inbox.tick();
+  assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds);
+  assert.equal(polls(host).at(-1).args.plugin, "claude-code/0.3.0", "TalkTo allows it a plugin");
+  assert.equal(host.timers.length, 1, "the next waiting poll is chained");
+  host.answers.push(reply([message({ conversationId: direct, body: "are you there?" })]));
+  await host.advance(rearmMillis);
+  assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds);
+  // The message that ended the wait arrives as a turn of its own, as before.
+  assert.equal(host.submitted.length, 1);
+  assert.match(host.submitted[0], /are you there\?/);
+  assert.deepEqual(host.stored.follows[0].pending, []);
+});
+
+const otherServer = "66666666-6666-4666-8666-666666666666";
+
+test("one follow's open wait never holds back another follow's messages, queued or urgent", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
   host.answers.push(reply([]));
-  await inbox.tick();
-  assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds, "a new message re-engages");
+  await inbox.follow({
+    serverId: otherServer,
+    participantId: me,
+    channelIds: [general],
+    directChats: "own",
+    startAt: "now",
+  });
+  // The other server's waits stay open until the test ends them.
+  const open = [];
+  const call = host.call;
+  host.call = async (tool, args) => {
+    if (tool === "get_updates" && args.mode === "poll" && args.serverId === otherServer) {
+      host.calls.push({ tool, args });
+      return new Promise((resolve) => open.push(resolve));
+    }
+    return call(tool, args);
+  };
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  host.timers = [];
+  host.answers.push(reply([message({ conversationId: direct, body: "from the first server" })]));
+  void inbox.tick();
+  await flush();
+  assert.equal(open.length, 1, "the other server's wait is open");
+  assert.equal(host.submitted.length, 1, "the first server's message did not wait for it");
+  assert.match(host.submitted[0], /from the first server/);
+
+  // In a turn, an urgent message on the first server goes in at its next check, as before.
+  inbox.onTurnStart("t1");
+  host.answers.push(
+    reply([message({ conversationId: direct, priority: "urgent", body: "stop the deploy" })]),
+  );
+  await host.advance(rearmMillis);
+  await flush();
+  assert.match(host.injected.at(-1), /stop the deploy/);
+  assert.equal(open.length, 1, "still one wait open there, never a second");
+
+  // The other server's message, when its wait ends, arrives on its own.
+  host.call = call;
+  open[0](reply([message({ conversationId: direct, body: "from the other server" })]));
+  await flush();
+  await inbox.onTurnComplete("t1");
+  await host.advance(settleMillis);
+  await flush();
+  assert.match(host.submitted.at(-1), /from the other server/);
+  assert.equal(host.stored.follows.length, 2);
 });
 
 test("wait=never checks on the timer only; wait=always waits while idle", async () => {
@@ -993,22 +1049,52 @@ test("wait=never checks on the timer only; wait=always waits while idle", async 
 
   const always = fakeHost();
   const eager = await followed(always, { ...settings, wait: "always" });
-  always.time += engagedMillis * 3;
+  always.time += 3 * hours;
   await eager.tick();
-  assert.equal(polls(always).at(-1).args.waitSeconds, waitSeconds);
+  assert.equal(polls(always).at(-1).args.waitSeconds, longWaitSeconds);
+});
+
+test("every wait setting but never waits; auto, the default before 0.3.4, is the same as always", () => {
+  assert.equal(waitPolicyOf("never"), "never");
+  for (const setting of ["always", "auto", undefined, "", "sometimes", 20])
+    assert.equal(waitPolicyOf(setting), "always", String(setting));
+});
+
+test("a host whose server refuses waitSeconds keeps checking on its timer, without waiting", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(
+    failure("invalid_input", "waitSeconds must be a value between 0 and 20"),
+    failure("invalid_input", "unknown plugin"),
+    failure("invalid_input", "unknown waitSeconds"),
+    reply([]),
+  );
+  host.timers = [];
+  await inbox.tick();
+  assert.equal(host.timers.length, 0, "nothing is chained: the host's timer checks next");
+  host.time += 3 * hours;
+  host.answers.push(reply([message({ body: "still delivered" })]));
+  await inbox.tick();
+  assert.equal("waitSeconds" in polls(host).at(-1).args, false);
+  assert.equal(host.timers.length, 0);
+  assert.equal(host.submitted.length, 1);
+  assert.match(host.submitted[0], /still delivered/);
 });
 
 test("a server that does not know waitSeconds is asked again without it, and the follow survives", async () => {
   const host = fakeHost();
   const inbox = await followed(host);
   inbox.onTurnStart("t1");
-  // Such a server predates the plugin field too: it refuses the call with it, then without it.
+  // Such a server predates the plugin field too: it refuses the long wait, then the published
+  // wait with the plugin field, then without it.
   host.answers.push(
+    failure("invalid_input", "waitSeconds must be a value between 0 and 20"),
     failure("invalid_input", "unknown plugin"),
     failure("invalid_input", "unknown waitSeconds"),
     reply([message()]),
   );
   await inbox.tick();
+  assert.equal(polls(host).at(-4).args.waitSeconds, longWaitSeconds);
   const [refused, unreported, retried] = polls(host).slice(-3);
   assert.equal(refused.args.waitSeconds, waitSeconds);
   assert.equal(refused.args.plugin, "claude-code/0.3.0");
@@ -1027,7 +1113,11 @@ test("a server that refuses only the plugin field is asked again without it and 
   const host = fakeHost();
   const inbox = await followed(host);
   inbox.onTurnStart("t1");
-  host.answers.push(failure("invalid_input", "unknown plugin"), reply([message()]));
+  host.answers.push(
+    failure("invalid_input", "waitSeconds must be a value between 0 and 20"),
+    failure("invalid_input", "unknown plugin"),
+    reply([message()]),
+  );
   await inbox.tick();
   const [refused, retried] = polls(host).slice(-2);
   assert.equal(refused.args.plugin, "claude-code/0.3.0");
@@ -1039,11 +1129,217 @@ test("a server that refuses only the plugin field is asked again without it and 
   assert.equal("plugin" in polls(host).at(-1).args, false, "and leave the field out");
 });
 
+test("a server that refuses the long wait is asked again at once with 20, and later polls wait 20", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  // A server from November 16, 2026: it knows the plugin field and waits up to 20 seconds.
+  host.answers.push(
+    failure("invalid_input", "waitSeconds must be a value between 0 and 20"),
+    reply([message({ body: "not lost" })]),
+  );
+  await inbox.tick();
+  const [long, retried] = polls(host).slice(-2);
+  assert.equal(long.args.waitSeconds, longWaitSeconds);
+  assert.equal(retried.args.waitSeconds, waitSeconds);
+  assert.equal(retried.args.plugin, "claude-code/0.3.0");
+  assert.equal(retried.args.checkpoint, long.args.checkpoint, "the same check");
+  assert.match(host.submitted.at(-1), /not lost/, "what it read is delivered");
+  await host.advance(rearmMillis);
+  assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds, "no long wait for a while");
+  assert.equal(polls(host).at(-1).args.plugin, "claude-code/0.3.0");
+  // Half an hour later a long wait is tried again: the server may have been updated meanwhile.
+  host.time += longWaitRetryMillis;
+  await host.advance(rearmMillis);
+  assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds);
+});
+
+test("a long wait the host or a proxy cuts is asked again at once with 20, and again long half an hour later", async () => {
+  for (const cut of [
+    new Error("MCP error -32001: Request timed out"),
+    { isError: true, content: [{ type: "text", text: "504 Gateway Timeout" }] },
+  ]) {
+    const host = fakeHost();
+    const inbox = await followed(host);
+    host.time += 3 * hours;
+    host.answers.push(cut, reply([message({ conversationId: direct, body: "still here" })]));
+    await inbox.tick();
+    const [long, retried] = polls(host).slice(-2);
+    assert.equal(long.args.waitSeconds, longWaitSeconds);
+    assert.equal(retried.args.waitSeconds, waitSeconds);
+    assert.equal(retried.args.checkpoint, long.args.checkpoint);
+    assert.match(host.submitted.at(-1), /still here/, "the idle agent still gets its turn");
+    assert.equal(inbox.describe().includes("Not delivering"), false, "no failure is counted");
+    await host.advance(rearmMillis);
+    assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds);
+    // A laptop that slept, or a network that changed, does not cost long waits for good.
+    host.time += longWaitRetryMillis - rearmMillis;
+    await host.advance(rearmMillis);
+    assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds, "tried again");
+    host.answers.push(cut, reply([message({ conversationId: direct, body: "cut again" })]));
+    await host.advance(rearmMillis);
+    const [again, stepped] = polls(host).slice(-2);
+    assert.equal(again.args.waitSeconds, longWaitSeconds);
+    assert.equal(stepped.args.waitSeconds, waitSeconds, "a cut steps down again");
+    assert.match(host.submitted.at(-1), /cut again/);
+    await host.advance(rearmMillis);
+    assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds);
+  }
+});
+
+test("TalkTo's own thrown failures and brief network drops keep long waits", async () => {
+  for (const failure of [
+    new Error("TalkTo did not accept the sign-in."),
+    new Error("TalkTo answered HTTP 503 without a result."),
+    new Error("TalkTo refused the call: storage_unavailable"),
+    new Error("MCP error -32603: Internal error"),
+    new Error("fetch failed", { cause: new Error("read ECONNRESET") }),
+    { isError: true, content: [{ type: "text", text: "fetch failed: socket hang up" }] },
+  ]) {
+    const host = fakeHost();
+    const inbox = await followed(host);
+    host.answers.push(failure);
+    const asked = polls(host).length;
+    await inbox.tick();
+    assert.equal(polls(host).length, asked + 1, `no second call for ${JSON.stringify(failure)}`);
+    assert.match(inbox.describe(), /Not delivering|queued/);
+    host.time += 10 * 60 * 1000;
+    await inbox.tick();
+    assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds, String(failure));
+  }
+});
+
+/** A TalkTo URL behind `fetch`, for calls through the plugin's own MCP client. */
+const endpoint = (fetch) => ({
+  url: "https://talkto.test/mcp",
+  token: async () => "token",
+  clientName: "test",
+  clientVersion: "0",
+  fetch,
+});
+
+test("a long wait that fails after 25 seconds was cut, whatever it says: a gateway's JSON 504 still delivers", async () => {
+  // A gateway that ends every call it holds 30 seconds with a JSON body that names nothing: the
+  // plugin's MCP client says only "without a result".
+  const gateway = (host) =>
+    endpoint(async () => {
+      host.time += 30_000;
+      return {
+        status: 504,
+        headers: { get: () => "application/json" },
+        text: async () => JSON.stringify({ message: "upstream" }),
+      };
+    });
+  // A host whose MCP client answers in TalkTo's place after 30 seconds, without the words of a cut.
+  const closed = (host) => ({
+    tool: async () => {
+      host.time += 30_000;
+      return {
+        isError: true,
+        content: [{ type: "text", text: "MCP error -32000: Connection closed" }],
+      };
+    },
+  });
+  for (const [name, through] of [
+    ["gateway", (host) => (tool, args) => callTool(gateway(host), tool, args)],
+    ["host", (host) => closed(host).tool],
+  ]) {
+    const host = fakeHost();
+    const inbox = await followed(host);
+    await assert.rejects(callTool(gateway(fakeHost()), "get_updates", {}), /without a result\.$/);
+    const call = host.call;
+    const held = through(host);
+    host.call = async (tool, args) => {
+      if (tool !== "get_updates" || (args.waitSeconds ?? 0) <= waitSeconds) return call(tool, args);
+      host.calls.push({ tool, args });
+      return held(tool, args);
+    };
+    host.time += 3 * hours;
+    await inbox.tick();
+    const [long, retried] = polls(host).slice(-2);
+    assert.equal(long.args.waitSeconds, longWaitSeconds, name);
+    assert.equal(retried.args.waitSeconds, waitSeconds, `${name}: asked again at once with 20`);
+    assert.equal(retried.args.checkpoint, long.args.checkpoint);
+    assert.equal(inbox.describe().includes("Not delivering"), false, name);
+    // Later checks wait 20, which the gateway lets through: a message sent later arrives.
+    for (let check = 0; check < 7; check += 1) await host.advance(rearmMillis);
+    host.answers.push(reply([message({ conversationId: direct, body: "sent later" })]));
+    await host.advance(rearmMillis);
+    assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds, name);
+    assert.match(host.submitted.at(-1), /sent later/, name);
+    assert.equal(inbox.describe().includes("Not delivering"), false, name);
+  }
+  assert.ok(cutMillis > waitSeconds * 1000 && cutMillis < 30_000);
+});
+
+test("two long waits in a row that fail step down however fast they fail, and one that works between starts the count again", async () => {
+  assert.equal(longWaitTries, 2);
+  const host = fakeHost();
+  const inbox = await followed(host);
+  const fast = () => new Error("MCP error -32603: Internal error");
+  host.answers.push(fast());
+  await inbox.tick();
+  host.time += 10 * 60 * 1000;
+  host.answers.push(reply([]), fast());
+  await inbox.tick();
+  await host.advance(rearmMillis);
+  assert.deepEqual(
+    polls(host).map((poll) => poll.args.waitSeconds),
+    [longWaitSeconds, longWaitSeconds, longWaitSeconds],
+    "the long wait that worked started the count again",
+  );
+  host.time += 10 * 60 * 1000;
+  host.answers.push(fast(), reply([message({ conversationId: direct, body: "after two" })]));
+  await inbox.tick();
+  const [second, retried] = polls(host).slice(-2);
+  assert.equal(second.args.waitSeconds, longWaitSeconds);
+  assert.equal(retried.args.waitSeconds, waitSeconds, "the second in a row is asked again with 20");
+  assert.equal(retried.args.checkpoint, second.args.checkpoint);
+  assert.match(host.submitted.at(-1), /after two/);
+});
+
+test("TalkTo's own failure on a long wait is handled as before, and long waits go on", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  host.answers.push(failure("storage_unavailable"));
+  const asked = polls(host).length;
+  await inbox.tick();
+  assert.equal(polls(host).length, asked + 1, "no second call: TalkTo answered");
+  host.time += 10 * 60 * 1000;
+  await inbox.tick();
+  assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds);
+});
+
+test("a long wait that never answers is given up, and the next check waits 20", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host);
+  const call = host.call;
+  let hang = true;
+  host.call = async (tool, args) => {
+    if (hang && tool === "get_updates" && args.mode === "poll") {
+      host.calls.push({ tool, args });
+      return new Promise(() => {});
+    }
+    return call(tool, args);
+  };
+  void inbox.tick();
+  while (polls(host).length === 0) await Promise.resolve();
+  assert.equal(polls(host).at(-1).args.waitSeconds, longWaitSeconds);
+  assert.ok(stuckMillis > longWaitSeconds * 1000, "a long wait has time to answer");
+  assert.ok(stuckMillis > (60 + waitSeconds) * 1000, "and one cut at 60 s, then asked with 20");
+  hang = false;
+  host.time += stuckMillis;
+  host.answers.push(reply([message({ body: "after the hang" })]));
+  await inbox.tick();
+  assert.equal(polls(host).at(-1).args.waitSeconds, waitSeconds);
+  assert.match(host.submitted.at(-1), /after the hang/);
+});
+
 test("a real invalid_input still ends the follow, with the plugin field kept for next time", async () => {
   const host = fakeHost();
   const inbox = await followed(host);
-  // Refused with and without the plugin field, and without waiting: the input itself is wrong.
-  for (let index = 0; index < 3; index += 1)
+  // Refused as a long wait, with and without the plugin field, and without waiting: the input
+  // itself is wrong.
+  for (let index = 0; index < 4; index += 1)
     host.answers.push(failure("invalid_input", "bad checkpoint"));
   await inbox.tick();
   assert.equal(host.stored.follows.length, 0);
@@ -1286,8 +1582,15 @@ test("a refusal the host returns as an error result is handled like a thrown one
 test("checks that keep failing tell the agent, again each hour, and say when delivery works again", async () => {
   const host = fakeHost();
   const inbox = await followed(host);
+  // TalkTo cannot be reached until `down` is false: every call fails, a long wait or a short one.
+  let down = true;
+  const call = host.call;
+  host.call = async (tool, args) => {
+    if (!down || tool !== "get_updates") return call(tool, args);
+    host.calls.push({ tool, args });
+    throw new Error("fetch failed: connect ECONNREFUSED");
+  };
   const failOnce = async () => {
-    host.answers.push(new Error("fetch failed: connect ECONNREFUSED"));
     host.time += 10 * 60 * 1000;
     await inbox.tick();
   };
@@ -1311,6 +1614,7 @@ test("checks that keep failing tell the agent, again each hour, and say when del
   assert.equal(host.submitted.length, 2, "again after an hour");
 
   host.time += 10 * 60 * 1000;
+  down = false;
   host.answers.push(reply([message({ body: "sent during the outage" })]));
   await inbox.tick();
   const resumed = host.submitted.at(-1);
@@ -1379,6 +1683,34 @@ test("following again while a check hangs gives it up and polls at once", async 
   hang = false;
   await host.advance(0);
   assert.equal(polls(host)[1].args.checkpoint, "refollowed", "polled at once, from the new follow");
+  await host.advance(settleMillis);
+  assert.match(host.submitted.at(-1), /at once/);
+});
+
+test("following again after failed checks polls at once, without the wait their failures earned", async () => {
+  const host = fakeHost();
+  const inbox = await followed(host, { ...settings, wait: "never" });
+  for (let failure = 0; failure < 5; failure += 1) {
+    host.answers.push(new Error("TalkTo answered HTTP 503 without a result."));
+    host.time += 10 * 60 * 1000;
+    await inbox.tick();
+  }
+  const failed = polls(host).length;
+  assert.equal(failed, 5);
+  await inbox.tick();
+  assert.equal(polls(host).length, failed, "the failures earned a wait before the next check");
+  host.timers = [];
+  host.answers.push(reply([], { checkpoint: "refollowed" }), reply([message({ body: "at once" })]));
+  await inbox.follow({
+    serverId: server,
+    participantId: me,
+    channelIds: [general],
+    directChats: "own",
+    startAt: "now",
+  });
+  await host.advance(0);
+  assert.equal(polls(host).length, failed + 1, "polled at once");
+  assert.equal(polls(host).at(-1).args.checkpoint, "refollowed");
   await host.advance(settleMillis);
   assert.match(host.submitted.at(-1), /at once/);
 });

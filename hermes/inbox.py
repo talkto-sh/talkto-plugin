@@ -21,6 +21,10 @@ the TypeScript core cannot run here. Differences, all caused by Hermes's API:
   a resumed session reads on from the saved checkpoint.
 - Hermes truncates an MCP result over about 64 KB, so a truncated page is read
   again with fewer messages.
+- Hermes gives a plugin no timer of its own, so the inbox arranges every next
+  check itself: a waiting poll right after the last one, or, when polls cannot
+  wait (an older server, or ``wait: never``), a check every ``poll_millis``,
+  and after a failed check, one when the backoff ends.
 - Methods are synchronous and thread-safe. Network calls run without the lock.
 
 Identity: a follow names the participant explicitly (the agent's own follow
@@ -29,6 +33,7 @@ call after it registered); the MCP connection identifies nobody.
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Sequence, Union
@@ -57,7 +62,8 @@ from .talkto import (
 
 Delivery = Literal["idle", "next-prompt"]
 UrgentHandling = Literal["inject", "queue"]
-WaitPolicy = Literal["auto", "always", "never"]
+#: Whether polls wait on the server: whenever following (the default), or never.
+WaitPolicy = Literal["always", "never"]
 DirectChats = Literal["own", "none"]
 
 #: Participants one session may follow at once (one per server).
@@ -72,10 +78,23 @@ PAGES_PER_TICK = 4
 PAGE_LIMIT = 50
 #: Idle time before a queued notice is submitted, so a person about to type goes first.
 SETTLE_MILLIS = 2000
-#: Seconds one poll may wait on the server; TalkTo's maximum.
+#: Seconds one poll may wait on the server; the most TalkTo publishes to every client.
 WAIT_SECONDS = 20
-#: How long after the last turn or message ``auto`` keeps waiting polls.
-ENGAGED_MILLIS = 10 * 60 * 1000
+#: Seconds one poll asks to wait while it may: TalkTo lets any call that names a plugin wait this
+#: long (since November 17, 2026). When TalkTo refuses it, or Hermes or a proxy cuts a long wait
+#: short, the check is asked again at once with ``WAIT_SECONDS``, and polls wait ``WAIT_SECONDS``
+#: for ``LONG_WAIT_RETRY_MILLIS``.
+LONG_WAIT_SECONDS = 50
+#: A long wait that fails after this long was cut short by Hermes or a proxy, whatever the failure
+#: says: TalkTo's own failures come at once. A gateway that ends a held call may answer with a body
+#: that names nothing, such as a JSON 504.
+CUT_MILLIS = 25_000
+#: Long waits that fail in a row, for any reason, after which the last is taken as cut short.
+LONG_WAIT_TRIES = 2
+#: How long polls wait ``WAIT_SECONDS`` after a long wait was refused or cut short; then a long
+#: wait is tried again, so a laptop that slept or a network that changed during one long wait does
+#: not cost long waits for the whole session.
+LONG_WAIT_RETRY_MILLIS = 30 * 60 * 1000
 #: Least time between the starts of two chained waiting polls.
 REARM_MILLIS = 1000
 #: How long an idle session has to start the turn for a submitted notice.
@@ -102,12 +121,18 @@ _PERMANENT = frozenset(
 _REMOVED = "participant_removed"
 
 
+def wait_policy_of(setting: object) -> WaitPolicy:
+    """The wait policy a person's setting names. Anything but ``never`` waits: ``auto``, the default
+    before 0.3.4, waited only while the session was engaged and is now the same as ``always``."""
+    return "never" if setting == "never" else "always"
+
+
 @dataclass(frozen=True)
 class Settings:
     delivery: Delivery = "idle"
     urgent: UrgentHandling = "inject"
     poll_millis: int = 15_000
-    wait: WaitPolicy = "auto"
+    wait: WaitPolicy = "always"
 
 
 @dataclass(frozen=True)
@@ -348,6 +373,16 @@ class _Submitted:
     deadline: float
 
 
+@dataclass(frozen=True, eq=False)
+class _Run:
+    """One follow's check in flight. A check whose run was removed or replaced was given up (the
+    follow started again), and what it finds changes nothing."""
+
+    server_id: str
+    #: When it started, in milliseconds.
+    since: float
+
+
 @dataclass
 class _Injected:
     """Urgent messages put into one turn, until a model request carries them."""
@@ -372,22 +407,28 @@ class Inbox:
         self._busy = False
         self._turn_id: Optional[str] = None
         self._idle_since = 0.0
-        self._active_at = 0.0
         #: False once the server rejected waitSeconds (an older deployment).
         self._can_wait = True
         #: False once the server rejected the ``plugin`` field (before November 16, 2026).
         self._can_report = True
+        #: When polls may wait ``LONG_WAIT_SECONDS`` again; until then they wait ``WAIT_SECONDS``.
+        #: Set ``LONG_WAIT_RETRY_MILLIS`` ahead when a long wait was refused or cut short.
+        self._long_waits_from = 0.0
+        #: Long waits that failed in a row, for any reason; ``LONG_WAIT_TRIES`` count as a cut.
+        self._long_wait_failures = 0
         #: The newest version of this plugin, from the latest page that said.
         self._latest_version: Optional[str] = None
         #: When a notice last carried the update line; None before the first.
         self._update_notice_at: Optional[float] = None
-        self._chained = False
+        #: Servers whose follow's next check is already arranged.
+        self._chained: set[str] = set()
         self._submitting = False
         self._submitted: Optional[_Submitted] = None
         self._held_for_input = False
-        self._polling = False
-        self._failures = 0
-        self._resume_at = 0.0
+        #: Each follow's check in flight, by server.
+        self._running: dict[str, _Run] = {}
+        #: Each follow's failed checks in a row and when it may check again, by server.
+        self._backoff: dict[str, tuple[int, float]] = {}
         self._injected: list[_Injected] = []
         #: True once Hermes ended the session: nothing polls or delivers any more.
         self._closed = False
@@ -486,9 +527,12 @@ class Inbox:
             ] + [follow]
             self._unchecked.discard(given.server_id)
             self._widening.pop(given.server_id, None)
+            # A follow restarts delivery now: its check still in flight is given up, and the wait
+            # after its earlier failures is dropped, so the next tick polls it at once.
+            self._running.pop(given.server_id, None)
+            self._backoff.pop(given.server_id, None)
             self._learn_cadence(given.server_id, reply)
             self._learn_latest(reply)
-            self._active_at = self._host.now()
             self._persist()
         self._host.after(0, self.tick)
         waiting = len(follow.pending)
@@ -652,7 +696,6 @@ class Inbox:
             self._busy = False
             self._turn_id = None
             self._idle_since = self._host.now()
-            self._active_at = self._idle_since
             if self._submitted is not None:
                 # Hermes runs the accepted notice after this turn: give it time again.
                 self._submitted.deadline = self._idle_since + CONFIRM_MILLIS
@@ -667,64 +710,128 @@ class Inbox:
     # -- polling -------------------------------------------------------------
 
     def tick(self) -> None:
-        """One tick: poll every follow at once, then deliver what is due."""
+        """One tick: check every follow that has no check in flight, each on its own. A follow's
+        messages are delivered as soon as its own check answers, so one follow's open wait never
+        holds back another's."""
         with self._lock:
-            if self._closed or self._polling or not self._follows:
+            if self._closed:
+                return
+            follows = list(self._follows)
+        _parallel([lambda f=follow: self._check(f) for follow in follows])
+
+    def _check(self, follow: Follow) -> None:
+        """One follow's check: read what is new, save it, deliver what is due, then arrange the
+        next one."""
+        key = follow.server_id
+        with self._lock:
+            if self._closed or key in self._running or follow not in self._follows:
                 return
             now = self._host.now()
-            if now < self._resume_at:
-                return
-            self._polling = True
-            follows = list(self._follows)
+            failures, resume_at = self._backoff.get(key, (0, 0.0))
+            backoff = resume_at - now
+            run = _Run(server_id=key, since=now)
+            if backoff <= 0:
+                self._running[key] = run
             wait = self._wait_for(now)
-            before = self._queued()
+        if backoff > 0:
+            # Asked before the backoff ended (a turn started, say): check once it does.
+            self._schedule(key, backoff)
+            return
         failed = False
         try:
-            results = _parallel([lambda f=follow: self._poll(f, wait) for follow in follows])
-            failed = not all(results)
+            try:
+                failed = not self._poll(follow, wait, run)
+            except Exception:
+                failed = True
             with self._lock:
-                self._failures = self._failures + 1 if failed else 0
-                self._resume_at = (
-                    now
-                    + min(_BACKOFF_LIMIT_MILLIS, self._settings.poll_millis * 2**self._failures)
-                    if failed
-                    else 0
-                )
-                if self._queued() > before:
-                    self._active_at = self._host.now()
+                if not self._current(run):
+                    return  # given up while it ran: the follow started again
+                if failed:
+                    failures += 1
+                    limit = min(_BACKOFF_LIMIT_MILLIS, self._settings.poll_millis * 2**failures)
+                    self._backoff[key] = (failures, now + limit)
+                else:
+                    self._backoff.pop(key, None)
                 # A poll that ends after the session closed saves nothing: the saved checkpoint
                 # stays before these messages, so a resumed session reads them again.
                 if not self._closed:
                     self._persist()
         finally:
             with self._lock:
-                self._polling = False
+                if self._current(run):
+                    del self._running[key]
         self.deliver()
-        if not failed:
-            self._chain(now)
+        self._next(key, now, failed)
+
+    def _current(self, run: _Run) -> bool:
+        """Whether a check is still the one its follow runs: the follow did not start again."""
+        return self._running.get(run.server_id) is run
 
     def _wait_for(self, now: float) -> int:
+        """Seconds a poll that starts at ``now`` may wait on the server."""
         if not self._can_wait or self._settings.wait == "never":
             return 0
-        engaged = self._busy or now - self._active_at < ENGAGED_MILLIS
-        return WAIT_SECONDS if self._settings.wait == "always" or engaged else 0
+        # TalkTo allows a long wait only from a call that names its plugin.
+        if self._can_report and now >= self._long_waits_from:
+            return LONG_WAIT_SECONDS
+        return WAIT_SECONDS
 
-    def _chain(self, started: float) -> None:
+    def _step_down(self, now: float) -> None:
+        """Polls wait ``WAIT_SECONDS`` from ``now``, and try a long wait again
+        ``LONG_WAIT_RETRY_MILLIS`` later."""
+        self._long_wait_failures = 0
+        self._long_waits_from = now + LONG_WAIT_RETRY_MILLIS
+
+    def _cut_short(self, words: str, run: _Run) -> bool:
+        """Whether a long wait that failed with these words was cut short by Hermes or a proxy, so
+        the same check is asked again at once with ``WAIT_SECONDS``, and polls step down. It was
+        when it failed after ``CUT_MILLIS``, whatever it says, or in a host's or proxy's words, or
+        when it is the ``LONG_WAIT_TRIES``th long wait in a row to fail. Otherwise the failure is
+        handled as before (TalkTo unavailable, a brief network drop), and long waits go on."""
+        with self._lock:
+            if not self._current(run):
+                return False
+            self._long_wait_failures += 1
+            now = self._host.now()
+            cut = (
+                now - run.since > CUT_MILLIS
+                or _CUT_WORDS.search(words) is not None
+                or self._long_wait_failures >= LONG_WAIT_TRIES
+            )
+            if cut:
+                self._step_down(now)
+            return cut
+
+    def _next(self, key: str, started: float, failed: bool) -> None:
+        """Arranges a follow's next check: once the backoff ends after a failure, a waiting poll
+        right after this one, or a timed check when polls cannot wait. Nothing else would check an
+        idle session again."""
         with self._lock:
             now = self._host.now()
-            if self._closed or self._chained or not self._follows or self._wait_for(now) == 0:
+            if failed:
+                delay = self._backoff.get(key, (0, now))[1] - now
+            elif self._wait_for(now) > 0:
+                delay = REARM_MILLIS - (now - started)
+            else:
+                delay = float(self._settings.poll_millis)
+        self._schedule(key, delay)
+
+    def _schedule(self, key: str, delay: float) -> None:
+        """Checks a follow after ``delay`` milliseconds; one such timer per follow at a time."""
+        with self._lock:
+            followed = any(item.server_id == key for item in self._follows)
+            if self._closed or key in self._chained or not followed:
                 return
-            self._chained = True
+            self._chained.add(key)
 
         def again() -> None:
             with self._lock:
-                self._chained = False
-            self.tick()
+                self._chained.discard(key)
+                follow = next((item for item in self._follows if item.server_id == key), None)
+            if follow is not None:
+                self._check(follow)
 
-        self._host.after(max(0.0, REARM_MILLIS - (now - started)), again)
-
-    def _queued(self) -> int:
-        return sum(len(follow.pending) for follow in self._follows)
+        self._host.after(max(0.0, delay), again)
 
     def _read(self, args: Mapping[str, Any]) -> Answer:
         """One get_updates call; a page Hermes truncated is read again with fewer messages."""
@@ -738,16 +845,45 @@ class Inbox:
             # A cut answer had messages to read, so the retry need not wait.
             current.pop("waitSeconds", None)
 
-    def _page(self, follow: Follow, wait: int) -> Answer:
-        return self._updates(
-            {
-                "serverId": follow.server_id,
-                "participantId": follow.participant_id,
-                "mode": "poll",
-                "checkpoint": follow.checkpoint,
-            },
-            wait,
-        )
+    def _page(self, follow: Follow, wait: int, run: _Run) -> Answer:
+        args = {
+            "serverId": follow.server_id,
+            "participantId": follow.participant_id,
+            "mode": "poll",
+            "checkpoint": follow.checkpoint,
+        }
+        if wait <= WAIT_SECONDS:
+            return self._updates(args, wait)
+        # A long wait. TalkTo refusing it, and Hermes or a proxy cutting it short, end it the same
+        # way: the check is asked again at once with the published wait, and polls step down for a
+        # while. Nothing is lost: the checkpoint moves only with a page. Any other failure is
+        # handled as before, and long waits go on.
+        try:
+            answer = self._read(
+                {**args, "waitSeconds": wait, "plugin": release_text(PLUGIN_NAME, VERSION)}
+            )
+        except TransportError as cause:
+            if not self._cut_short(str(cause), run):
+                raise
+            return self._updates(args, WAIT_SECONDS)
+        reply = decode_updates(answer.envelope, "")
+        failure = reply if isinstance(reply, UpdatesFailure) else None
+        if failure is None or failure.code not in ("invalid_input", "unreadable"):
+            # TalkTo answered the long wait: a page, or one of TalkTo's own failures.
+            with self._lock:
+                if self._current(run):
+                    self._long_wait_failures = 0
+            return answer
+        if failure.code == "invalid_input":
+            # TalkTo refused the long wait: a server from before long waits.
+            with self._lock:
+                if not self._current(run):
+                    return answer
+                self._step_down(self._host.now())
+        elif not self._cut_short(failure.message, run):
+            # Something answered in TalkTo's place, but not as a cut does.
+            return answer
+        return self._updates(args, WAIT_SECONDS)
 
     def _updates(self, args: Mapping[str, Any], wait: int) -> Answer:
         """One get_updates call with this plugin's name and version, and ``waitSeconds`` when it may
@@ -779,7 +915,7 @@ class Inbox:
                 self._can_report = False
         return plain
 
-    def _poll(self, follow: Follow, wait: int) -> bool:
+    def _poll(self, follow: Follow, wait: int, run: _Run) -> bool:
         """Reads one follow's new messages into its queue; False on a failure worth retrying."""
         with self._lock:
             unchecked = follow.server_id in self._unchecked
@@ -790,7 +926,7 @@ class Inbox:
         while page < pages:
             try:
                 # Only the first page waits; a continuation already has messages to read.
-                answer = self._page(follow, wait if page == 0 else 0)
+                answer = self._page(follow, wait if page == 0 else 0, run)
             except TransportError:
                 return False
             reply = decode_updates(answer.envelope, follow.participant_id)
@@ -1065,6 +1201,11 @@ class Inbox:
         self._host.save(saved)
 
 
+#: Words of a host or proxy ending a call it held too long, whenever it does: a timeout, an abort,
+#: or a gateway that answered in TalkTo's place.
+_CUT_WORDS = re.compile(r"timed? ?out|timeout|abort|gateway|\b(?:408|502|504|524)\b", re.I)
+
+
 def _refused(answer: Answer) -> bool:
     """Whether TalkTo refused a call's input (``invalid_input``), as a server older than a field does."""
     reply = decode_updates(answer.envelope, "")
@@ -1081,19 +1222,19 @@ def _update_notice_at(stored: object) -> Optional[float]:
     return float(value)
 
 
-def _parallel(runs: Sequence[Callable[[], bool]]) -> list[bool]:
-    """Runs each poll on its own thread, since each may wait up to 20 seconds on TalkTo."""
-    results = [False] * len(runs)
+def _parallel(runs: Sequence[Callable[[], None]]) -> None:
+    """Runs each follow's check on its own thread, since each may wait up to 50 seconds on
+    TalkTo, and returns once all have ended."""
 
     def run(index: int) -> None:
         try:
-            results[index] = runs[index]()
+            runs[index]()
         except Exception:
-            results[index] = False
+            pass
 
     if len(runs) == 1:
         run(0)
-        return results
+        return
     threads = [
         threading.Thread(target=run, args=(index,), daemon=True, name="talkto-poll")
         for index in range(len(runs))
@@ -1102,4 +1243,3 @@ def _parallel(runs: Sequence[Callable[[], bool]]) -> list[bool]:
         thread.start()
     for thread in threads:
         thread.join()
-    return results
