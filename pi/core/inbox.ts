@@ -24,6 +24,16 @@
  * - Urgent messages go INTO a running turn (`Host.inject`), read at the
  *   turn's next model request. If the host reports that the turn ended
  *   before reading it, a short follow-up turn points at it.
+ * - Only what concerns the participant wakes the session: its direct chats,
+ *   channel messages that @mention it, TalkTo's own notices (a new channel,
+ *   announced in General), and every message in the channels it follows in
+ *   full (`fullChannelIds`). Other messages in the channels it watches,
+ *   General's included, are held per channel (`quiet`) as a short summary:
+ *   count, senders, and each one's first line and ID. The summary goes with
+ *   the next notice that goes out anyway, or, once the first held message has
+ *   waited `channelBatchMillis` (the batch window) with no such notice, as a
+ *   turn of its own. Either way the window starts again with the next held
+ *   message, so channel chatter starts at most one turn per window.
  * - Participant renames on the page (`renames`) wait with the queue and are
  *   listed at the top of the next notice. They never start a turn on their
  *   own; with `next-prompt` delivery they ride along with the person's prompt.
@@ -81,11 +91,18 @@ import {
   saveFailed,
   stamp,
   staleConnection,
+  heldSummary,
+  previewOf,
+  tallyRecent,
+  tallySenders,
   updateNotice,
   urgentFollowUp,
   urgentNotice,
+  type HeldMessage,
+  type PluginName,
   type PluginRelease,
   type Recipient,
+  type Tally,
 } from "./notice.ts";
 
 /** When queued messages are delivered: as a turn of their own once idle, or with the person's next prompt. */
@@ -103,11 +120,67 @@ export type WaitPolicy = "always" | "never";
 export const waitPolicyOf = (setting: string | undefined): WaitPolicy =>
   setting === "never" ? "never" : "always";
 
+/**
+ * When held channel messages (those that do not concern the participant) are delivered on their
+ * own. A turn re-reads the whole session; while the host's prompt cache is warm that is cheap, and
+ * once it has expired the host writes the whole context again, which costs as much as 12 to 40 warm
+ * turns. Every host times its cache from the session's last model call, which the plugin knows
+ * best as the end of the session's last turn. So held messages go, whichever comes first:
+ * 1. with any notice that wakes the session anyway (a direct chat, an @mention, a full channel);
+ * 2. `batchMinutes` after the oldest of them arrived;
+ * 3. just before the cache expires: the last turn's end plus `cacheMinutes`, less `cacheMarginOf`.
+ * A session whose cache has already expired is never woken for them: they wait for 1.
+ */
+export interface Timing {
+  /** How long the host's prompt cache lives after the last model call, by default. */
+  readonly cacheMinutes: number;
+  /** The longest a held message waits while the cache is warm. */
+  readonly batchMinutes: number;
+}
+
+/**
+ * Each host's defaults, from what each documents (November 17, 2026). Claude Code keeps the main
+ * conversation's cache for an hour on a subscription (5 minutes on an API key or a cloud provider:
+ * its plugin checks). Pi keeps its 5-minute cache warm for 30 minutes of idle time by default.
+ * OpenCode and Hermes keep 5 minutes, so their held messages mostly ride with other notices. Codex
+ * keeps 30 minutes (20-minute window), but it is served by the hooks, which cannot wake it idle.
+ */
+export const hostTimings = {
+  "claude-code": { cacheMinutes: 60, batchMinutes: 30 },
+  pi: { cacheMinutes: 30, batchMinutes: 20 },
+  opencode: { cacheMinutes: 5, batchMinutes: 4 },
+  hermes: { cacheMinutes: 5, batchMinutes: 4 },
+} as const satisfies { readonly [K in PluginName]: Timing };
+/** Defaults for a host whose cache is not known: the shortest common lifetime. */
+export const unknownHostTiming: Timing = { cacheMinutes: 5, batchMinutes: 4 };
+
+const timings: ReadonlyMap<string, Timing> = new Map(Object.entries(hostTimings));
+/** The defaults for the host a plugin names; `unknownHostTiming` for any other. */
+export const timingOf = (name: string): Timing => timings.get(name) ?? unknownHostTiming;
+
+/** Minutes a person may set for either value. */
+export const timingRange = { min: 1, max: 24 * 60 } as const;
+
+/** A person's setting in minutes as milliseconds, kept within `timingRange`; null when unset. */
+export const minutesSetting = (setting: string | undefined): number | null => {
+  const minutes = setting === undefined || setting.trim() === "" ? Number.NaN : Number(setting);
+  if (!Number.isFinite(minutes)) return null;
+  return Math.max(timingRange.min, Math.min(timingRange.max, minutes)) * 60 * 1000;
+};
+
+/** How long before the cache expires a held batch is sent: a fifth of its life, at most 10 minutes. */
+export const cacheMarginOf = (cacheMillis: number): number =>
+  Math.min(10 * 60 * 1000, cacheMillis / 5);
+
 export interface Settings {
   readonly delivery: Delivery;
   readonly urgent: UrgentHandling;
   readonly pollMillis: number;
   readonly wait: WaitPolicy;
+  /** The batch window for held channel messages; the host's `batchMinutes` when null. */
+  readonly channelBatchMillis: number | null;
+  /** The host's prompt-cache lifetime; the host's `cacheMinutes` when null. */
+  readonly cacheMillis: number | null;
 }
 
 /** Arguments of a TalkTo tool call. */
@@ -151,6 +224,12 @@ export type QueuedMessage = IncomingMessage;
 export interface Follow extends Recipient {
   /** The channels it watches; General is added to one restored from before plugins always did. */
   channelIds: ReadonlyArray<string>;
+  /**
+   * The watched channels whose every message is delivered; the others' messages are counted
+   * unless they @mention the participant. Null for a follow started before plugin 0.3.5, when every
+   * watched channel delivered: all but General still do, until the agent follows again.
+   */
+  readonly fullChannelIds: ReadonlyArray<string> | null;
   readonly directChats: "own" | "none";
   checkpoint: string;
   pending: QueuedMessage[];
@@ -158,11 +237,24 @@ export interface Follow extends Recipient {
   dropped: number;
   /** Renames since the last notice, at most `queueLimit`; they go with the next one. */
   renames: ParticipantRename[];
+  /** Channel messages held instead of delivered since the last notice, one tally per channel. */
+  quiet: Tally[];
+  /** When the first of the held messages arrived: the batch window's start. Null while none is held. */
+  quietSince: number | null;
 }
 
-/** A follow as stored; one saved before renames were queued has no `renames`. */
-export interface SavedFollow extends Omit<Follow, "renames"> {
+/**
+ * A follow as stored. One saved before renames were queued has no `renames`; one saved before
+ * plugin 0.3.5 has no `fullChannelIds`, `quiet` or `quietSince`.
+ */
+export interface SavedFollow extends Omit<
+  Follow,
+  "renames" | "fullChannelIds" | "quiet" | "quietSince"
+> {
   readonly renames?: ReadonlyArray<ParticipantRename>;
+  readonly fullChannelIds?: ReadonlyArray<string> | null;
+  readonly quiet?: ReadonlyArray<Tally>;
+  readonly quietSince?: number | null;
 }
 
 /** What the store keeps for one session. */
@@ -176,7 +268,10 @@ export interface Saved {
 
 /** The `follow` tool's input, decoded. */
 export interface FollowInput extends Recipient {
+  /** Channels watched quietly: their messages are counted unless they @mention the participant. */
   readonly channelIds: ReadonlyArray<string>;
+  /** Channels whose every message is delivered; none when absent. */
+  readonly fullChannelIds?: ReadonlyArray<string>;
   readonly directChats: "own" | "none";
   readonly startAt: "now" | "beginning";
 }
@@ -215,8 +310,23 @@ const generalNote = (watched: Watched): string =>
   !watched.general
     ? "TalkTo did not name this server's General channel, so the plugin could not add it; to hear about new channels, add General's ID from get_context to channelIds."
     : watched.displaced === null
-      ? "General is always included: TalkTo announces new channels there."
-      : `General is always included and took one of the ${channelLimit} channel places, so channel ${watched.displaced} is not delivered; to keep it, follow again with at most ${channelLimit - 1} other channels.`;
+      ? "General is always watched: TalkTo announces new channels there."
+      : `General is always watched and took one of the ${channelLimit} channel places, so channel ${watched.displaced} is not watched; to keep it, follow again with at most ${channelLimit - 1} other channels.`;
+
+/** What the follow answer says wakes the agent, with `full` channels followed in full. */
+export const wakeRules = (full: number, generalInFull: boolean, batchMillis: number): string => {
+  const minutes = batchMillis / 60_000;
+  return `${
+    full === 0
+      ? "Direct chats, @mentions of you and TalkTo's notices (such as a new channel) wake you."
+      : `Direct chats, @mentions of you, TalkTo's notices (such as a new channel) and every message in your ${full === 1 ? "fullChannelIds channel" : `${full} fullChannelIds channels`}${generalInFull ? " (General included)" : ""} wake you.`
+  } Other channel messages${generalInFull ? "" : ", General's included,"} are held: a short summary (sender, first line, messageId) goes with your next notice, or on its own within ${minutes === 1 ? "a minute" : `${minutes} minutes`} while you are active; read_messages shows them in full.`;
+};
+
+/** The chosen channels without repeats, full ones first, so General displaces a quiet one first. */
+const chosenOf = (input: FollowInput): ReadonlyArray<string> => [
+  ...new Set([...(input.fullChannelIds ?? []), ...input.channelIds]),
+];
 
 /** Participants one session may follow at once (one per server). */
 export const followLimit = 4;
@@ -328,12 +438,47 @@ const enqueue = (pending: QueuedMessage[], messages: ReadonlyArray<IncomingMessa
   }
 };
 
+/** Holds one channel message the session does not get in full, in its channel's tally. */
+const tally = (quiet: Tally[], message: IncomingMessage): void => {
+  // "planner (codex)" is named "planner": a name holds no spaces or parentheses.
+  const sender = message.from.replace(/ \(.*\)$/, "");
+  const held = { id: message.id, from: sender, line: previewOf(message.body) };
+  const index = quiet.findIndex((item) => item.conversationId === message.conversationId);
+  const current = quiet[index];
+  if (current === undefined) {
+    quiet.push({
+      conversationId: message.conversationId,
+      where: message.where,
+      count: 1,
+      senders: [sender],
+      recent: [held],
+    });
+    return;
+  }
+  quiet[index] = {
+    ...current,
+    count: current.count + 1,
+    recent: [...current.recent, held].slice(-tallyRecent),
+    senders:
+      current.senders.includes(sender) || current.senders.length > tallySenders
+        ? current.senders
+        : [...current.senders, sender],
+  };
+};
+
+/** Quiet message IDs remembered, so a page read twice is not counted twice. */
+const countedLimit = 1000;
+
 const same = (follow: Recipient, other: Recipient) => follow.serverId === other.serverId;
 
 /** What one notice covered: the notes before it, the queued message IDs, and the update line. */
 interface Snapshot {
   readonly notes: number;
   readonly ids: ReadonlySet<string>;
+  /** The held counts it showed, by server and conversation (`tallyKey`). */
+  readonly tallies: ReadonlyMap<string, number>;
+  /** When it was taken: held messages it did not show start a new batch window then. */
+  readonly at: number;
   /** When it was sent, if it carried the plugin update line. */
   readonly updateAt: number | null;
 }
@@ -344,6 +489,12 @@ type Check =
   | { readonly kind: "failed"; readonly reason: string }
   /** It was given up (`stuckMillis`, or the follow started again): nothing it read counts. */
   | { readonly kind: "abandoned" };
+
+const tallyKey = (serverId: string, conversationId: string) => `${serverId} ${conversationId}`;
+
+/** Channel messages one follow held since its last notice. */
+const countedIn = (follow: Follow): number =>
+  follow.quiet.reduce((sum, item) => sum + item.count, 0);
 
 const ok: Check = { kind: "ok" };
 const abandoned: Check = { kind: "abandoned" };
@@ -475,8 +626,17 @@ export class Inbox {
   /** Whether the agent was told that saving failed; once per session. */
   private saveFailureTold = false;
   private cadenceTimer = false;
+  /** Whether a timer for a held batch is set. */
+  private batchTimer = false;
+  /**
+   * When the session's last turn ended, the plugin's best measure of its last model call, from which
+   * the host times its prompt cache. Null before the first turn end this inbox saw.
+   */
+  private lastTurnAt: number | null = null;
   /** Messages the agent read itself in the running turn, with get_updates or read_messages. */
   private readInTurn = new Set<string>();
+  /** The newest quiet messages counted, at most `countedLimit`, so none is counted twice. */
+  private readonly counted = new Set<string>();
   private readonly host: Host;
   private readonly settings: Settings;
 
@@ -489,11 +649,19 @@ export class Inbox {
   async restore(): Promise<void> {
     const saved = await this.host.load();
     if (saved === null) return;
-    this.follows = saved.follows.map((follow) => ({
-      ...follow,
-      pending: [...follow.pending],
-      renames: [...(follow.renames ?? [])],
-    }));
+    const now = await this.host.now();
+    this.follows = saved.follows.map((follow) => {
+      const quiet = [...(follow.quiet ?? [])];
+      return {
+        ...follow,
+        fullChannelIds: follow.fullChannelIds ?? null,
+        pending: [...follow.pending],
+        renames: [...(follow.renames ?? [])],
+        quiet,
+        quietSince: quiet.length === 0 ? null : (follow.quietSince ?? now),
+      };
+    });
+    this.armBatch(now);
     for (const follow of this.follows) this.unchecked.add(follow.serverId);
     this.notes = [...saved.notes];
     this.updateNoticeAt = Number.isFinite(saved.updateNoticeAt)
@@ -506,7 +674,11 @@ export class Inbox {
   async follow(input: FollowInput): Promise<string> {
     if (this.follows.length >= followLimit && !this.follows.some((item) => same(item, input)))
       return `This session already follows ${followLimit} participants. Call unfollow for one first.`;
-    const watched = watchedChannels(input.channelIds, await this.generalOf(input.serverId));
+    const general = await this.generalOf(input.serverId);
+    const watched = watchedChannels(chosenOf(input), general);
+    const full = [...new Set(input.fullChannelIds ?? [])].filter((id) =>
+      watched.channelIds.includes(id),
+    );
     let answer: ToolAnswer;
     try {
       answer = await this.updates(
@@ -539,13 +711,16 @@ export class Inbox {
       serverId: input.serverId,
       participantId: input.participantId,
       channelIds: watched.channelIds,
+      fullChannelIds: full,
       directChats: input.directChats,
       checkpoint: reply.page.checkpoint,
       pending: [],
       dropped: 0,
       renames: [...reply.page.renames],
+      quiet: [],
+      quietSince: null,
     };
-    enqueue(follow.pending, reply.page.messages);
+    this.take(follow, reply.page.messages, await this.host.now());
     this.follows = [...this.follows.filter((item) => !same(item, input)), follow];
     this.unchecked.delete(input.serverId);
     this.widening.delete(input.serverId);
@@ -559,15 +734,20 @@ export class Inbox {
     await this.persist();
     this.host.after(0, () => this.tick());
     const waiting = follow.pending.length;
+    const counted = countedIn(follow);
     const missing = await this.missingTools(input.serverId);
     return [
-      `Following participant ${input.participantId} on server ${input.serverId} (${watched.channelIds.length} channels, direct chats: ${input.directChats}).`,
+      `Following participant ${input.participantId} on server ${input.serverId} (${watched.channelIds.length} channels, ${full.length} of them in full, direct chats: ${input.directChats}).`,
       generalNote(watched),
+      wakeRules(full.length, general !== null && full.includes(general), this.batchMillis()),
       deliveryRules(this.settings),
       "Do not poll get_updates, create watches, or schedule checks for this participant while the plugin follows it.",
       waiting > 0 || reply.page.hasMore
         ? `${waiting}${reply.page.hasMore ? "+" : ""} earlier messages were found; they arrive ${this.settings.delivery === "idle" ? "after this turn" : "with the person's next prompt"}.`
         : "Nothing is waiting yet.",
+      ...(counted > 0
+        ? [`${counted} earlier channel messages were held; a summary of them follows.`]
+        : []),
       ...(missing.length === 0 ? [] : [staleConnection(missing, this.reconnectHint())]),
     ].join(" ");
   }
@@ -613,6 +793,102 @@ export class Inbox {
     return found;
   }
 
+  /**
+   * Whether every message in a watched channel is delivered. A follow from before plugin 0.3.5
+   * delivers every channel but General, and General too while its ID is unknown, as it did.
+   */
+  private inFull(follow: Follow, conversationId: string): boolean {
+    if (follow.fullChannelIds !== null) return follow.fullChannelIds.includes(conversationId);
+    return this.generals.get(follow.serverId) !== conversationId;
+  }
+
+  /** The batch window for held channel messages: the person's setting, or the host's default. */
+  private batchMillis(): number {
+    return (
+      this.settings.channelBatchMillis ?? timingOf(this.host.plugin.name).batchMinutes * 60_000
+    );
+  }
+
+  /** How long the host's prompt cache lives after the last model call. */
+  private cacheMillis(): number {
+    return this.settings.cacheMillis ?? timingOf(this.host.plugin.name).cacheMinutes * 60_000;
+  }
+
+  /** Whether the session's prompt cache is still warm at `at`: a turn ended within its lifetime. */
+  private warm(at: number): boolean {
+    return this.lastTurnAt !== null && at < this.lastTurnAt + this.cacheMillis();
+  }
+
+  /**
+   * When a follow's held messages go on their own: `batchMillis` after the oldest, or just before
+   * the cache expires, whichever is first. Null when none are held, and when the cache had nearly
+   * expired, or the plugin saw no turn end, by the time the oldest arrived: a cold session is not
+   * woken for them.
+   */
+  private flushAt(follow: Follow): number | null {
+    if (follow.quietSince === null || this.lastTurnAt === null) return null;
+    const cache = this.cacheMillis();
+    const warmUntil = this.lastTurnAt + cache - cacheMarginOf(cache);
+    if (follow.quietSince >= warmUntil) return null;
+    return Math.min(follow.quietSince + this.batchMillis(), warmUntil);
+  }
+
+  /** Whether some follow's held messages are due on their own now, while the cache is warm. */
+  private batchDue(now: number): boolean {
+    if (!this.warm(now)) return false;
+    return this.follows.some((item) => {
+      const at = this.flushAt(item);
+      return at !== null && now >= at;
+    });
+  }
+
+  /**
+   * Tries delivery when the earliest held batch is due; one timer at a time. A timer that finds the
+   * batch already delivered (a real wake took it) arms the next, if one is held meanwhile.
+   */
+  private armBatch(now: number): void {
+    if (this.batchTimer || !this.warm(now)) return;
+    const due = this.follows.flatMap((item) => {
+      const at = this.flushAt(item);
+      return at === null ? [] : [at];
+    });
+    if (due.length === 0) return;
+    this.batchTimer = true;
+    this.host.after(Math.max(0, Math.min(...due) - now), async () => {
+      this.batchTimer = false;
+      await this.deliver();
+      // A batch still due waits for the turn to end, the cadence or the person, which each
+      // deliver again; only a window that has not ended yet needs this timer.
+      const later = await this.host.now();
+      if (!this.batchDue(later)) this.armBatch(later);
+    });
+  }
+
+  /**
+   * Takes new messages: those that concern the participant into the queue, the rest of a channel's
+   * into its tally, starting the batch window when it was empty. A message already queued or held
+   * is skipped.
+   */
+  private take(follow: Follow, messages: ReadonlyArray<IncomingMessage>, now: number): void {
+    const known = new Set(follow.pending.map((message) => message.id));
+    const delivered: IncomingMessage[] = [];
+    for (const message of messages) {
+      if (known.has(message.id) || this.counted.has(message.id)) continue;
+      if (message.scope !== "channel" || this.inFull(follow, message.conversationId)) {
+        delivered.push(message);
+        continue;
+      }
+      tally(follow.quiet, message);
+      follow.quietSince ??= now;
+      this.counted.add(message.id);
+      if (this.counted.size > countedLimit)
+        for (const id of [...this.counted].slice(0, this.counted.size - countedLimit))
+          this.counted.delete(id);
+    }
+    enqueue(follow.pending, delivered);
+    this.armBatch(now);
+  }
+
   /** Stops delivery for the participant this session follows on one server. */
   async unfollow(serverId: string): Promise<string> {
     const found = this.follows.find((item) => item.serverId === serverId);
@@ -631,7 +907,8 @@ export class Inbox {
       .map(
         (item) =>
           `TalkTo: participant ${item.participantId} on server ${item.serverId}: ${item.pending.length} queued` +
-          `${item.pending.some((message) => message.isUrgent) ? " (urgent waiting)" : ""}.` +
+          `${item.pending.some((message) => message.isUrgent) ? " (urgent waiting)" : ""}` +
+          `${countedIn(item) > 0 ? `; ${countedIn(item)} channel messages held for a summary` : ""}.` +
           this.outageLine(item.serverId),
       )
       .concat(
@@ -682,6 +959,9 @@ export class Inbox {
     this.busy = false;
     this.turnId = null;
     this.idleSince = await this.host.now();
+    this.lastTurnAt = this.idleSince;
+    // The cache is warm again: held messages get a deadline, or a later one.
+    this.armBatch(this.idleSince);
     const unread = this.injected
       .filter((entry) => entry.turnId === turnId && !entry.stepped)
       .flatMap((entry) => entry.ids)
@@ -703,9 +983,10 @@ export class Inbox {
     if (this.settings.delivery !== "next-prompt") return null;
     const now = await this.host.now();
     const update = this.updateDue(now);
-    const text = this.noticeText(true, update);
+    const text = this.noticeText(true, update, this.batchDue(now));
     if (text === null) return null;
-    this.clearDelivered(this.snapshot(update ? now : null));
+    this.clearDelivered(this.snapshot(now, update ? now : null));
+    this.armBatch(now);
     await this.persist();
     return text;
   }
@@ -941,6 +1222,7 @@ export class Inbox {
           ? this.skipRefused(follow, reason, run)
           : { kind: "failed", reason };
       }
+      const now = await this.host.now();
       if (!this.current(run)) return abandoned;
       const reply = decodeUpdates(answer, follow.participantId);
       if (reply.kind === "failure")
@@ -949,11 +1231,7 @@ export class Inbox {
           hostRefused(reply.failure.message)
           ? this.skipRefused(follow, reply.failure.message, run)
           : this.failed(follow, reply.failure, run);
-      const known = new Set(follow.pending.map((message) => message.id));
-      enqueue(
-        follow.pending,
-        reply.page.messages.filter((message) => !known.has(message.id)),
-      );
+      this.take(follow, reply.page.messages, now);
       const over = follow.pending.length - queueLimit;
       if (over > 0) {
         follow.pending = follow.pending.slice(over);
@@ -1145,18 +1423,20 @@ export class Inbox {
     if (this.settings.delivery === "next-prompt" && !hasUrgent && this.notes.length === 0) return;
     const now = await this.host.now();
     const update = this.updateDue(now);
-    const text = this.noticeText(false, update);
+    const batch = this.batchDue(now);
+    const text = this.noticeText(false, update, batch);
     if (text === null) return;
-    const held = hasUrgent || this.notes.length > 0 ? 0 : this.cadenceWait(now);
+    const held = hasUrgent || this.notes.length > 0 ? 0 : this.cadenceWait(now, batch);
     if (held > 0) {
       this.retryAfter(held);
       return;
     }
-    const snapshot = this.snapshot(update ? now : null);
+    const snapshot = this.snapshot(now, update ? now : null);
     try {
       if (await this.host.submit(text)) {
         this.lastWakeAt = now;
         this.clearDelivered(snapshot);
+        this.armBatch(now);
         await this.persist();
       } else this.heldForInput = true;
     } catch {
@@ -1218,11 +1498,14 @@ export class Inbox {
 
   /**
    * How long the person's cadence still holds the next turn back: zero once any follow with
-   * queued messages may wake, else the shortest wait among them.
+   * queued messages (or held ones, when a `batch` is due) may wake, else the shortest wait among them.
    */
-  private cadenceWait(now: number): number {
+  private cadenceWait(now: number, batch: boolean): number {
     const waits = this.follows
-      .filter((item) => item.pending.length > 0 || item.dropped > 0)
+      .filter(
+        (item) =>
+          item.pending.length > 0 || item.dropped > 0 || (batch && item.quietSince !== null),
+      )
       .map((item) => Math.max(0, this.lastWakeAt + (this.cadence.get(item.serverId) ?? 0) - now));
     return waits.length === 0 ? 0 : Math.min(...waits);
   }
@@ -1240,12 +1523,18 @@ export class Inbox {
   /**
    * The combined notice for everything queued, or null when nothing waits. Queued renames go with
    * any notice; on their own they make one only when `renamesAlone` (the person's prompt carries it).
+   * Held channel messages go with any notice as a short summary; on their own they make one only
+   * when a `batch` is due (their window ended).
    */
-  private noticeText(renamesAlone: boolean, update: boolean): string | null {
+  private noticeText(renamesAlone: boolean, update: boolean, batch: boolean): string | null {
     const waking =
       this.notes.length > 0 ||
       this.follows.some((item) => item.pending.length > 0 || item.dropped > 0);
-    if (!waking && !(renamesAlone && this.follows.some((item) => item.renames.length > 0)))
+    if (
+      !waking &&
+      !batch &&
+      !(renamesAlone && this.follows.some((item) => item.renames.length > 0))
+    )
       return null;
     const parts = [
       ...this.notes,
@@ -1253,19 +1542,36 @@ export class Inbox {
         .filter((item) => item.pending.length > 0 || item.dropped > 0 || item.renames.length > 0)
         .map((item) => queuedNotice(item, item.pending, item.dropped, item.renames)),
     ];
-    const text = parts.join("\n\n---\n\n");
-    return update ? `${text}\n\n${updateNotice(this.host.plugin, this.latestVersion ?? "")}` : text;
+    const alone = parts.length === 0;
+    const summaries = this.follows
+      .filter((item) => item.quiet.length > 0)
+      .map((item) => heldSummary(item, item.quiet, alone));
+    return [
+      ...(alone ? [] : [parts.join("\n\n---\n\n")]),
+      ...(summaries.length > 0 ? [summaries.join(alone ? "\n\n---\n\n" : "\n\n")] : []),
+      ...(update ? [updateNotice(this.host.plugin, this.latestVersion ?? "")] : []),
+    ].join("\n\n");
   }
 
-  /** What one notice covers, so messages and renames that arrive while it is submitted stay queued. */
-  private snapshot(updateAt: number | null): Snapshot {
+  /**
+   * What one notice taken at `at` covers, so messages, renames and held messages that arrive while
+   * it is submitted stay for the next.
+   */
+  private snapshot(at: number, updateAt: number | null): Snapshot {
     return {
+      at,
       updateAt,
       notes: this.notes.length,
+      tallies: new Map(
+        this.follows.flatMap((item) =>
+          item.quiet.map((each) => [tallyKey(item.serverId, each.conversationId), each.count]),
+        ),
+      ),
       ids: new Set(
         this.follows.flatMap((item) => [
           ...item.pending.map((message) => message.id),
           ...item.renames.map((rename) => rename.id),
+          ...item.quiet.flatMap((each) => each.recent.map((held) => held.id)),
         ]),
       ),
     };
@@ -1278,6 +1584,22 @@ export class Inbox {
       follow.pending = follow.pending.filter((message) => !snapshot.ids.has(message.id));
       follow.renames = follow.renames.filter((rename) => !snapshot.ids.has(rename.id));
       follow.dropped = 0;
+      // A summary shown starts again; what was held while the notice went out stays, in a new
+      // batch window from now.
+      follow.quiet = follow.quiet
+        .map((each) => ({
+          ...each,
+          count:
+            each.count -
+            (snapshot.tallies.get(tallyKey(follow.serverId, each.conversationId)) ?? 0),
+          recent: each.recent.filter((held) => !snapshot.ids.has(held.id)),
+        }))
+        .filter((each) => each.count > 0);
+      const shown = [...snapshot.tallies.keys()].some((key) =>
+        key.startsWith(tallyKey(follow.serverId, "")),
+      );
+      if (follow.quiet.length === 0) follow.quietSince = null;
+      else if (shown) follow.quietSince = snapshot.at;
     }
   }
 
@@ -1361,7 +1683,14 @@ const isMessage = (value: unknown): value is QueuedMessage => {
   const fields: Fields = new Map(Object.entries(value));
   const transfer = fields.get("transfer");
   const cut = fields.get("cut");
+  const scope = fields.get("scope");
   return (
+    // Absent in a message queued before plugin 0.3.5, or whose conversation TalkTo did not describe.
+    (scope === undefined ||
+      scope === "direct" ||
+      scope === "mention" ||
+      scope === "notice" ||
+      scope === "channel") &&
     ["id", "conversationId", "senderId", "createdAt", "body", "where", "from"].every(
       (key) => textOf(fields, key) !== null,
     ) &&
@@ -1388,13 +1717,42 @@ const isRename = (value: unknown): value is ParticipantRename => {
   );
 };
 
+const isTally = (value: unknown): value is Tally => {
+  if (!isObject(value)) return false;
+  const fields: Fields = new Map(Object.entries(value));
+  const count = fields.get("count");
+  return (
+    textOf(fields, "conversationId") !== null &&
+    textOf(fields, "where") !== null &&
+    Number.isSafeInteger(count) &&
+    Number(count) > 0 &&
+    Array.isArray(fields.get("senders")) &&
+    listOf(fields, "senders").every(isText) &&
+    Array.isArray(fields.get("recent")) &&
+    listOf(fields, "recent").every(isHeld)
+  );
+};
+
+const isHeld = (value: unknown): value is HeldMessage => {
+  if (!isObject(value)) return false;
+  const fields: Fields = new Map(Object.entries(value));
+  return ["id", "from", "line"].every((key) => textOf(fields, key) !== null);
+};
+
 const isFollow = (value: unknown): value is SavedFollow => {
   if (!isObject(value)) return false;
   const fields: Fields = new Map(Object.entries(value));
   const directChats = textOf(fields, "directChats");
   const dropped = fields.get("dropped");
   const renames = fields.get("renames");
+  const full = fields.get("fullChannelIds");
+  const quiet = fields.get("quiet");
+  const quietSince = fields.get("quietSince");
   return (
+    (quietSince === undefined || quietSince === null || Number.isFinite(quietSince)) &&
+    // Absent, or null, in a follow from before plugin 0.3.5.
+    (full === undefined || full === null || (Array.isArray(full) && full.every(isText))) &&
+    (quiet === undefined || (Array.isArray(quiet) && quiet.every(isTally))) &&
     textOf(fields, "serverId") !== null &&
     textOf(fields, "participantId") !== null &&
     textOf(fields, "checkpoint") !== null &&
@@ -1439,8 +1797,11 @@ export const readFollowInput = (fields: Fields): FollowRead => {
   const channels = fields.get("channelIds") ?? [];
   if (!Array.isArray(channels) || !channels.every(isText))
     return problem("channelIds must be a list of channel IDs.");
-  if (new Set(channels).size > channelLimit)
-    return problem(`channelIds holds at most ${channelLimit} channels.`);
+  const full = fields.get("fullChannelIds") ?? [];
+  if (!Array.isArray(full) || !full.every(isText))
+    return problem("fullChannelIds must be a list of channel IDs.");
+  if (new Set([...channels, ...full]).size > channelLimit)
+    return problem(`channelIds and fullChannelIds hold at most ${channelLimit} channels together.`);
   const directChats = textOf(fields, "directChats") ?? "own";
   if (directChats !== "own" && directChats !== "none")
     return problem('directChats must be "own" or "none".');
@@ -1449,6 +1810,13 @@ export const readFollowInput = (fields: Fields): FollowRead => {
     return problem('startAt must be "now" or "beginning".');
   return {
     ok: true,
-    input: { serverId, participantId, channelIds: channels, directChats, startAt },
+    input: {
+      serverId,
+      participantId,
+      channelIds: channels,
+      fullChannelIds: full,
+      directChats,
+      startAt,
+    },
   };
 };

@@ -196,6 +196,7 @@ const holderOf = (store: Map<string, unknown>) =>
 
 test("follow, poll through the session's MCP connection, queue while busy, deliver when idle", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 });
+  mock.env(on, {}); // no prompt-cache variables: the hour-long subscription cache
   const session = mock.session(on);
   const { calls, contexts, submitted, descriptions } = engine(on, {
     clock,
@@ -219,7 +220,7 @@ test("follow, poll through the session's MCP connection, queue while busy, deliv
   });
   expect(String(followed.result)).toMatch(/^Following participant/);
   expect(String(followed.result)).not.toMatch(/T3/);
-  expect(String(followed.result)).toMatch(/General is always included/);
+  expect(String(followed.result)).toMatch(/General is always watched/);
   expect(contexts).toEqual([{ serverId: server }]);
   expect(calls[0]).toEqual({
     server: "plugin:talkto-plugin:talkto",
@@ -254,6 +255,7 @@ test("follow, poll through the session's MCP connection, queue while busy, deliv
 
 test("an idle session keeps waiting on TalkTo, and a message sent to it starts a turn", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 });
+  mock.env(on, {}); // no prompt-cache variables: the hour-long subscription cache
   const answers: (ReturnType<typeof page> | Error)[] = [page([], "cp-0")];
   const { polls, submitted } = engine(on, { clock, answers });
 
@@ -276,6 +278,7 @@ test("an idle session keeps waiting on TalkTo, and a message sent to it starts a
 
 test("where TalkTo refuses the long wait, an idle session waits 20 seconds and still starts a turn", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 });
+  mock.env(on, {}); // no prompt-cache variables: the hour-long subscription cache
   const answers: (ReturnType<typeof page> | Error)[] = [page([], "cp-0")];
   const { polls, submitted } = engine(on, { clock, answers, pluginWait: 20 });
 
@@ -574,6 +577,7 @@ test("thread records nobody renewed for a month are removed", async ($, on) => {
 
 test("after a reload or compaction a terminal session resumes its stored follow and polls at once", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 });
+  mock.env(on, {}); // no prompt-cache variables: the hour-long subscription cache
   const store = new Map<string, unknown>([["session:session-1", record("cp-saved")]]);
   const { calls, submitted } = engine(on, {
     clock,
@@ -590,6 +594,7 @@ test("after a reload or compaction a terminal session resumes its stored follow 
 
 test("a stale TalkTo connection is named at follow, and a refused answer restarts and says to reconnect", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 });
+  mock.env(on, {}); // no prompt-cache variables: the hour-long subscription cache
   const listed = "mcp__plugin_talkto-plugin_talkto__";
   const { calls, submitted } = engine(on, {
     clock,

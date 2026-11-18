@@ -134,13 +134,18 @@ const fakeHost = () => {
   return host;
 };
 const settings = { delivery: "idle", urgent: "inject", pollMillis: 15000, wait: "auto" };
+/**
+ * A follow of General in full, so the queue's rules can be tested with General messages; quiet
+ * channels have tests of their own.
+ */
 const followed = async (host, options = settings) => {
   const inbox = new Inbox(host, options);
   host.answers.push(reply([]));
   const answer = await inbox.follow({
     serverId: server,
     participantId: me,
-    channelIds: [general],
+    channelIds: [],
+    fullChannelIds: [general],
     directChats: "own",
     startAt: "now",
   });
@@ -181,7 +186,10 @@ test("follow always adds General, found with get_context, to the chosen channels
   assert.deepEqual(host.contexts, [{ serverId: server }], "asks for the server, not a participant");
   assert.deepEqual(startedWith(host), [general, task]);
   assert.deepEqual(host.stored.follows[0].channelIds, [general, task], "a restart keeps General");
-  assert.match(answer, /\(2 channels, direct chats: own\)\. General is always included/);
+  assert.match(
+    answer,
+    /\(2 channels, 0 of them in full, direct chats: own\)\. General is always watched/,
+  );
   // With no channels and no direct chats, General alone still makes a valid feed.
   await followWith(inbox, [], "none");
   assert.deepEqual(host.calls.at(-1).args.channelIds, [general]);
@@ -207,7 +215,7 @@ test("with the channel limit chosen, General takes the last one's place and the 
   const watched = startedWith(host);
   assert.equal(watched.length, channelLimit);
   assert.deepEqual(watched, [general, ...chosen.slice(0, channelLimit - 1)]);
-  assert.match(answer, new RegExp(`channel channel-${channelLimit - 1} is not delivered`));
+  assert.match(answer, new RegExp(`channel channel-${channelLimit - 1} is not watched`));
   assert.match(answer, new RegExp(`at most ${channelLimit - 1} other channels`));
   const withGeneral = [general, ...chosen.slice(1)];
   assert.deepEqual(watchedChannels(withGeneral, general).channelIds, withGeneral);
@@ -831,7 +839,10 @@ test("a follow restored without General adds it, and misses or repeats nothing o
   await inbox.restore();
   const before = message({ conversationId: task, body: "sent before the reload" });
   const during = message({ conversationId: task, body: "sent while it switched" });
-  const announced = message({ body: "a channel was created" });
+  const announced = message({
+    body: "a channel was created",
+    notice: { kind: "channel_created", channelId: task, channelName: "task" },
+  });
   host.answers.push(
     reply([], { checkpoint: "cp-wide" }),
     reply([before, during], { checkpoint: "cp-old-end" }),
@@ -890,10 +901,18 @@ test("follow arguments are decoded strictly and TalkTo refusals are reported", a
         serverId: server,
         participantId: me,
         channelIds: [],
+        fullChannelIds: [],
         directChats: "own",
         startAt: "now",
       },
     },
+  );
+  assert.equal(
+    readFollowInput(
+      new Map(Object.entries({ serverId: server, participantId: me, fullChannelIds: "general" })),
+    ).ok,
+    false,
+    "fullChannelIds must be a list",
   );
   const host = fakeHost();
   const inbox = new Inbox(host, settings);
@@ -1672,7 +1691,10 @@ test("following again while a check hangs gives it up and polls at once", async 
   };
   void inbox.tick();
   while (polls(host).length === 0) await Promise.resolve();
-  host.answers.push(reply([], { checkpoint: "refollowed" }), reply([message({ body: "at once" })]));
+  host.answers.push(
+    reply([], { checkpoint: "refollowed" }),
+    reply([message({ conversationId: direct, body: "at once" })]),
+  );
   await inbox.follow({
     serverId: server,
     participantId: me,
@@ -1700,7 +1722,10 @@ test("following again after failed checks polls at once, without the wait their 
   await inbox.tick();
   assert.equal(polls(host).length, failed, "the failures earned a wait before the next check");
   host.timers = [];
-  host.answers.push(reply([], { checkpoint: "refollowed" }), reply([message({ body: "at once" })]));
+  host.answers.push(
+    reply([], { checkpoint: "refollowed" }),
+    reply([message({ conversationId: direct, body: "at once" })]),
+  );
   await inbox.follow({
     serverId: server,
     participantId: me,

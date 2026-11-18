@@ -190,6 +190,7 @@ const follow = (pi) =>
     serverId: server,
     participantId: me,
     channelIds: [],
+    fullChannelIds: [general],
     directChats: "own",
   });
 
@@ -242,7 +243,7 @@ test("queued messages arrive as one follow-up turn once pi is idle; urgent ones 
     "the follow names the agent's own participant",
   );
   assert.deepEqual(started.params.arguments.channelIds, [general], "General is always included");
-  assert.match(answer.content[0].text, /General is always included/);
+  assert.match(answer.content[0].text, /General is always watched/);
 
   pi.idle = false;
   talkto.updates.push(

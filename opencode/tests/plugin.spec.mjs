@@ -221,7 +221,13 @@ const follow = (opencode, sessionID = "ses_1") =>
     .tools()
     .get("talkto_follow")
     .execute(
-      { serverId: server, participantId: me, channelIds: [], directChats: "own" },
+      {
+        serverId: server,
+        participantId: me,
+        channelIds: [],
+        fullChannelIds: [general],
+        directChats: "own",
+      },
       { sessionID },
     );
 
@@ -264,7 +270,7 @@ test("queued messages go in as a queued prompt once idle; urgent ones are steere
   talkto.updates.push(page([], "cp-start"));
   const followed = (await follow(opencode)).content;
   assert.match(followed, /^Following participant/);
-  assert.match(followed, /General is always included/);
+  assert.match(followed, /General is always watched/);
   const started = talkto.calls.findLast((call) => call.params.name === "get_updates");
   assert.equal(started.params.arguments.participantId, me);
   assert.deepEqual(started.params.arguments.channelIds, [general], "General is always included");

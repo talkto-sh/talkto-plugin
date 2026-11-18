@@ -5,8 +5,10 @@
  * - TALKTO_WAIT: always (default) or never; auto, the default before 0.3.4, means always
  * - TALKTO_URGENT: inject (default) or queue
  * - TALKTO_POLL_SECONDS: 5 to 300 (default 15)
+ * - TALKTO_CHANNEL_BATCH_MINUTES and TALKTO_CACHE_MINUTES: when channel messages that do not concern
+ *   the agent are summarized on their own (see `hostTimings` in core/inbox.ts for the defaults)
  */
-import { waitPolicyOf, type Settings } from "./core/inbox.ts";
+import { minutesSetting, waitPolicyOf, type Settings } from "./core/inbox.ts";
 import { plugin } from "./plugin.ts";
 
 const env = process.env;
@@ -16,6 +18,8 @@ const settings: Settings = {
   urgent: env["TALKTO_URGENT"] === "queue" ? "queue" : "inject",
   pollMillis: Math.max(5, Math.min(300, Number.isFinite(seconds) ? seconds : 15)) * 1000,
   wait: waitPolicyOf(env["TALKTO_WAIT"]),
+  channelBatchMillis: minutesSetting(env["TALKTO_CHANNEL_BATCH_MINUTES"]),
+  cacheMillis: minutesSetting(env["TALKTO_CACHE_MINUTES"]),
 };
 
 export default plugin({

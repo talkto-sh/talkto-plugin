@@ -7,7 +7,9 @@ messages and fails when they differ.
 
 from __future__ import annotations
 
-from typing import Optional, Protocol, Sequence
+import re
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from .talkto import FileOffer, IncomingMessage, ParticipantRename
 
@@ -66,6 +68,16 @@ def _heading(message: IncomingMessage, index: int) -> str:
     )
 
 
+#: The longest part of a TalkTo notice (a new channel's announcement) a notice shows.
+_ANNOUNCEMENT_LIMIT = 600
+
+
+def _announced(message: IncomingMessage, index: int) -> str:
+    """A notice TalkTo wrote, such as a new channel, on one line."""
+    text = re.sub(r"\s*\n\s*", " ", message.body)[:_ANNOUNCEMENT_LIMIT]
+    return f"[{index + 1}] TalkTo notice in {message.where}: {text}"
+
+
 def _described(messages: Sequence[IncomingMessage]) -> str:
     shown = messages[:_SHOWN_LIMIT]
     listed = messages[_SHOWN_LIMIT : _SHOWN_LIMIT + _LISTED_LIMIT]
@@ -73,6 +85,9 @@ def _described(messages: Sequence[IncomingMessage]) -> str:
     parts: list[str] = []
     spent = 0
     for index, message in enumerate(shown):
+        if message.scope == "notice":
+            parts.append(_announced(message, index))
+            continue
         allowance = min(BODY_LIMIT, max(BODY_FLOOR, NOTICE_BODY_BUDGET - spent))
         body = message.body[:allowance]
         spent += len(body)
@@ -171,6 +186,125 @@ def queued_notice(
         else "A rename needs no reply: continue your work, or end your turn if you were idle."
     )
     return "\n\n".join(parts)
+
+
+@dataclass(frozen=True)
+class HeldMessage:
+    """One held channel message as a summary shows it: who, the start of its first line, its ID."""
+
+    id: str
+    #: "planner": the sender's name without its agent type.
+    sender: str
+    #: The message's first line, at most ``PREVIEW_LIMIT`` characters and "…".
+    line: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {"id": self.id, "from": self.sender, "line": self.line}
+
+    @staticmethod
+    def from_json(value: object) -> Optional["HeldMessage"]:
+        if not isinstance(value, Mapping):
+            return None
+        mid, sender, line = (value.get(key) for key in ("id", "from", "line"))
+        if not isinstance(mid, str) or not isinstance(sender, str) or not isinstance(line, str):
+            return None
+        return HeldMessage(mid, sender, line)
+
+
+@dataclass(frozen=True)
+class Tally:
+    """Channel messages held instead of delivered one by one, in one channel: messages that did not
+    @mention the participant, in a channel it does not follow in full. A summary of them goes with
+    the next notice, or alone once they have waited the batch window; then it starts again."""
+
+    conversation_id: str
+    #: "#general".
+    where: str
+    count: int
+    #: Who sent them, each name once, in order, at most ``TALLY_SENDERS`` + 1 (the extra means "…").
+    senders: tuple[str, ...]
+    #: The newest of them, oldest first, at most ``TALLY_RECENT``.
+    recent: tuple[HeldMessage, ...]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "conversation_id": self.conversation_id,
+            "where": self.where,
+            "count": self.count,
+            "senders": list(self.senders),
+            "recent": [held.to_json() for held in self.recent],
+        }
+
+    @staticmethod
+    def from_json(value: object) -> Optional["Tally"]:
+        if not isinstance(value, Mapping):
+            return None
+        cid, where, count = value.get("conversation_id"), value.get("where"), value.get("count")
+        senders, recent = value.get("senders"), value.get("recent")
+        if not isinstance(cid, str) or not isinstance(where, str):
+            return None
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            return None
+        if not isinstance(senders, list) or not all(isinstance(item, str) for item in senders):
+            return None
+        if not isinstance(recent, list):
+            return None
+        held = [HeldMessage.from_json(item) for item in recent]
+        kept = [item for item in held if item is not None]
+        if len(kept) != len(held):
+            return None
+        return Tally(cid, where, count, tuple(senders), tuple(kept))
+
+
+#: Senders a summary names for one channel; more are shown as "…".
+TALLY_SENDERS = 3
+#: Messages a summary lists for one channel, the newest; earlier ones are counted.
+TALLY_RECENT = 8
+#: Characters of a held message's first line a summary shows.
+PREVIEW_LIMIT = 100
+
+
+def preview_of(body: str) -> str:
+    """The start of a message's first line, for a summary."""
+    first = body.strip().split("\n", 1)[0].strip()
+    return f"{first[:PREVIEW_LIMIT]}…" if len(first) > PREVIEW_LIMIT else first
+
+
+def _tallied(tally: Tally) -> list[str]:
+    """One channel's part of a summary: a heading line, then one line per listed message."""
+    named = ", ".join(tally.senders[:TALLY_SENDERS])
+    sender = f"{named}, …" if len(tally.senders) > TALLY_SENDERS else named
+    earlier = tally.count - len(tally.recent)
+    lines = [
+        f"{tally.where} · {_plural(tally.count, 'message')} from {sender} "
+        f"· conversationId {tally.conversation_id}"
+    ]
+    if earlier > 0:
+        lines.append(f"- {earlier} earlier, not listed")
+    lines.extend(f"- {held.sender}: {held.line} · messageId {held.id}" for held in tally.recent)
+    return lines
+
+
+def held_summary(recipient: Recipient, tallies: Sequence[Tally], alone: bool) -> str:
+    """The summary of one follow's held channel messages: on its own when the batch window ended
+    (``alone``), or added to a notice that wakes the session anyway."""
+    total = _plural(sum(tally.count for tally in tallies), "channel message")
+    heading = (
+        f"TalkTo: {total} for your participant {recipient.participant_id} on server "
+        f"{recipient.server_id} that did not @mention you, gathered since your last notice. "
+        "Reply only if one concerns your work."
+        if alone
+        else f"Also, {total} that did not @mention you (participant {recipient.participant_id}, "
+        f"server {recipient.server_id}):"
+    )
+    lines = [heading]
+    for tally in tallies:
+        lines.extend(_tallied(tally))
+    lines.append(
+        "Each line is the start of a message; read any in full with read_messages (its "
+        "conversationId, or around its messageId). " + _UNTRUSTED
+    )
+    return "\n".join(lines)
 
 
 def urgent_notice(recipient: Recipient, messages: Sequence[IncomingMessage]) -> str:

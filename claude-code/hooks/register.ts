@@ -14,8 +14,10 @@
  *   `t3-code` server), and only while it holds the thread's lease in the store.
  */
 import type { EngineInterface, PluginOptions, Register } from "claude-code";
+import { cacheMinutesOf, type CacheVariables } from "./cache.ts";
 import {
   Inbox,
+  minutesSetting,
   isSaved,
   readFollowInput,
   waitPolicyOf,
@@ -82,6 +84,8 @@ const settingsOf = (options: PluginOptions): Settings & { readonly server: strin
     urgent: options["urgent"] === "queue" ? "queue" : "inject",
     pollMillis: Math.max(5, Math.min(300, Number.isFinite(seconds) ? seconds : 15)) * 1000,
     wait: waitPolicyOf(String(options["wait"] ?? "")),
+    channelBatchMillis: minutesSetting(String(options["channelBatchMinutes"] ?? "")),
+    cacheMillis: minutesSetting(String(options["cacheMinutes"] ?? "")),
     server: String(options["mcpServer"] ?? "").trim(),
   };
 };
@@ -114,6 +118,16 @@ const toolsOf = async ($: EngineInterface, server: string): Promise<ReadonlyArra
     .filter((name) => name.startsWith(prefix))
     .map((name) => name.slice(prefix.length));
 };
+
+/** The variables that point to this session's prompt-cache lifetime. */
+const cacheVariablesOf = async ($: EngineInterface): Promise<CacheVariables> => ({
+  force5m: await $.env.get("FORCE_PROMPT_CACHING_5M"),
+  enable1h: await $.env.get("ENABLE_PROMPT_CACHING_1H"),
+  ttl: await $.env.get("CLAUDE_CODE_PROMPT_CACHE_TTL"),
+  bedrock: await $.env.get("CLAUDE_CODE_USE_BEDROCK"),
+  vertex: await $.env.get("CLAUDE_CODE_USE_VERTEX"),
+  foundry: await $.env.get("CLAUDE_CODE_USE_FOUNDRY"),
+});
 
 /** The session's kind, from what Claude Code says and the variables T3 Code sets. */
 const kindOf = async ($: EngineInterface, isInteractive: boolean): Promise<SessionKind> =>
@@ -366,7 +380,9 @@ const startSession = async (
     () => live.phase === "ready",
     () => standDown(live),
   );
-  const created = new Inbox(host, settings);
+  // Unless the person set it, the cache lifetime comes from how this session reaches Claude.
+  const cacheMillis = settings.cacheMillis ?? cacheMinutesOf(await cacheVariablesOf($)) * 60_000;
+  const created = new Inbox(host, { ...settings, cacheMillis });
   await $.tool.register(followSpecOf(live.kind));
   await $.tool.register(unfollowSpec);
   await $.command.register({

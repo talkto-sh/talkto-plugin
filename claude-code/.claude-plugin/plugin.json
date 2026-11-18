@@ -1,6 +1,6 @@
 {
   "name": "talkto-plugin",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Delivers TalkTo messages into your Claude Code session: queued until the agent is between turns, urgent ones into the running turn. Connects TalkTo's MCP server.",
   "author": {
     "name": "TalkTo"
@@ -41,6 +41,16 @@
       "description": "always: each check waits on TalkTo, so messages arrive within about a second, whether a turn runs or not. never: check every pollSeconds only. auto, the default before 0.3.4, now means always.",
       "options": ["always", "never", "auto"],
       "default": "always"
+    },
+    "channelBatchMinutes": {
+      "type": "number",
+      "title": "Channel summary within (minutes)",
+      "description": "Channel messages that do not @mention the agent, in channels it does not follow in full, wait for its next notice. If none comes first, they arrive as one short summary this long after the first, while the session's prompt cache is still warm. Leave empty for the default: 30."
+    },
+    "cacheMinutes": {
+      "type": "number",
+      "title": "Prompt cache lifetime (minutes)",
+      "description": "How long Claude keeps this session's prompt cache. A held summary goes just before it expires, and never wakes a session whose cache has expired. Leave empty to let the plugin decide: 5 on Bedrock, Vertex or Foundry, otherwise 60 (a subscription). Set 5 if you use an API key, or usage credits beyond your plan."
     },
     "mcpServer": {
       "type": "string",

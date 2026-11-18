@@ -59,6 +59,12 @@ class FileOffer:
         )
 
 
+#: Why a message reached this participant, which decides whether it wakes the session: one of its
+#: direct chats, a channel message that @mentions it, a notice TalkTo wrote (such as a new channel),
+#: or any other message in a channel it watches.
+SCOPES = ("direct", "mention", "notice", "channel")
+
+
 @dataclass(frozen=True)
 class IncomingMessage:
     """One incoming message, as much as a notice shows."""
@@ -77,6 +83,9 @@ class IncomingMessage:
     transfer: Optional[FileOffer] = None
     #: True when the plugin's queue kept only the start of the body.
     cut: bool = False
+    #: Why it reached this participant (one of ``SCOPES``). None when the reply did not describe its
+    #: conversation, and in a message queued before plugin 0.3.5; such a message is delivered in full.
+    scope: Optional[str] = None
 
     def to_json(self) -> dict[str, Any]:
         saved = asdict(self)
@@ -84,6 +93,8 @@ class IncomingMessage:
             del saved["transfer"]
         if not self.cut:
             del saved["cut"]
+        if self.scope is None:
+            del saved["scope"]
         return saved
 
     @staticmethod
@@ -115,8 +126,15 @@ class IncomingMessage:
         cut = value.get("cut", False)
         if not isinstance(cut, bool):
             return None
+        # Absent in a message queued before plugin 0.3.5, or whose conversation was not described.
+        scope = value.get("scope")
+        if scope is not None and scope not in SCOPES:
+            return None
         return IncomingMessage(
-            **{key: value[key] for key in (*texts, "is_urgent")}, transfer=transfer, cut=cut
+            **{key: value[key] for key in (*texts, "is_urgent")},
+            transfer=transfer,
+            cut=cut,
+            scope=scope,
         )
 
 
@@ -237,6 +255,18 @@ def _renames(data: Mapping[str, Any]) -> tuple[ParticipantRename, ...]:
     return tuple(renames)
 
 
+def _scope(entry: Mapping[str, Any], channel: Optional[bool], participant_id: str) -> Optional[str]:
+    """Why a message reached ``participant_id``: TalkTo's own ``notice``, its direct chat, an
+    @mention in ``mentions``, or a channel it watches. None when the conversation was not described."""
+    if isinstance(entry.get("notice"), (Mapping, list)):
+        return "notice"
+    if channel is None:
+        return None
+    if not channel:
+        return "direct"
+    return "mention" if participant_id in _list(entry, "mentions") else "channel"
+
+
 def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
     """Decode one ``get_updates`` reply envelope for ``participant_id``."""
     if not isinstance(envelope, Mapping):
@@ -260,6 +290,8 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
         if pid is not None and name is not None:
             names[pid] = name if kind is None else f"{name} ({kind})"
     places: dict[str, str] = {}
+    #: Whether each described conversation is a channel (True) or a direct chat (False).
+    channels: dict[str, bool] = {}
     for entry in _list(included, "conversations"):
         if not isinstance(entry, Mapping):
             continue
@@ -267,6 +299,9 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
         if cid is None:
             continue
         name = _text(entry, "name")
+        kind = _text(entry, "kind")
+        # A record without a kind: a channel has a name, a direct chat has none.
+        channels[cid] = kind == "channel" or (kind != "direct" and name is not None)
         if name is not None:
             places[cid] = f"#{name}"
             continue
@@ -304,6 +339,7 @@ def decode_updates(envelope: object, participant_id: str) -> UpdatesReply:
                 where=places.get(conversation_id, f"conversation {conversation_id}"),
                 sender=names.get(sender_id, f"participant {sender_id}"),
                 transfer=None if offered is None else FileOffer.read(offered, camel=True),
+                scope=_scope(entry, channels.get(conversation_id), participant_id),
             )
         )
     interval = data.get("wakeIntervalSeconds")

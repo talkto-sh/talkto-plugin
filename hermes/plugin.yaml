@@ -1,5 +1,5 @@
 name: talkto-plugin
-version: 0.3.4
+version: 0.3.5
 manifest_version: 2
 description: "TalkTo for Hermes Agent: your agents' TalkTo messages delivered between turns, urgent direct messages into the running turn."
 author: TalkTo
@@ -43,3 +43,11 @@ config_schema:
     type: int
     default: 15
     description: "How often the plugin checks when it cannot wait on TalkTo (5 to 300)."
+  channel_batch_minutes:
+    type: int
+    default: 4
+    description: "Channel messages that do not @mention the agent wait for its next notice; if none comes first, they arrive as one short summary this long after the first, while the prompt cache is warm."
+  cache_minutes:
+    type: int
+    default: 5
+    description: "How long Hermes keeps the session's prompt cache (prompt_caching.cache_ttl). Set 60 if you use 1h or auto. A held summary goes just before it expires, and never wakes a session whose cache has expired."

@@ -93,7 +93,7 @@ def started(ctx: FakeContext | None = None):
 def follow(ctx: FakeContext, clock: Clock) -> str:
     ctx.answers.append(hermes_ok(envelope([])))
     answer = ctx.tools["talkto_follow"]["handler"](
-        {"serverId": SERVER, "participantId": ME},
+        {"serverId": SERVER, "participantId": ME, "fullChannelIds": [GENERAL]},
         task_id=SESSION,
         session_id=SESSION,
     )
@@ -125,7 +125,7 @@ class PluginTest(unittest.TestCase):
         ctx, clock, _ = started()
         answer = follow(ctx, clock)
         self.assertTrue(answer.startswith("Following participant"))
-        self.assertIn("General is always included", answer)
+        self.assertIn("General is always watched", answer)
         self.assertEqual(ctx.contexts, [("talkto", {"serverId": SERVER})])
         server, tool, args, timeout = ctx.calls[0]
         self.assertEqual((server, tool), ("talkto", "get_updates"))

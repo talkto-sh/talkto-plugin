@@ -33,6 +33,8 @@ def camel(message) -> dict:
         "where": message.where,
         "from": message.sender,
     }
+    if message.scope is not None:
+        fields["scope"] = message.scope
     offer = message.transfer
     if offer is not None:
         fields["transfer"] = {
@@ -90,8 +92,43 @@ def update(case: dict) -> dict:
     }
 
 
+def held(case: dict) -> dict:
+    """A held summary, previews and the follow answer's wake rules, for the core to compare."""
+    tallies = [
+        notice.Tally(
+            tally["conversationId"],
+            tally["where"],
+            tally["count"],
+            tuple(tally["senders"]),
+            tuple(notice.HeldMessage(h["id"], h["from"], h["line"]) for h in tally["recent"]),
+        )
+        for tally in case["tallies"]
+    ]
+    recipient = Recipient(case["serverId"], case["participantId"])
+    return {
+        "summary": notice.held_summary(recipient, tallies, case["alone"]),
+        "previews": [notice.preview_of(body) for body in case["bodies"]],
+        "rules": plugin.inbox.wake_rules(case["full"], case["generalInFull"], case["batchMillis"]),
+    }
+
+
+def tools() -> dict:
+    return {
+        "description": plugin.tools.follow_description("this Hermes session"),
+        "schema": plugin.tools.FOLLOW_PARAMETERS,
+        "timing": {
+            "cacheMinutes": plugin.inbox.DEFAULT_CACHE_MINUTES,
+            "batchMinutes": plugin.inbox.DEFAULT_BATCH_MINUTES,
+        },
+    }
+
+
 cases = json.load(sys.stdin)
 if "--updates" in sys.argv:
     json.dump([update(case) for case in cases], sys.stdout, ensure_ascii=False)
+elif "--held" in sys.argv:
+    json.dump([held(case) for case in cases], sys.stdout, ensure_ascii=False)
+elif "--tools" in sys.argv:
+    json.dump(tools(), sys.stdout, ensure_ascii=False)
 else:
     json.dump([run(case) for case in cases], sys.stdout, ensure_ascii=False)

@@ -48,12 +48,20 @@ const heading = (message: IncomingMessage, index: number) =>
   `[${index + 1}]${message.isUrgent ? " URGENT" : ""} ${message.where} · from ${message.from} · ${message.createdAt}\n` +
   `messageId ${message.id} · conversationId ${message.conversationId}`;
 
+/** The longest part of a TalkTo notice (a new channel's announcement) a notice shows. */
+const announcementLimit = 600;
+
+/** A notice TalkTo wrote, such as a new channel, on one line. */
+const announced = (message: IncomingMessage, index: number) =>
+  `[${index + 1}] TalkTo notice in ${message.where}: ${message.body.replace(/\s*\n\s*/g, " ").slice(0, announcementLimit)}`;
+
 const described = (messages: ReadonlyArray<IncomingMessage>) => {
   const shown = messages.slice(0, shownLimit);
   const listed = messages.slice(shownLimit, shownLimit + listedLimit);
   const unlisted = messages.length - shown.length - listed.length;
   let spent = 0;
   const parts = shown.map((message, index) => {
+    if (message.scope === "notice") return announced(message, index);
     const allowance = Math.min(bodyLimit, Math.max(bodyFloor, noticeBodyBudget - spent));
     const body = message.body.slice(0, allowance);
     spent += body.length;
@@ -137,6 +145,79 @@ export const queuedNotice = (
       ? "Reply with send_message (same serverId and participantId; target the conversationId) only if a message needs it. Otherwise continue your work, or end your turn if you were idle."
       : "A rename needs no reply: continue your work, or end your turn if you were idle.",
   ].join("\n\n");
+};
+
+/** One held channel message as a summary shows it: who, the start of its first line, and its ID. */
+export interface HeldMessage {
+  readonly id: string;
+  /** "planner": the sender's name without its agent type. */
+  readonly from: string;
+  /** The message's first line, at most `previewLimit` characters and "…". */
+  readonly line: string;
+}
+
+/**
+ * Channel messages the plugin held instead of delivering one by one, in one channel: messages that
+ * did not @mention the participant, in a channel it does not follow in full. A summary of them
+ * goes with the next notice, or alone once they have waited the batch window; then it starts again.
+ */
+export interface Tally {
+  readonly conversationId: string;
+  /** "#general". */
+  readonly where: string;
+  readonly count: number;
+  /** Who sent them, each name once, in order, at most `tallySenders` + 1 (the extra means "…"). */
+  readonly senders: ReadonlyArray<string>;
+  /** The newest of them, oldest first, at most `tallyRecent`. */
+  readonly recent: ReadonlyArray<HeldMessage>;
+}
+
+/** Senders a summary names for one channel; more are shown as "…". */
+export const tallySenders = 3;
+/** Messages a summary lists for one channel, the newest; earlier ones are counted. */
+export const tallyRecent = 8;
+/** Characters of a held message's first line a summary shows. */
+export const previewLimit = 100;
+
+/** The start of a message's first line, for a summary. */
+export const previewOf = (body: string): string => {
+  const first = (body.trim().split("\n")[0] ?? "").trim();
+  return first.length > previewLimit ? `${first.slice(0, previewLimit)}…` : first;
+};
+
+/** One channel's part of a summary: a heading line, then one line per listed message. */
+const tallied = (tally: Tally): ReadonlyArray<string> => {
+  const named = tally.senders.slice(0, tallySenders).join(", ");
+  const from = tally.senders.length > tallySenders ? `${named}, …` : named;
+  const earlier = tally.count - tally.recent.length;
+  return [
+    `${tally.where} · ${plural(tally.count, "message")} from ${from} · conversationId ${tally.conversationId}`,
+    ...(earlier > 0 ? [`- ${earlier} earlier, not listed`] : []),
+    ...tally.recent.map((held) => `- ${held.from}: ${held.line} · messageId ${held.id}`),
+  ];
+};
+
+/**
+ * The summary of one follow's held channel messages: on its own when the batch window ended
+ * (`alone`), or added to a notice that wakes the session anyway.
+ */
+export const heldSummary = (
+  recipient: Recipient,
+  tallies: ReadonlyArray<Tally>,
+  alone: boolean,
+): string => {
+  const total = plural(
+    tallies.reduce((sum, tally) => sum + tally.count, 0),
+    "channel message",
+  );
+  return [
+    alone
+      ? `TalkTo: ${total} for your participant ${recipient.participantId} on server ${recipient.serverId} that did not @mention you, gathered since your last notice. Reply only if one concerns your work.`
+      : `Also, ${total} that did not @mention you (participant ${recipient.participantId}, server ${recipient.serverId}):`,
+    ...tallies.flatMap(tallied),
+    "Each line is the start of a message; read any in full with read_messages (its conversationId, or around its messageId). " +
+      untrusted,
+  ].join("\n");
 };
 
 /** The notice that goes into a running turn for urgent messages. */

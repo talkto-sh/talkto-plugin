@@ -5,6 +5,15 @@
  * guess.
  */
 
+/**
+ * Why a message reached this participant, which decides whether it wakes the session:
+ * - `direct`: in one of its direct chats;
+ * - `mention`: a channel message that @mentions it;
+ * - `notice`: a notice TalkTo itself wrote into General, such as a new channel;
+ * - `channel`: any other message in a channel it watches.
+ */
+export type MessageScope = "direct" | "mention" | "notice" | "channel";
+
 /** One incoming message, as much as a notice shows. */
 export interface IncomingMessage {
   readonly id: string;
@@ -21,6 +30,11 @@ export interface IncomingMessage {
   readonly transfer?: FileOffer;
   /** True when the plugin's queue kept only the start of the body; absent for a whole body. */
   readonly cut?: boolean;
+  /**
+   * Why it reached this participant; absent when the reply did not describe its conversation, and
+   * in a message queued before plugin 0.3.5. Such a message is delivered in full.
+   */
+  readonly scope?: MessageScope;
 }
 
 /** A file or folder a message offers. The receiver fetches it with fetch_transfer, by `id`. */
@@ -200,6 +214,21 @@ const renamesOf = (data: Fields): ReadonlyArray<ParticipantRename> =>
     return [{ id, participantId, previousName, name, by }];
   });
 
+/**
+ * Why a message reached `participantId`: TalkTo's own `notice`, its direct chat, an @mention in
+ * `mentions`, or a channel it watches. Null when the reply did not describe the conversation.
+ */
+const scopeOf = (
+  item: Fields,
+  channel: boolean | undefined,
+  participantId: string,
+): MessageScope | null => {
+  if (isObject(item.get("notice"))) return "notice";
+  if (channel === undefined) return null;
+  if (!channel) return "direct";
+  return listOf(item, "mentions").includes(participantId) ? "mention" : "channel";
+};
+
 /** Longest part of an error's text a failure keeps. */
 const reasonLimit = 300;
 
@@ -242,12 +271,17 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
     if (id !== null && name !== null) names.set(id, type === null ? name : `${name} (${type})`);
   }
   const places = new Map<string, string>();
+  /** Whether each described conversation is a channel (true) or a direct chat (false). */
+  const channels = new Map<string, boolean>();
   for (const entry of included === null ? [] : listOf(included, "conversations")) {
     if (!isObject(entry)) continue;
     const item: Fields = new Map(Object.entries(entry));
     const id = textOf(item, "id");
     if (id === null) continue;
     const name = textOf(item, "name");
+    const kind = textOf(item, "kind");
+    // A record without a kind: a channel has a name, a direct chat has none.
+    channels.set(id, kind === "channel" || (kind !== "direct" && name !== null));
     if (name !== null) {
       places.set(id, `#${name}`);
       continue;
@@ -279,6 +313,7 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
     // The offer is additive: one this plugin cannot read is left out, never failing the message.
     const offered = fieldsAt(item, "transfer");
     const transfer = offered === null ? null : offerOf(offered);
+    const scope = scopeOf(item, channels.get(conversationId), participantId);
     const decoded: IncomingMessage = {
       id,
       conversationId,
@@ -289,7 +324,8 @@ export const decodeUpdates = (answer: ToolAnswer, participantId: string): Update
       where: places.get(conversationId) ?? `conversation ${conversationId}`,
       from: names.get(senderId) ?? `participant ${senderId}`,
     };
-    messages.push(transfer === null ? decoded : { ...decoded, transfer });
+    const scoped = scope === null ? decoded : { ...decoded, scope };
+    messages.push(transfer === null ? scoped : { ...scoped, transfer });
   }
   const interval = data.get("wakeIntervalSeconds");
   const latest = textOf(data, "latestPluginVersion");

@@ -32,7 +32,7 @@ def followed(host: FakeHost, settings=None) -> "Inbox":
     inbox = Inbox(host, settings or Settings())
     host.answers.append(envelope([]))
     given = inbox_module.read_follow_input(
-        {"serverId": SERVER, "participantId": ME, "channelIds": [GENERAL]}
+        {"serverId": SERVER, "participantId": ME, "fullChannelIds": [GENERAL]}
     )
     answer = inbox.follow(given)
     assert answer.startswith("Following participant"), answer
@@ -122,7 +122,7 @@ class InboxTest(unittest.TestCase):
         self.assertEqual(host.contexts, [{"serverId": SERVER}], "asks for the server, not a participant")
         self.assertEqual(started_with(host), [GENERAL, TASK])
         self.assertEqual(host.stored["follows"][0]["channel_ids"], [GENERAL, TASK])
-        self.assertIn("(2 channels, direct chats: own). General is always included", answer)
+        self.assertIn("(2 channels, 0 of them in full, direct chats: own). General is always watched", answer)
         # With no channels and no direct chats, General alone still makes a valid feed.
         follow_with(inbox, [], "none")
         self.assertEqual(host.calls[-1][1]["channelIds"], [GENERAL])
@@ -139,7 +139,7 @@ class InboxTest(unittest.TestCase):
         host = FakeHost()
         answer = follow_with(Inbox(host, Settings()), chosen)
         self.assertEqual(started_with(host), [GENERAL, *chosen[: LIMIT - 1]])
-        self.assertIn(f"channel channel-{LIMIT - 1} is not delivered", answer)
+        self.assertIn(f"channel channel-{LIMIT - 1} is not watched", answer)
         self.assertIn(f"at most {LIMIT - 1} other channels", answer)
         with_general = [GENERAL, *chosen[1:]]
         self.assertEqual(
@@ -632,7 +632,7 @@ class InboxTest(unittest.TestCase):
         self.assertEqual(len(host.calls), failed, "the failures earned a wait")
         host.clock.timers.clear()
         host.answers.append(envelope([], checkpoint="refollowed"))
-        host.answers.append(envelope([message(body="at once")]))
+        host.answers.append(envelope([message(conversationId=DIRECT, body="at once")]))
         follow_with(inbox, [GENERAL])
         host.clock.advance(0)
         self.assertEqual(host.calls[-1][1]["checkpoint"], "refollowed", "polled at once")
@@ -664,7 +664,7 @@ class InboxTest(unittest.TestCase):
                 break
             time.sleep(0.01)
         host.answers.append(envelope([], checkpoint="refollowed"))
-        host.answers.append(envelope([message(body="at once")], checkpoint="cp-new"))
+        host.answers.append(envelope([message(conversationId=DIRECT, body="at once")], checkpoint="cp-new"))
         follow_with(inbox, [GENERAL])
         host.clock.advance(0)
         self.assertFalse(release.is_set())

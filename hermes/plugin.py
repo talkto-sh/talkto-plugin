@@ -31,11 +31,14 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
 from .inbox import (
+    DEFAULT_BATCH_MINUTES,
+    DEFAULT_CACHE_MINUTES,
     WAIT_SECONDS,
     Answer,
     Inbox,
     Settings,
     TransportError,
+    minutes_setting,
     read_follow_input,
     wait_policy_of,
 )
@@ -242,6 +245,10 @@ class TalkToPlugin:
             urgent="queue" if self._setting("urgent", "inject") == "queue" else "inject",
             poll_millis=int(min(300, max(5, seconds)) * 1000),
             wait=wait_policy_of(self._setting("wait", "always")),
+            channel_batch_millis=minutes_setting(self._setting("channel_batch_minutes", None))
+            or DEFAULT_BATCH_MINUTES * 60_000,
+            cache_millis=minutes_setting(self._setting("cache_minutes", None))
+            or DEFAULT_CACHE_MINUTES * 60_000,
         )
 
     def _hint(self) -> str:

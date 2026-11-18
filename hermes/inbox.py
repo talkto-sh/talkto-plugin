@@ -41,7 +41,13 @@ from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Sequence
 from .notice import (
     BODY_FLOOR,
     BODY_LIMIT,
+    TALLY_RECENT,
+    TALLY_SENDERS,
+    HeldMessage,
+    Tally,
     follow_ended,
+    held_summary,
+    preview_of,
     is_newer,
     participant_removed,
     queued_notice,
@@ -127,12 +133,51 @@ def wait_policy_of(setting: object) -> WaitPolicy:
     return "never" if setting == "never" else "always"
 
 
+#: Hermes's defaults for held channel messages (those that do not concern the participant): its
+#: prompt cache lives 5 minutes after the last model call (``prompt_caching.cache_ttl``), and held
+#: messages wait at most 4 minutes. They go with any notice that wakes the session anyway, else
+#: after ``DEFAULT_BATCH_MINUTES``, or just before the cache expires, whichever is first, and never
+#: into a session whose cache has expired. The core keeps every host's values in ``hostTimings``;
+#: a test holds these to it.
+DEFAULT_CACHE_MINUTES = 5
+DEFAULT_BATCH_MINUTES = 4
+#: Minutes a person may set for either value.
+_TIMING_RANGE = (1, 24 * 60)
+
+
+def minutes_setting(setting: object) -> Optional[float]:
+    """A person's setting in minutes as milliseconds, kept within range; None when unset."""
+    if isinstance(setting, bool):
+        return None
+    if isinstance(setting, (int, float)):
+        minutes = float(setting)
+    elif isinstance(setting, str) and setting.strip():
+        try:
+            minutes = float(setting)
+        except ValueError:
+            return None
+    else:
+        return None
+    if minutes != minutes or minutes in (float("inf"), float("-inf")):
+        return None
+    return max(_TIMING_RANGE[0], min(_TIMING_RANGE[1], minutes)) * 60_000
+
+
+def cache_margin_of(cache_millis: float) -> float:
+    """How long before the cache expires a held batch is sent: a fifth of its life, at most 10 min."""
+    return min(10 * 60_000, cache_millis / 5)
+
+
 @dataclass(frozen=True)
 class Settings:
     delivery: Delivery = "idle"
     urgent: UrgentHandling = "inject"
     poll_millis: int = 15_000
     wait: WaitPolicy = "always"
+    #: The longest a held channel message waits while the cache is warm, in milliseconds.
+    channel_batch_millis: float = DEFAULT_BATCH_MINUTES * 60_000
+    #: How long the prompt cache lives after the last model call, in milliseconds.
+    cache_millis: float = DEFAULT_CACHE_MINUTES * 60_000
 
 
 @dataclass(frozen=True)
@@ -178,9 +223,12 @@ class Host(Protocol):
 class FollowInput:
     server_id: str
     participant_id: str
+    #: Channels watched quietly: their messages are held unless they @mention the participant.
     channel_ids: tuple[str, ...]
     direct_chats: DirectChats
     start_at: Literal["now", "beginning"]
+    #: Channels whose every message is delivered.
+    full_channel_ids: tuple[str, ...] = ()
 
 
 @dataclass(eq=False)
@@ -197,6 +245,13 @@ class Follow:
     dropped: int = 0
     #: Renames since the last notice, at most ``QUEUE_LIMIT``; they go with the next one.
     renames: list[ParticipantRename] = field(default_factory=list)
+    #: The watched channels whose every message is delivered. None for a follow started before
+    #: plugin 0.3.5, when every watched channel delivered: all but General still do.
+    full_channel_ids: Optional[tuple[str, ...]] = None
+    #: Channel messages held instead of delivered since the last notice, one tally per channel.
+    quiet: list[Tally] = field(default_factory=list)
+    #: When the first of the held messages arrived, in milliseconds; None while none is held.
+    quiet_since: Optional[float] = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -208,6 +263,11 @@ class Follow:
             "pending": [message.to_json() for message in self.pending],
             "dropped": self.dropped,
             "renames": [rename.to_json() for rename in self.renames],
+            "full_channel_ids": None
+            if self.full_channel_ids is None
+            else list(self.full_channel_ids),
+            "quiet": [tally.to_json() for tally in self.quiet],
+            "quiet_since": self.quiet_since,
         }
 
     @staticmethod
@@ -237,6 +297,22 @@ class Follow:
         known = [rename for rename in renames if rename is not None]
         if len(known) != len(renames):
             return None
+        # Absent in a follow saved before plugin 0.3.5.
+        full = value.get("full_channel_ids")
+        if full is not None and (
+            not isinstance(full, list) or not all(isinstance(item, str) for item in full)
+        ):
+            return None
+        saved_quiet = value.get("quiet", [])
+        if not isinstance(saved_quiet, list):
+            return None
+        tallies = [Tally.from_json(item) for item in saved_quiet]
+        quiet = [tally for tally in tallies if tally is not None]
+        if len(quiet) != len(tallies):
+            return None
+        since = value.get("quiet_since")
+        if since is not None and (isinstance(since, bool) or not isinstance(since, (int, float))):
+            return None
         server_id, participant_id, checkpoint = (str(text) for text in texts)
         return Follow(
             server_id=server_id,
@@ -247,6 +323,9 @@ class Follow:
             pending=kept,
             dropped=dropped,
             renames=known,
+            full_channel_ids=None if full is None else tuple(full),
+            quiet=quiet,
+            quiet_since=None if not quiet or since is None else float(since),
         )
 
 
@@ -299,11 +378,37 @@ def _general_note(watched: Watched) -> str:
             "to hear about new channels, add General's ID from get_context to channelIds."
         )
     if watched.displaced is None:
-        return "General is always included: TalkTo announces new channels there."
+        return "General is always watched: TalkTo announces new channels there."
     return (
-        f"General is always included and took one of the {CHANNEL_LIMIT} channel places, so channel "
-        f"{watched.displaced} is not delivered; to keep it, follow again with at most "
+        f"General is always watched and took one of the {CHANNEL_LIMIT} channel places, so channel "
+        f"{watched.displaced} is not watched; to keep it, follow again with at most "
         f"{CHANNEL_LIMIT - 1} other channels."
+    )
+
+
+def _minutes_text(minutes: float) -> str:
+    """Minutes as the core's template literal writes them: 4, 2.5."""
+    return str(int(minutes)) if minutes == int(minutes) else repr(minutes)
+
+
+def wake_rules(full: int, general_in_full: bool, batch_millis: float) -> str:
+    """What the follow answer says wakes the agent, with ``full`` channels followed in full."""
+    minutes = batch_millis / 60_000
+    if full == 0:
+        first = "Direct chats, @mentions of you and TalkTo's notices (such as a new channel) wake you."
+    else:
+        channels = "fullChannelIds channel" if full == 1 else f"{full} fullChannelIds channels"
+        general = " (General included)" if general_in_full else ""
+        first = (
+            "Direct chats, @mentions of you, TalkTo's notices (such as a new channel) and every "
+            f"message in your {channels}{general} wake you."
+        )
+    others = "" if general_in_full else ", General's included,"
+    within = "a minute" if minutes == 1 else f"{_minutes_text(minutes)} minutes"
+    return (
+        f"{first} Other channel messages{others} are held: a short summary (sender, first line, "
+        f"messageId) goes with your next notice, or on its own within {within} while you are "
+        "active; read_messages shows them in full."
     )
 
 
@@ -318,8 +423,11 @@ def read_follow_input(args: Mapping[str, Any]) -> Union[FollowInput, str]:
     channels = args.get("channelIds", [])
     if not isinstance(channels, list) or not all(isinstance(item, str) for item in channels):
         return "channelIds must be a list of channel IDs."
-    if len(set(channels)) > CHANNEL_LIMIT:
-        return f"channelIds holds at most {CHANNEL_LIMIT} channels."
+    full = args.get("fullChannelIds", [])
+    if not isinstance(full, list) or not all(isinstance(item, str) for item in full):
+        return "fullChannelIds must be a list of channel IDs."
+    if len(set(channels) | set(full)) > CHANNEL_LIMIT:
+        return f"channelIds and fullChannelIds hold at most {CHANNEL_LIMIT} channels together."
     direct_chats = args.get("directChats", "own")
     if direct_chats not in ("own", "none"):
         return 'directChats must be "own" or "none".'
@@ -332,6 +440,7 @@ def read_follow_input(args: Mapping[str, Any]) -> Union[FollowInput, str]:
         channel_ids=tuple(channels),
         direct_chats="own" if direct_chats == "own" else "none",
         start_at="now" if start_at == "now" else "beginning",
+        full_channel_ids=tuple(full),
     )
 
 
@@ -354,6 +463,33 @@ def _enqueue(pending: list[IncomingMessage], messages: Sequence[IncomingMessage]
         kept += len(queued.body)
 
 
+#: Held message IDs remembered, so a page read twice is not held twice.
+_COUNTED_LIMIT = 1000
+
+
+def _tally(quiet: list[Tally], message: IncomingMessage) -> None:
+    """Holds one channel message the session does not get in full, in its channel's tally."""
+    # "planner (codex)" is named "planner": a name holds no spaces or parentheses.
+    sender = re.sub(r" \(.*\)$", "", message.sender)
+    held = HeldMessage(message.id, sender, preview_of(message.body))
+    for index, current in enumerate(quiet):
+        if current.conversation_id != message.conversation_id:
+            continue
+        keep = sender in current.senders or len(current.senders) > TALLY_SENDERS
+        quiet[index] = replace(
+            current,
+            count=current.count + 1,
+            recent=(*current.recent, held)[-TALLY_RECENT:],
+            senders=current.senders if keep else (*current.senders, sender),
+        )
+        return
+    quiet.append(Tally(message.conversation_id, message.where, 1, (sender,), (held,)))
+
+
+def _tally_key(server_id: str, conversation_id: str) -> str:
+    return f"{server_id} {conversation_id}"
+
+
 @dataclass(frozen=True)
 class _Snapshot:
     """What one notice covered: the notes before it and the queued message IDs."""
@@ -362,6 +498,10 @@ class _Snapshot:
     ids: frozenset[str]
     #: When it was sent, if it carried the plugin update line.
     update_at: Optional[float] = None
+    #: The held counts it showed, by server and conversation (``_tally_key``).
+    tallies: Mapping[str, int] = field(default_factory=dict)
+    #: When it was taken: held messages it did not show start a new window then.
+    at: float = 0.0
 
 
 @dataclass
@@ -447,6 +587,13 @@ class Inbox:
         self._widening: dict[str, tuple[str, tuple[str, ...]]] = {}
         #: Each server's name, by server, once get_context named it; only notices use it.
         self._server_names: dict[str, str] = {}
+        #: The newest held message IDs, at most ``_COUNTED_LIMIT``, so none is held twice.
+        self._counted: dict[str, None] = {}
+        #: When the session's last turn ended, the best measure of its last model call, from which
+        #: Hermes times its prompt cache. None before the first turn end this inbox saw.
+        self._last_turn_at: Optional[float] = None
+        #: Whether a timer for a held batch is set.
+        self._batch_timer = False
 
     # -- what the plugin and the agent use --------------------------------
 
@@ -458,6 +605,10 @@ class Inbox:
             return
         with self._lock:
             self._follows, self._notes = decoded
+            now = self._host.now()
+            for follow in self._follows:
+                if follow.quiet and follow.quiet_since is None:
+                    follow.quiet_since = now
             self._unchecked = {follow.server_id for follow in self._follows}
             self._update_notice_at = _update_notice_at(stored)
         if self._follows:
@@ -490,7 +641,13 @@ class Inbox:
                 item.server_id == given.server_id for item in self._follows
             ):
                 return f"This session already follows {FOLLOW_LIMIT} participants. Call unfollow for one first."
-        watched = watched_channels(given.channel_ids, self._general_of(given.server_id))
+        general = self._general_of(given.server_id)
+        # Full channels first, so General displaces a quiet one first.
+        chosen = tuple(dict.fromkeys((*given.full_channel_ids, *given.channel_ids)))
+        watched = watched_channels(chosen, general)
+        full = tuple(
+            item for item in dict.fromkeys(given.full_channel_ids) if item in watched.channel_ids
+        )
         try:
             answer = self._updates(
                 {
@@ -519,9 +676,10 @@ class Inbox:
             direct_chats=given.direct_chats,
             checkpoint=reply.checkpoint,
             renames=list(reply.renames),
+            full_channel_ids=full,
         )
-        _enqueue(follow.pending, reply.messages)
         with self._lock:
+            self._take(follow, reply.messages)
             self._follows = [
                 item for item in self._follows if item.server_id != given.server_id
             ] + [follow]
@@ -536,12 +694,19 @@ class Inbox:
             self._persist()
         self._host.after(0, self.tick)
         waiting = len(follow.pending)
+        held = sum(tally.count for tally in follow.quiet)
         more = "+" if reply.has_more else ""
         return " ".join(
             [
                 f"Following participant {given.participant_id} on server {given.server_id} "
-                f"({len(watched.channel_ids)} channels, direct chats: {given.direct_chats}).",
+                f"({len(watched.channel_ids)} channels, {len(full)} of them in full, "
+                f"direct chats: {given.direct_chats}).",
                 _general_note(watched),
+                wake_rules(
+                    len(full),
+                    general is not None and general in full,
+                    self._settings.channel_batch_millis,
+                ),
                 "New messages wait in a queue and arrive as one notice after you finish a turn; "
                 "urgent direct messages arrive inside your running turn.",
                 "Do not poll get_updates, create watches, or schedule checks for this participant "
@@ -549,6 +714,11 @@ class Inbox:
                 f"{waiting}{more} earlier messages were found; they arrive after this turn."
                 if waiting > 0 or reply.has_more
                 else "Nothing is waiting yet.",
+                *(
+                    [f"{held} earlier channel messages were held; a summary of them follows."]
+                    if held > 0
+                    else []
+                ),
             ]
         )
 
@@ -606,7 +776,12 @@ class Inbox:
             lines = [
                 f"TalkTo: participant {item.participant_id} on server {item.server_id}: "
                 f"{len(item.pending)} queued"
-                f"{' (urgent waiting)' if any(m.is_urgent for m in item.pending) else ''}."
+                f"{' (urgent waiting)' if any(m.is_urgent for m in item.pending) else ''}"
+                + (
+                    f"; {sum(t.count for t in item.quiet)} channel messages held for a summary."
+                    if item.quiet
+                    else "."
+                )
                 for item in self._follows
             ]
             if self._held_for_input:
@@ -696,6 +871,9 @@ class Inbox:
             self._busy = False
             self._turn_id = None
             self._idle_since = self._host.now()
+            self._last_turn_at = self._idle_since
+            # The cache is warm again: held messages get a deadline, or a later one.
+            self._arm_batch(self._idle_since)
             if self._submitted is not None:
                 # Hermes runs the accepted notice after this turn: give it time again.
                 self._submitted.deadline = self._idle_since + CONFIRM_MILLIS
@@ -983,9 +1161,85 @@ class Inbox:
             if isinstance(reply, UpdatesPage) and follow in self._follows:
                 self._widening[follow.server_id] = (reply.checkpoint, watched.channel_ids)
 
-    def _take_page(self, follow: Follow, page: UpdatesPage) -> None:
+    def _in_full(self, follow: Follow, conversation_id: str) -> bool:
+        """Whether every message in a watched channel is delivered. A follow from before plugin
+        0.3.5 delivers every channel but General, and General too while its ID is unknown."""
+        if follow.full_channel_ids is not None:
+            return conversation_id in follow.full_channel_ids
+        return self._generals.get(follow.server_id) != conversation_id
+
+    def _take(self, follow: Follow, messages: Sequence[IncomingMessage]) -> None:
+        """Takes new messages: those that concern the participant into the queue, the rest of a
+        channel's into its tally, starting the window when it was empty. Holds the lock."""
         known = {message.id for message in follow.pending}
-        _enqueue(follow.pending, [message for message in page.messages if message.id not in known])
+        now = self._host.now()
+        delivered: list[IncomingMessage] = []
+        for message in messages:
+            if message.id in known or message.id in self._counted:
+                continue
+            if message.scope != "channel" or self._in_full(follow, message.conversation_id):
+                delivered.append(message)
+                continue
+            _tally(follow.quiet, message)
+            if follow.quiet_since is None:
+                follow.quiet_since = now
+            self._counted[message.id] = None
+            while len(self._counted) > _COUNTED_LIMIT:
+                del self._counted[next(iter(self._counted))]
+        _enqueue(follow.pending, delivered)
+        self._arm_batch(now)
+
+    # -- held channel messages ----------------------------------------------
+
+    def _warm(self, at: float) -> bool:
+        """Whether the prompt cache is still warm at ``at``: a turn ended within its lifetime."""
+        return self._last_turn_at is not None and at < self._last_turn_at + self._settings.cache_millis
+
+    def _flush_at(self, follow: Follow) -> Optional[float]:
+        """When a follow's held messages go on their own: the window after the oldest, or just
+        before the cache expires, whichever is first. None when none are held, and when the cache
+        had nearly expired (or no turn end was seen) by the time the oldest arrived."""
+        if follow.quiet_since is None or self._last_turn_at is None:
+            return None
+        cache = self._settings.cache_millis
+        warm_until = self._last_turn_at + cache - cache_margin_of(cache)
+        if follow.quiet_since >= warm_until:
+            return None
+        return min(follow.quiet_since + self._settings.channel_batch_millis, warm_until)
+
+    def _batch_due(self, now: float) -> bool:
+        """Whether some follow's held messages are due on their own now, while the cache is warm."""
+        if not self._warm(now):
+            return False
+        for follow in self._follows:
+            at = self._flush_at(follow)
+            if at is not None and now >= at:
+                return True
+        return False
+
+    def _arm_batch(self, now: float) -> None:
+        """Tries delivery when the earliest held batch is due; one timer at a time. Holds the lock."""
+        if self._batch_timer or self._closed or not self._warm(now):
+            return
+        due = [at for at in (self._flush_at(follow) for follow in self._follows) if at is not None]
+        if not due:
+            return
+        self._batch_timer = True
+        self._host.after(max(0.0, min(due) - now), self._batch_fired)
+
+    def _batch_fired(self) -> None:
+        with self._lock:
+            self._batch_timer = False
+        self.deliver()
+        with self._lock:
+            # A batch still due waits for the turn to end or the person; only a batch not yet due
+            # needs this timer.
+            later = self._host.now()
+            if not self._batch_due(later):
+                self._arm_batch(later)
+
+    def _take_page(self, follow: Follow, page: UpdatesPage) -> None:
+        self._take(follow, page.messages)
         over = len(follow.pending) - QUEUE_LIMIT
         if over > 0:
             follow.pending = follow.pending[over:]
@@ -1017,13 +1271,13 @@ class Inbox:
         if page.wake_interval_seconds is not None:
             self._cadence[server_id] = page.wake_interval_seconds * 1000
 
-    def _cadence_wait(self, now: float) -> float:
+    def _cadence_wait(self, now: float, batch: bool = False) -> float:
         """How long the person's cadence still holds the next turn back: zero once any follow with
-        queued messages may wake, else the shortest wait among them."""
+        queued messages (or held ones, when a ``batch`` is due) may wake, else the shortest wait."""
         waits = [
             max(0.0, self._last_wake_at + self._cadence.get(item.server_id, 0) - now)
             for item in self._follows
-            if item.pending or item.dropped
+            if item.pending or item.dropped or (batch and item.quiet_since is not None)
         ]
         return min(waits) if waits else 0.0
 
@@ -1091,17 +1345,18 @@ class Inbox:
             if self._settings.delivery == "next-prompt" and not has_urgent and not self._notes:
                 return
             update = self._update_due(now)
-            text = self._notice_text(frozenset(), renames_alone=False, update=update)
+            batch = self._batch_due(now)
+            text = self._notice_text(frozenset(), renames_alone=False, update=update, batch=batch)
             if text is None:
                 return
-            held = 0.0 if has_urgent or self._notes else self._cadence_wait(now)
+            held = 0.0 if has_urgent or self._notes else self._cadence_wait(now, batch)
             if held > 0:
                 # Urgent messages and plugin notes ignore the cadence; the rest wait for it.
                 if not self._cadence_timer:
                     self._cadence_timer = True
                     self._host.after(held, self._cadence_due)
                 return
-            snapshot = self._snapshot(now if update else None)
+            snapshot = self._snapshot(now, now if update else None)
             self._submitting = True
         accepted: Optional[bool]
         try:
@@ -1126,20 +1381,35 @@ class Inbox:
         held = self._submitted.snapshot.ids if self._submitted is not None else frozenset()
         now = self._host.now()
         update = self._update_due(now)
-        text = self._notice_text(held, renames_alone=True, update=update)
+        text = self._notice_text(
+            held, renames_alone=True, update=update, batch=self._batch_due(now)
+        )
         if text is None:
             return None
-        snapshot = self._snapshot(now if update else None)
-        self._clear_delivered(_Snapshot(snapshot.notes, snapshot.ids - held, snapshot.update_at))
+        snapshot = self._snapshot(now, now if update else None)
+        # A held summary the submitted notice carries is not shown here, so it is not cleared here.
+        recent = frozenset(h.id for f in self._follows for t in f.quiet for h in t.recent)
+        self._clear_delivered(
+            replace(snapshot, ids=snapshot.ids - held - recent, tallies={})
+            if held
+            else snapshot
+        )
+        self._arm_batch(now)
         self._persist()
         return text
 
     def _notice_text(
-        self, without: frozenset[str], renames_alone: bool, update: bool = False
+        self,
+        without: frozenset[str],
+        renames_alone: bool,
+        update: bool = False,
+        batch: bool = False,
     ) -> Optional[str]:
         """The combined notice for everything queued except ``without``, or None. Queued renames go
         with any notice; on their own they make one only when ``renames_alone`` (the person's
-        prompt carries it)."""
+        prompt carries it). Held channel messages go with any notice as a short summary; on their
+        own they make one only when a ``batch`` is due. A summary a submitted notice carries
+        (``without`` is not empty) is not repeated."""
         parts = list(self._notes)
         waking = bool(parts)
         for follow in self._follows:
@@ -1148,23 +1418,40 @@ class Inbox:
             waking = waking or bool(messages) or follow.dropped > 0
             if messages or follow.dropped > 0 or renames:
                 parts.append(queued_notice(follow, messages, follow.dropped, renames))
-        if not waking and not (renames_alone and parts):
+        if not waking and not batch and not (renames_alone and parts):
             return None
-        if not parts:
+        alone = not parts
+        summaries = (
+            []
+            if without
+            else [
+                held_summary(follow, follow.quiet, alone) for follow in self._follows if follow.quiet
+            ]
+        )
+        if alone and not summaries:
             return None
-        text = "\n\n---\n\n".join(parts)
+        sections = [] if alone else ["\n\n---\n\n".join(parts)]
+        if summaries:
+            sections.append(("\n\n---\n\n" if alone else "\n\n").join(summaries))
         if update:
-            text += "\n\n" + update_notice(PLUGIN_NAME, VERSION, self._latest_version or "")
-        return text
+            sections.append(update_notice(PLUGIN_NAME, VERSION, self._latest_version or ""))
+        return "\n\n".join(sections)
 
-    def _snapshot(self, update_at: Optional[float] = None) -> _Snapshot:
+    def _snapshot(self, at: float, update_at: Optional[float] = None) -> _Snapshot:
         return _Snapshot(
             update_at=update_at,
             notes=len(self._notes),
             ids=frozenset(
                 [m.id for follow in self._follows for m in follow.pending]
                 + [r.id for follow in self._follows for r in follow.renames]
+                + [h.id for follow in self._follows for t in follow.quiet for h in t.recent]
             ),
+            tallies={
+                _tally_key(follow.server_id, tally.conversation_id): tally.count
+                for follow in self._follows
+                for tally in follow.quiet
+            },
+            at=at,
         )
 
     def _clear_delivered(self, snapshot: _Snapshot) -> None:
@@ -1175,6 +1462,23 @@ class Inbox:
             follow.pending = [m for m in follow.pending if m.id not in snapshot.ids]
             follow.renames = [r for r in follow.renames if r.id not in snapshot.ids]
             follow.dropped = 0
+            # A summary shown starts again; what was held while the notice went out stays, in a
+            # new window from when the notice was taken.
+            shown = False
+            kept: list[Tally] = []
+            for tally in follow.quiet:
+                key = _tally_key(follow.server_id, tally.conversation_id)
+                if key in snapshot.tallies:
+                    shown = True
+                count = tally.count - snapshot.tallies.get(key, 0)
+                if count > 0:
+                    recent = tuple(h for h in tally.recent if h.id not in snapshot.ids)
+                    kept.append(replace(tally, count=count, recent=recent))
+            follow.quiet = kept
+            if not kept:
+                follow.quiet_since = None
+            elif shown:
+                follow.quiet_since = snapshot.at
 
     def _requeue(self, entry: _Injected) -> None:
         follow = next(

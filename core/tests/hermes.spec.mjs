@@ -7,7 +7,17 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { decodeUpdates } from "../src/talkto.ts";
-import { followEnded, isNewer, queuedNotice, updateNotice, urgentNotice } from "../src/notice.ts";
+import {
+  followEnded,
+  heldSummary,
+  isNewer,
+  previewOf,
+  queuedNotice,
+  updateNotice,
+  urgentNotice,
+} from "../src/notice.ts";
+import { hostTimings, wakeRules } from "../src/inbox.ts";
+import { followDescription, followSchema } from "../src/tools.ts";
 
 const hermes = new URL("../../hermes/", import.meta.url).pathname;
 const python = process.env.PYTHON ?? "python3";
@@ -135,6 +145,18 @@ const envelopes = [
       message(200 + index, index % 2 === 0 ? { transfer: offer({ id: `t-${index}` }) } : {}),
     ),
   ),
+  // Why each message reached the participant, and a new-channel notice shown on one line.
+  page([
+    message(50, { mentions: [me] }),
+    message(51, { mentions: [peer, 7, null] }),
+    message(52, { mentions: "not a list" }),
+    message(53, {
+      body: "TalkTo: planner created the channel #deploys.\nDescription: x\n  To follow it, add it.",
+      notice: { kind: "channel_created", channelId: direct, channelName: "deploys" },
+    }),
+    message(54, { notice: "not an object" }),
+    message(55, { conversationId: direct, mentions: [me] }),
+  ]),
   renamed([message(10)], "not a list"),
   renamed([message(11)], []),
   // The person's wake cadence, and values a port must refuse the same way.
@@ -240,6 +262,92 @@ test("the Hermes port writes the update line and compares versions exactly like 
       newer: isNewer(latest, version),
     })),
   );
+});
+
+const heldCases = [
+  {
+    serverId: server,
+    participantId: me,
+    alone: true,
+    tallies: [
+      {
+        conversationId: general,
+        where: "#general",
+        count: 11,
+        senders: ["planner", "builder", "a", "b"],
+        recent: Array.from({ length: 8 }, (_, index) => ({
+          id: `m-${index}`,
+          from: "planner",
+          line: `ünïcode line ${index}`,
+        })),
+      },
+      {
+        conversationId: direct,
+        where: "#deploys",
+        count: 1,
+        senders: ["builder"],
+        recent: [{ id: "m-9", from: "builder", line: "" }],
+      },
+    ],
+    bodies: ["one line", "\n\n  first  \nsecond", "x".repeat(150), "", "ü".repeat(101)],
+    full: 0,
+    generalInFull: false,
+    batchMillis: 4 * 60_000,
+  },
+  {
+    serverId: server,
+    participantId: me,
+    alone: false,
+    tallies: [
+      {
+        conversationId: general,
+        where: "#general",
+        count: 1,
+        senders: ["planner"],
+        recent: [{ id: "m-1", from: "planner", line: "hi" }],
+      },
+    ],
+    bodies: [],
+    full: 1,
+    generalInFull: true,
+    batchMillis: 60_000,
+  },
+  {
+    serverId: server,
+    participantId: me,
+    alone: false,
+    tallies: [],
+    bodies: [],
+    full: 3,
+    generalInFull: false,
+    batchMillis: 30 * 60_000,
+  },
+];
+
+test("the Hermes port summarizes held channel messages exactly like the core", () => {
+  const run = runPython(["conformance.py", "--held"], JSON.stringify(heldCases));
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(
+    JSON.parse(run.stdout),
+    heldCases.map((item) => ({
+      summary: heldSummary(
+        { serverId: item.serverId, participantId: item.participantId },
+        item.tallies,
+        item.alone,
+      ),
+      previews: item.bodies.map(previewOf),
+      rules: wakeRules(item.full, item.generalInFull, item.batchMillis),
+    })),
+  );
+});
+
+test("the Hermes port offers the same follow tool and Hermes's timing from the core's table", () => {
+  const run = runPython(["conformance.py", "--tools"], "[]");
+  assert.equal(run.status, 0, run.stderr);
+  const ported = JSON.parse(run.stdout);
+  assert.equal(ported.description, followDescription("this Hermes session"));
+  assert.deepEqual(ported.schema, JSON.parse(JSON.stringify(followSchema)));
+  assert.deepEqual(ported.timing, hostTimings.hermes);
 });
 
 test("the Hermes plugin's Python tests pass", () => {
