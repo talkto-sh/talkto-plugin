@@ -10,7 +10,9 @@
  * the agent then reads them with `get_updates` through its MCP connection.
  *
  * - Normal messages: once the session has been idle for a moment, one system event for the
- *   session's next turn, and a wake so that turn starts now (`Host.notify`). The person's wake
+ *   session's next turn, and a wake so that turn starts now (`Host.notify`). Only direct
+ *   messages, mentions and TalkTo's notices wake (`waking` in the counts); when only other
+ *   channel messages wait, the event waits for the next prompt without a wake. The person's wake
  *   cadence (`wakeIntervalSeconds` in the counts) spaces those wakes; inside the gap the event
  *   waits for the next prompt, and the wake follows once the gap has passed.
  * - Urgent direct messages while a turn runs: steered into that turn (`Host.steer`), read after
@@ -23,12 +25,14 @@
  */
 import {
   check,
+  forYou,
   isNewer,
   isText,
   linkFrom,
   linkPattern,
   mayWake,
   notices as hookNotices,
+  wakingOf,
   updateNoticeMs,
 } from "./core/core.mjs";
 import { version } from "./version.mjs";
@@ -132,11 +136,11 @@ const untrusted =
 export const notices = {
   /** @param {Follow} follow */
   saved: (follow) =>
-    `TalkTo: signal link saved for ${whose(follow)}. The TalkTo plugin now tells this session when messages arrive: it starts a turn for them once you are idle, and urgent direct messages come into your running turn. Read them with get_updates as usual. Do not schedule TalkTo checks.`,
+    `TalkTo: signal link saved for ${whose(follow)}. The TalkTo plugin now tells this session when messages arrive: it starts a turn once you are idle for your direct messages, @mentions of you and TalkTo's notices, other channel messages wait for your next turn, and urgent direct messages come into your running turn. Read them with get_updates as usual. Do not schedule TalkTo checks.`,
   /** @param {Follow} follow @param {Counts} counts */
   queued: (follow, counts) => {
     const urgent = counts.urgent > 0 ? `, ${counts.urgent} urgent` : "";
-    return `TalkTo: ${amount(counts)} new ${plural(counts.pending, "message", "messages")}${urgent} for ${whose(follow)}. Call get_updates to read ${plural(counts.pending, "it", "them")}, and reply with send_message only if a message needs it. Then continue your work, or end your turn if you were idle. ${untrusted}`;
+    return `TalkTo: ${amount(counts)} new ${plural(counts.pending, "message", "messages")}${urgent} for ${whose(follow)}${forYou(counts)}. Call get_updates to read ${plural(counts.pending, "it", "them")}, and reply with send_message only if a message needs it. Then continue your work, or end your turn if you were idle. ${untrusted}`;
   },
   /** @param {Follow} follow @param {Counts} counts */
   urgent: (follow, counts) =>
@@ -466,7 +470,8 @@ export class Signals {
     const now = this.#host.now();
     if (now - session.idleSince < settleMillis) return;
     // Inside the cadence gap the event still goes in for the next prompt, without starting a turn.
-    const allowed = mayWake(latest, session.lastWakeAt, now);
+    // So do other channel messages: only direct messages, @mentions and notices start one.
+    const allowed = mayWake(latest, session.lastWakeAt, now) && wakingOf(latest) > 0;
     const wake = (this.#settings.delivery === "idle" && allowed) || inject;
     const notified = entry.notified;
     if (notified !== null && notified.cursor === latest.cursor && (notified.woke || !wake)) return;
@@ -513,7 +518,9 @@ export class Signals {
       })
       .concat(
         this.#settings.delivery === "idle"
-          ? ["New messages start a turn once the session is idle."]
+          ? [
+              "Direct messages, @mentions and TalkTo notices start a turn once the session is idle; other channel messages arrive with your next prompt.",
+            ]
           : ["New messages arrive with your next prompt; urgent ones still start a turn."],
       )
       .concat(

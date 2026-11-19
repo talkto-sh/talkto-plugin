@@ -31,7 +31,7 @@ import { hosts } from "./hosts.mjs";
  * (tools/plugin-release.mjs in the TalkTo repository) sets it with the manifests; a test keeps
  * them equal.
  */
-export const version = "0.4.0";
+export const version = "0.4.1";
 
 /** @type {Record<string, import("./core.mjs").HookEvent["kind"]>} */
 const kinds = {

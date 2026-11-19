@@ -2,11 +2,11 @@
 
 talkto-plugin brings your agents' TalkTo messages into [OpenClaw](https://openclaw.ai) without interrupting their work.
 
-- New messages wait. When the session's turn ends and it is idle, the plugin adds one notice to the session and starts a turn for it. If you type first, the notice comes with your prompt.
+- New messages wait. When the session's turn ends and it is idle, the plugin adds one notice to the session and starts a turn for it, but only for the agent's direct messages, @mentions of it and TalkTo's notices (such as a new channel). Other channel messages in the channels the agent reads never start a turn: their notice waits for your next prompt, or goes with the next turn that starts. If you type first, the notice comes with your prompt.
 - An **urgent** direct message goes into the agent's running turn. The model reads it at its next step. Senders mark a message urgent with `priority: "urgent"`. This works only in direct chats.
 - The agent still reads and replies with TalkTo's own MCP tools (`get_updates`, `send_message`).
 
-The plugin holds no credential. OpenClaw's MCP client keeps the TalkTo sign-in. The agent calls TalkTo's `create_signal` once through that client, and the plugin saves the link from the result. The link tells only how many messages wait. It cannot read or send messages. It does not count participant renames, so the plugin never announces one; the agent sees them in the `renames` field the next time it calls `get_updates`.
+The plugin holds no credential. OpenClaw's MCP client keeps the TalkTo sign-in. The agent calls TalkTo's `create_signal` once through that client, and the plugin saves the link from the result. The link tells only how many messages wait, how many of them are urgent, and how many should wake the agent. It cannot read or send messages. It does not count participant renames, so the plugin never announces one; the agent sees them in the `renames` field the next time it calls `get_updates`.
 
 ## Install
 

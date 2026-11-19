@@ -322,6 +322,50 @@ test("an idle session hears about waiting messages with the next prompt", async 
   assert.match(reply.context, /More than 3 new messages arrived while you were idle/);
 });
 
+test("only direct messages, @mentions and TalkTo notices continue a turn; other channel messages wait for the next prompt", async () => {
+  const w = world([
+    { pending: 3, urgent: 0, waking: 0, cursor: message(3) },
+    { pending: 3, urgent: 0, waking: 0, cursor: message(3) },
+    { pending: 2, urgent: 0, waking: 0, cursor: message(5) },
+    { pending: 4, urgent: 0, waking: 1, cursor: message(9) },
+  ]);
+  linked(w);
+  // Channel posts alone: the turn ends, the cursor stays, and the count waits for the next prompt.
+  assert.deepEqual(await handle(hook("stop"), w.deps), {});
+  assert.equal(w.state.cursor, null);
+  assert.equal(w.state.pending, 3);
+  assert.equal(w.state.continuations, 0);
+  assert.deepEqual(await handle(hook("stop"), w.deps), {});
+  // The next prompt mentions them quietly, as context, and moves the cursor past them.
+  w.tick(defaults.promptIntervalMs);
+  const prompt = await handle(hook("promptSubmit"), w.deps);
+  assert.equal(
+    prompt.context,
+    "TalkTo: 2 new messages (channel messages only, none for you) arrived while you were idle. Call get_updates to read them when it fits this request.",
+  );
+  assert.equal(w.state.cursor, message(5));
+  // One message for the agent continues the turn, and the channel posts ride along with it.
+  const woken = await handle(hook("stop"), w.deps);
+  assert.equal(
+    woken.continueWith,
+    "TalkTo: 4 new messages (1 for you: direct messages, @mentions or TalkTo notices; 3 other channel messages). Call get_updates to read them, then carry on.",
+  );
+  assert.equal(w.state.cursor, message(9));
+});
+
+test("a server without the waking count, or with an odd one, keeps the old rule: every message continues", async () => {
+  for (const waking of [undefined, -1, 101, "2", null]) {
+    const w = world([{ pending: 2, urgent: 0, cursor: message(2), waking }]);
+    linked(w);
+    const reply = await handle(hook("stop"), w.deps);
+    assert.equal(
+      reply.continueWith,
+      "TalkTo: 2 new messages. Call get_updates to read them, then carry on.",
+      String(waking),
+    );
+  }
+});
+
 test("offline, slow, failing and rate-limited links stay quiet and back off", async () => {
   const w = world([new Error("offline"), 503, 429, { pending: 1, urgent: 1, cursor: message(1) }]);
   linked(w);
@@ -440,6 +484,22 @@ test("the watcher starts a turn while idle, announces each batch once, and stays
   // Checks are spaced by the watch interval, which the hooks' checks also count toward.
   assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: defaults.watchIntervalMs });
   assert.equal(w.requests.length, 2);
+});
+
+test("the watcher never starts a turn for channel messages alone; a direct message, @mention or notice does", async () => {
+  const w = idleWorld([
+    { pending: 2, urgent: 0, waking: 0, cursor: message(2) },
+    { pending: 3, urgent: 0, waking: 1, cursor: message(3) },
+  ]);
+  assert.deepEqual(await watchStep(w.deps), { kind: "wait", ms: defaults.watchIntervalMs });
+  assert.equal(w.state.cursor, null, "the held messages stay counted for the next turn");
+  assert.equal(w.state.lastWakeAt, 0);
+  w.tick(defaults.watchIntervalMs);
+  assert.deepEqual(await watchStep(w.deps), {
+    kind: "wake",
+    notice: notices.waiting({ pending: 3, urgent: 0, waking: 1, more: false }),
+  });
+  assert.equal(w.state.cursor, message(3));
 });
 
 test("the watcher holds normal messages for the person's wake cadence; urgent ones start a turn at once", async () => {

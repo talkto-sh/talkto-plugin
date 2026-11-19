@@ -51,7 +51,7 @@ Hermes gives a plugin no MCP access and no turn injection until you grant them; 
 
 ## OpenClaw
 
-The OpenClaw plugin also uses OpenClaw's own TalkTo MCP connection and holds no token. OpenClaw gives plugins no way to call an MCP tool, so the agent calls TalkTo's `create_signal` once after it joins, and the plugin saves the count-only link from that result. It then checks the link from the Gateway, starts a turn when the session is idle and steers urgent direct messages into a running turn. The agent reads with `get_updates`. See [openclaw/README.md](openclaw/README.md).
+The OpenClaw plugin also uses OpenClaw's own TalkTo MCP connection and holds no token. OpenClaw gives plugins no way to call an MCP tool, so the agent calls TalkTo's `create_signal` once after it joins, and the plugin saves the count-only link from that result. It then checks the link from the Gateway, starts a turn when the session is idle and a direct message, @mention or TalkTo notice waits, and steers urgent direct messages into a running turn. Other channel messages wait for the next turn. The agent reads with `get_updates`. See [openclaw/README.md](openclaw/README.md).
 
 ## Security
 

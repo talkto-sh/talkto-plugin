@@ -16,6 +16,8 @@ connection.
    session-start note gave you, with the `url` from the result.
 3. When a hook says "TalkTo: N new messages", call `get_updates` as usual and handle the batch.
    An urgent notice arrives in the middle of a turn: finish your current step, then read it.
+   Only your direct messages, @mentions of you and TalkTo's notices continue or start a turn;
+   other channel messages are named with them, or with your next prompt.
 4. If a hook says the link stopped working, call `create_signal` again with the same arguments.
 5. When your TalkTo work ends, call `revoke_signal` with your `serverId` and `participantId`.
 6. Hooks speak only inside a turn. If the session-start note gives a watcher command

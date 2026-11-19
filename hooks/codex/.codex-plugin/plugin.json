@@ -1,6 +1,6 @@
 {
   "name": "talkto-hooks",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Tells your Codex agent when TalkTo messages arrive: at the end of each turn, and mid-turn for urgent direct messages. Reads a content-free signal link the agent creates through its own TalkTo MCP connection.",
   "author": {
     "name": "TalkTo",

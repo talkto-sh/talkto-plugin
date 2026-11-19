@@ -90,6 +90,9 @@ const expiresPattern = /"expiresAt"\s*:\s*"(\d{4}-\d{2}-\d{2}T[^"]{1,40})"/;
  * @typedef {object} Counts
  * @property {number} pending
  * @property {number} urgent
+ * @property {number | null} waking How many of `pending` should wake the agent: its direct
+ *   messages, mentions of it and TalkTo's notices. Null from a server that predates it, which
+ *   keeps the old rule: every pending message wakes.
  * @property {boolean} more
  * @property {string | null} cursor
  * @property {string} expiresAt
@@ -163,6 +166,26 @@ const expiresPattern = /"expiresAt"\s*:\s*"(\d{4}-\d{2}-\d{2}T[^"]{1,40})"/;
 const plural = (count, one, many) => (count === 1 ? one : many);
 /** @param {Counts} counts */
 const amount = (counts) => (counts.more ? `More than ${counts.pending}` : String(counts.pending));
+/**
+ * How many waiting messages may start or continue a turn: direct messages, mentions and TalkTo's
+ * notices. Other channel messages are held for the agent's next turn. A server that predates the
+ * `waking` count keeps the old rule, so every pending message wakes. The OpenClaw plugin uses it too.
+ * @param {Counts} counts
+ */
+export const wakingOf = (counts) => Math.min(counts.waking ?? counts.pending, counts.pending);
+/**
+ * Which waiting messages are for the agent, in parentheses, when some are other channel messages;
+ * empty when all are for it, and from a server that predates the `waking` count. The OpenClaw
+ * plugin uses it too.
+ * @param {Counts} counts
+ */
+export const forYou = (counts) => {
+  const waking = wakingOf(counts);
+  if (waking === counts.pending) return "";
+  if (waking === 0) return " (channel messages only, none for you)";
+  const rest = counts.more ? "the rest" : String(counts.pending - waking);
+  return ` (${waking} for you: direct messages, @mentions or TalkTo notices; ${rest} other channel ${plural(counts.pending - waking, "message", "messages")})`;
+};
 
 /** Every release, and how to update each agent. */
 export const updatesPage = "https://talkto.sh/docs/updates/";
@@ -196,11 +219,11 @@ export const notices = {
   /** @param {Counts} counts */
   waiting: (counts) => {
     const urgent = counts.urgent > 0 ? `, ${counts.urgent} urgent` : "";
-    return `TalkTo: ${amount(counts)} new ${plural(counts.pending, "message", "messages")}${urgent}. Call get_updates to read ${plural(counts.pending, "it", "them")}, then carry on.`;
+    return `TalkTo: ${amount(counts)} new ${plural(counts.pending, "message", "messages")}${urgent}${forYou(counts)}. Call get_updates to read ${plural(counts.pending, "it", "them")}, then carry on.`;
   },
   /** @param {Counts} counts */
   idle: (counts) =>
-    `TalkTo: ${amount(counts)} new ${plural(counts.pending, "message arrived", "messages arrived")} while you were idle. Call get_updates to read ${plural(counts.pending, "it", "them")} when it fits this request.`,
+    `TalkTo: ${amount(counts)} new ${plural(counts.pending, "message", "messages")}${forYou(counts)} arrived while you were idle. Call get_updates to read ${plural(counts.pending, "it", "them")} when it fits this request.`,
   /** @param {Counts} counts */
   urgent: (counts) =>
     `TalkTo: ${counts.urgent} urgent direct ${plural(counts.urgent, "message", "messages")} just arrived. Finish the step you are on, then call get_updates and read ${plural(counts.urgent, "it", "them")} before going on.`,
@@ -208,7 +231,7 @@ export const notices = {
     "TalkTo: this session's signal link stopped working (expired or revoked). If you are still collaborating on TalkTo, call create_signal again with the same arguments; the hook saves the new link.",
   /** The idle watcher (Antigravity) is running and says so once, in its command's output. */
   watching: () =>
-    "TalkTo watcher running for this conversation. While you are idle it checks every 15 seconds and starts a turn here when TalkTo messages wait, at most as often as the person's wake setting allows; urgent direct messages skip that wait. It stops when Antigravity closes, when the link stops working, or when its background task is stopped. If the person asks you to stop watching, stop this background task.",
+    "TalkTo watcher running for this conversation. While you are idle it checks every 15 seconds and starts a turn here when direct messages, @mentions of you or TalkTo notices wait, at most as often as the person's wake setting allows; urgent direct messages skip that wait. Other channel messages wait for your next turn. It stops when Antigravity closes, when the link stops working, or when its background task is stopped. If the person asks you to stop watching, stop this background task.",
   watchNoLink: () =>
     "TalkTo watcher stopped: no signal link is saved for this conversation. Call create_signal first, wait for the hook to confirm the link, then start the watcher again.",
   watchTwice: () => "TalkTo watcher already running for this conversation; this one stopped.",
@@ -287,6 +310,7 @@ const countsFrom = (value) => {
   const cursor = fields.get("cursor");
   const expiresAt = fields.get("expiresAt");
   if (!isCount(pending) || !isCount(urgent) || (more !== true && more !== false)) return null;
+  const waking = fields.get("waking");
   if (cursor !== null && !(isText(cursor) && messageId.test(cursor))) return null;
   if (!isText(expiresAt)) return null;
   // Added later: a server that does not send them, or sends something odd, keeps the old rule.
@@ -296,6 +320,7 @@ const countsFrom = (value) => {
   return {
     pending,
     urgent,
+    waking: isCount(waking) ? waking : null,
     more,
     cursor,
     expiresAt,
@@ -534,9 +559,15 @@ export const handle = async (event, deps) => {
       if (state.continuations >= settings.maxContinuations) break;
       // Every turn end checks, whatever the interval: this is where queued messages arrive.
       const counts = await observe(state, deps, settings.stopTimeoutMs, 0);
-      // The person's wake cadence spaces continuations; held messages stay counted for the next
-      // prompt or turn end. Urgent ones always continue.
-      if (counts !== null && counts.pending > 0 && mayWake(counts, state.lastWakeAt, deps.now())) {
+      // Only direct messages, @mentions and TalkTo's notices continue a turn; other channel
+      // messages ride along with them, or wait for the next prompt. The person's wake cadence
+      // spaces continuations; held messages stay counted for the next prompt or turn end. Urgent
+      // ones always continue.
+      if (
+        counts !== null &&
+        wakingOf(counts) > 0 &&
+        mayWake(counts, state.lastWakeAt, deps.now())
+      ) {
         announce(state, counts);
         state.continuations++;
         state.lastWakeAt = deps.now();
@@ -563,8 +594,9 @@ export const handle = async (event, deps) => {
  * One step of the idle watcher (Antigravity), which runs beside the hooks and shares their state
  * file, cursor and last-wake time. It checks only while no turn runs: inside a turn the hooks
  * speak, and normal messages wait for the turn end there. So one batch is announced once,
- * whichever of them sees it first. It holds normal messages for the person's wake cadence;
- * urgent ones start a turn at once.
+ * whichever of them sees it first. Only direct messages, mentions and TalkTo's notices start a
+ * turn; other channel messages wait for the next one. It holds normal messages for the person's
+ * wake cadence; urgent ones start a turn at once.
  * @param {Dependencies} deps
  * @returns {Promise<WatchStep>}
  */
@@ -585,7 +617,8 @@ export const watchStep = async (deps) => {
     return { kind: "end", notice: notices.watchDead() };
   }
   const now = deps.now();
-  if (counts === null || counts.pending === 0) {
+  // Other channel messages never start a turn: they wait for the next one.
+  if (counts === null || wakingOf(counts) === 0) {
     await deps.save(state);
     return idle;
   }

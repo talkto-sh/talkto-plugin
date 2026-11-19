@@ -301,6 +301,35 @@ test("the person's wake cadence spaces wakes: inside the gap the notice waits fo
   assert.equal(w.notices.at(-1).target.contextKey, w.notices.at(-2).target.contextKey);
 });
 
+test("channel messages alone never wake: they wait for the next prompt, and a mention wakes", async () => {
+  const w = world(defaults, [{ pending: 2, urgent: 0, waking: 0, cursor: message(2) }]);
+  await capture(w);
+  await w.signals.tick();
+  assert.equal(w.notices.length, 1);
+  assert.equal(w.notices[0].wake, false, "other channel messages wait for the next prompt");
+  assert.match(
+    w.notices[0].text,
+    /^TalkTo: 2 new messages for your participant \S+ on server \S+ \(channel messages only, none for you\)\./,
+  );
+  // The same counts are not repeated.
+  w.tick(engagedPollMillis);
+  w.answers.push({ pending: 2, urgent: 0, waking: 0, cursor: message(2) });
+  await w.signals.tick();
+  assert.equal(w.notices.length, 1);
+  // A direct message, @mention or TalkTo notice arrives: now a turn starts, with all of them.
+  w.tick(engagedPollMillis);
+  w.answers.push({ pending: 3, urgent: 0, waking: 1, cursor: message(3) });
+  await w.signals.tick();
+  assert.equal(w.notices.length, 2);
+  assert.equal(w.notices[1].wake, true);
+  assert.match(
+    w.notices[1].text,
+    /\(1 for you: direct messages, @mentions or TalkTo notices; 2 other channel messages\)\./,
+  );
+  await w.signals.runStarted(session, "run-1");
+  assert.equal(w.stored.get(keyOf(session, server)).cursor, message(3));
+});
+
 test("right away, and a server without a cadence, wake for every batch as before", async () => {
   for (const extra of [{ wakeCadence: "right_away", wakeIntervalSeconds: 0 }, {}]) {
     const w = world(defaults, [{ pending: 1, urgent: 0, cursor: message(1), ...extra }]);
